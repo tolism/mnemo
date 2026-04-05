@@ -1,18 +1,40 @@
 # Mnemosyne - Feature Roadmap
 
-## Current Features (v0.1.0)
+## Current Features (v0.3.1)
 
 ### CLI Commands
 
 | Command | Description |
 |---|---|
-| `init` | Scaffold a new workspace (dirs, schema, index, log, CLAUDE.md) |
-| `ingest` | Atomic ingest: source file -> wiki page + Memvid frames + schema |
-| `search` | Dual-layer search (wiki text + Memvid semantic) |
-| `sync` | Push wiki pages into Memvid with content-hash dedup |
-| `drift` | Detect when wiki and Memvid layers are out of sync |
-| `stats` | Health overview across all layers |
-| `repair` | Fix corrupted .mv2 archives and schema JSON |
+| `mnemo init` | Scaffold a new workspace |
+| `mnemo ingest` | Atomic ingest: source -> wiki + Memvid + schema |
+| `mnemo ingest-dir` | Batch ingest all files from a directory |
+| `mnemo search` | Dual-layer search with `--client` scoping |
+| `mnemo lint` | Health check: orphan pages, dead links, stale pages, citations, schema drift, coverage |
+| `mnemo sync` | Sync wiki pages to Memvid |
+| `mnemo drift` | Detect layer desynchronization |
+| `mnemo stats` | Health overview |
+| `mnemo repair` | Fix corrupted archives and schema |
+| `mnemo status` | Quick summary of pending work |
+| `mnemo recent` | Show last N activity log entries |
+| `mnemo tags list` | List all tags with page counts |
+| `mnemo tags merge` | Merge one tag into another across all pages |
+| `mnemo diff` | Git-aware diff for a wiki page |
+| `mnemo snapshot` | Versioned zip archive of a client + git tag |
+| `mnemo dedupe` | Detect near-duplicate wiki pages |
+| `mnemo export` | Export client knowledge as JSON or markdown |
+| `mnemo profile list` | List available writing style profiles |
+| `mnemo profile set` | Set active profile (e.g. eu-mdr, iso-13485) |
+| `mnemo profile show` | Show active profile details |
+| `mnemo trace add` | Add a traceability link between pages |
+| `mnemo trace show` | Walk trace chain forward or backward |
+| `mnemo trace matrix` | Generate traceability matrix for a client |
+| `mnemo trace gaps` | Find incomplete trace chains |
+| `mnemo harmonize` | Vocabulary harmonization against active profile |
+| `mnemo validate structure` | Check page sections against profile requirements |
+| `mnemo validate consistency` | Cross-document consistency check |
+| `mnemo scan-repo` | Scan code repo, compare against QMS docs, find gaps |
+| `mnemo tornado` | Inbox processor: auto-detect type/client, ingest, archive to sources |
 
 ### Web UI (localhost:3141)
 
@@ -22,15 +44,28 @@
 - Entity table with filtering
 - Health tab with drift and sync status
 
-### Core Capabilities
+### Bundled Profiles
 
-- Dual-layer architecture: human-readable wiki + machine-searchable Memvid
-- Automatic entity extraction during ingest
-- Content hashing for dedup and drift detection
-- Cross-platform file locking (portalocker)
-- PDF support via PyMuPDF (optional)
-- Obsidian-compatible wikilinks and frontmatter
-- Schema tracking (entities.json, graph.json, tags.json)
+| Profile | Description |
+|---|---|
+| `eu-mdr` | EU Medical Device Regulation (2017/745) -- 15 vocabulary rules, 6 section templates |
+| `iso-13485` | ISO 13485:2016 QMS for Medical Devices -- 13 vocabulary rules, 6 section templates |
+
+### Traceability Chains Supported
+
+```
+User Need -> Requirement -> Design Input -> DDS -> Verification -> Validation
+
+Hazard -> Risk Analysis -> RMA -> Requirement -> DDS -> Test
+```
+
+Relationship types: `derived-from`, `implemented-by`, `detailed-in`, `mitigated-by`, `verified-by`, `validated-by`, `referenced-in`, `supersedes`
+
+### Security (v0.2.0+)
+
+- Path traversal protection using `pathlib.Path.resolve()` with bounds checking
+- File serving restricted to WIKI_DIR only
+- CORS locked to `localhost:3141`
 
 ---
 
@@ -38,31 +73,23 @@
 
 ### High Impact
 
-- [ ] **Lint command** - Orphan pages, dead links, stale pages, missing citations, schema drift, coverage gaps. Protocol defined in CLAUDE.md but not yet implemented in CLI.
-- [ ] **Query-and-file command** - Search wiki, synthesize answer, optionally file it as a new deliverable or comparison page. Turns repeated questions into permanent wiki entries.
-- [ ] **Batch ingest** - `mnemo ingest-dir sources/pdfs/ my-client` to walk a directory and ingest all files in one pass.
-- [ ] **Export / report generation** - Pull knowledge out as a combined brief per client. Markdown or PDF output for handoff.
+- [ ] **Query-and-file command** - Search wiki, synthesize answer, file as a new deliverable page
+- [ ] **Audit trail** - Per-page immutable change history with timestamps (ISO 9001 document control)
+- [ ] **More source formats** - .docx, .csv, .json ingestion
+- [ ] **Profile-aware ingest** - Auto-apply vocabulary and section rules during ingest, not just at lint time
 
 ### Medium Impact
 
-- [ ] **Watch mode** - Monitor `sources/` for new files and auto-ingest on drop.
-- [ ] **Tag management CLI** - `mnemo tags list`, `mnemo tags merge old-tag new-tag`.
-- [ ] **Entity graph visualization** - Render graph.json as Mermaid or DOT. Viewable in web UI or exported as image.
-- [ ] **Confidence auto-upgrade** - When a second source confirms a low-confidence claim, promote to medium. Cross-reference counting drives the upgrade.
-- [ ] **Interactive search UI** - Live-as-you-type search, clickable entity links, richer result cards.
+- [ ] **Watch mode** - Monitor `sources/` for new files and auto-ingest
+- [ ] **Entity graph visualization** - Render graph.json as Mermaid/DOT
+- [ ] **Confidence auto-upgrade** - Promote confidence when multiple sources confirm a claim
+- [ ] **Interactive search UI** - Live search, clickable entities
+- [ ] **Trace visualization** - Render traceability chains as diagrams in the web UI
+- [ ] **Client archival** - Freeze an engagement and remove from active indexes
+- [ ] **Merge clients** - Consolidate two client directories
 
 ### Nice to Have
 
-- [ ] **Page diff** - `mnemo diff <page>` to show what changed since last ingest (git-aware).
-- [ ] **More source formats** - .docx, .csv, .json ingestion support.
-- [ ] **Web UI auth** - Basic authentication for LAN sharing.
-- [ ] **Client archival** - `mnemo archive <client>` to freeze a client engagement and remove from active indexes.
-- [ ] **Merge clients** - Consolidate two client directories when engagements overlap.
-
----
-
-## Security Fixes
-
-- [ ] **Path traversal in server.py** - Replace `str.replace('..',  '')` with `pathlib.Path.resolve()` + bounds checking in `handle_wiki_page()`.
-- [ ] **Restrict file serving scope** - Remove BASE_DIR from wiki page candidate paths, limit to WIKI_DIR only.
-- [ ] **CORS policy** - Replace wildcard `Access-Control-Allow-Origin: *` with explicit origin.
+- [ ] **Web UI auth** - Basic auth for LAN sharing
+- [ ] **Custom profile builder** - Interactive CLI to create profiles from scratch
+- [ ] **Regulatory report generator** - Auto-generate compliance checklists from profile + trace data

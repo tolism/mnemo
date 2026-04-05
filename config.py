@@ -10,6 +10,9 @@ PER_CLIENT_DIR = os.path.join(MEMVID_DIR, 'per-client')
 INDEX_FILE = os.path.join(BASE_DIR, 'index.md')
 LOG_FILE = os.path.join(BASE_DIR, 'log.md')
 TEMPLATES_DIR = os.path.join(WIKI_DIR, '_templates')
+PROFILES_DIR = os.path.join(BASE_DIR, 'profiles')
+TRACEABILITY_FILE = os.path.join(SCHEMA_DIR, 'traceability.json')
+ACTIVE_PROFILE_FILE = os.path.join(BASE_DIR, '.mnemo-profile')
 
 # Excluded from sync
 EXCLUDED_DIRS = ['_templates']

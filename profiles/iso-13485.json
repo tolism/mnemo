@@ -1,0 +1,66 @@
+{
+  "name": "ISO 13485",
+  "description": "ISO 13485:2016 Quality Management System for Medical Devices",
+  "version": "1.0",
+  "vocabulary": {
+    "preferred": [
+      {"term": "medical device", "reject": ["product", "unit", "item"]},
+      {"term": "quality management system", "reject": ["QMS", "quality system"]},
+      {"term": "management representative", "reject": ["quality manager", "QA lead"]},
+      {"term": "documented procedure", "reject": ["SOP", "work instruction", "procedure"]},
+      {"term": "quality objective", "reject": ["quality goal", "quality target"]},
+      {"term": "nonconformity", "reject": ["defect", "bug", "issue", "problem"]},
+      {"term": "corrective action", "reject": ["fix", "resolution", "remedy"]},
+      {"term": "preventive action", "reject": ["prevention", "proactive fix"]},
+      {"term": "design and development", "reject": ["R&D", "engineering", "development"]},
+      {"term": "purchasing", "reject": ["procurement", "sourcing", "buying"]},
+      {"term": "traceability", "reject": ["tracking", "trace"]},
+      {"term": "customer complaint", "reject": ["feedback", "issue report", "bug report"]},
+      {"term": "advisory notice", "reject": ["recall notice", "safety alert"]}
+    ],
+    "requirement_levels": {
+      "shall": "mandatory requirement",
+      "should": "recommended",
+      "may": "permitted"
+    }
+  },
+  "sections": {
+    "quality-manual": {
+      "required": ["scope", "exclusions", "quality-policy", "quality-objectives", "qms-processes", "document-control", "record-control"],
+      "description": "Quality manual per clause 4.2.2"
+    },
+    "management-review": {
+      "required": ["review-input", "review-output", "actions", "resource-needs"],
+      "description": "Management review per clause 5.6"
+    },
+    "design-control": {
+      "required": ["design-planning", "design-inputs", "design-outputs", "design-review", "design-verification", "design-validation", "design-transfer", "design-changes"],
+      "description": "Design and development per clause 7.3"
+    },
+    "risk-management": {
+      "required": ["scope", "hazard-identification", "risk-estimation", "risk-evaluation", "risk-control"],
+      "description": "Risk management per clause 7.1"
+    },
+    "capa": {
+      "required": ["nonconformity-identification", "root-cause-analysis", "corrective-action", "preventive-action", "effectiveness-review"],
+      "description": "CAPA process per clause 8.5.2 and 8.5.3"
+    },
+    "supplier-management": {
+      "required": ["supplier-evaluation", "purchasing-requirements", "incoming-inspection", "supplier-monitoring"],
+      "description": "Purchasing and supplier control per clause 7.4"
+    }
+  },
+  "trace_types": [
+    "derived-from",
+    "implemented-by",
+    "detailed-in",
+    "mitigated-by",
+    "verified-by",
+    "validated-by",
+    "referenced-in",
+    "supersedes"
+  ],
+  "tone": "formal",
+  "voice": "passive-for-procedures",
+  "citation_style": "clause-reference"
+}

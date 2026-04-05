@@ -11,3 +11,9 @@ sources/conversations/
 sources/pdfs/
 sources/emails/
 memvid/.*.mv2.*
+snapshots/
+exports/
+inbox/
+mnemo.egg-info/
+.venv/
+.mnemo-profile

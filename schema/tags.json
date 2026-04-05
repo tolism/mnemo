@@ -1,1 +1,16 @@
-{"version": 1, "updated": "2026-04-05", "tags": {}}
+{
+  "version": 1,
+  "updated": "2026-04-05",
+  "tags": {
+    "demo-retail": {
+      "count": 5,
+      "pages": [
+        "demo-retail/sample-meeting-notes.md",
+        "demo-retail/sample-proposal.md",
+        "demo-retail/sample-research.md",
+        "demo-retail/meeting-notes-april.md",
+        "demo-retail/risk-assessment-draft.md"
+      ]
+    }
+  }
+}

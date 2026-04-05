@@ -1,0 +1,68 @@
+{
+  "name": "EU MDR",
+  "description": "European Medical Device Regulation (EU 2017/745) documentation profile",
+  "version": "1.0",
+  "vocabulary": {
+    "preferred": [
+      {"term": "medical device", "reject": ["product", "unit", "item", "widget", "gadget"]},
+      {"term": "intended purpose", "reject": ["intended use", "use case", "purpose"]},
+      {"term": "manufacturer", "reject": ["company", "vendor", "maker", "supplier"]},
+      {"term": "clinical evaluation", "reject": ["clinical review", "clinical assessment"]},
+      {"term": "risk management", "reject": ["risk analysis", "risk review"]},
+      {"term": "design and development", "reject": ["R&D", "engineering"]},
+      {"term": "verification", "reject": ["testing", "checking"]},
+      {"term": "validation", "reject": ["user testing", "acceptance testing"]},
+      {"term": "notified body", "reject": ["certification body", "audit body"]},
+      {"term": "technical documentation", "reject": ["tech docs", "technical file"]},
+      {"term": "post-market surveillance", "reject": ["PMS", "market monitoring"]},
+      {"term": "unique device identification", "reject": ["UDI", "device ID"]},
+      {"term": "economic operator", "reject": ["distributor", "reseller"]},
+      {"term": "conformity assessment", "reject": ["compliance check", "certification"]},
+      {"term": "essential requirements", "reject": ["basic requirements", "core requirements"]}
+    ],
+    "requirement_levels": {
+      "shall": "mandatory requirement - must be fulfilled",
+      "should": "recommended - expected unless justified otherwise",
+      "may": "permitted - optional, at discretion"
+    }
+  },
+  "sections": {
+    "risk-management": {
+      "required": ["scope", "hazard-identification", "risk-estimation", "risk-evaluation", "risk-control", "residual-risk-evaluation", "risk-management-review"],
+      "description": "ISO 14971 compliant risk management file"
+    },
+    "clinical-evaluation": {
+      "required": ["scope", "device-description", "clinical-data", "literature-review", "equivalence-assessment", "risk-benefit-analysis", "conclusions"],
+      "description": "MEDDEV 2.7/1 rev 4 clinical evaluation report"
+    },
+    "design-history-file": {
+      "required": ["design-inputs", "design-outputs", "design-review", "design-verification", "design-validation", "design-transfer", "design-changes"],
+      "description": "Design and development documentation per Annex II"
+    },
+    "software-documentation": {
+      "required": ["software-requirements", "software-architecture", "software-design", "software-unit-testing", "software-integration-testing", "software-system-testing", "soup-analysis"],
+      "description": "IEC 62304 software lifecycle documentation"
+    },
+    "post-market-surveillance": {
+      "required": ["pms-plan", "vigilance", "trend-reporting", "periodic-safety-update", "field-safety-corrective-action"],
+      "description": "Post-market surveillance per Article 83-86"
+    },
+    "technical-documentation": {
+      "required": ["device-description", "design-and-manufacturing", "essential-requirements-checklist", "risk-benefit-analysis", "clinical-evaluation", "labelling"],
+      "description": "Technical documentation per Annex II and III"
+    }
+  },
+  "trace_types": [
+    "derived-from",
+    "implemented-by",
+    "detailed-in",
+    "mitigated-by",
+    "verified-by",
+    "validated-by",
+    "referenced-in",
+    "supersedes"
+  ],
+  "tone": "formal",
+  "voice": "passive-for-procedures",
+  "citation_style": "section-reference"
+}

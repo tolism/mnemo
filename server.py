@@ -126,22 +126,26 @@ def handle_wiki_page(path_suffix: str):
     Read a specific wiki page. path_suffix is like 'demo-retail/sample-proposal'
     (no .md extension - we add it).
     """
-    # Sanitize: no path traversal
-    clean = path_suffix.replace('..', '').lstrip('/')
+    from pathlib import Path
+
+    clean = path_suffix.lstrip('/')
     if not clean:
         return 400, _json_response({'error': 'No path given'})
 
-    # Try with and without .md extension
+    # Try with and without .md extension, restricted to WIKI_DIR only
+    wiki_base = Path(WIKI_DIR).resolve()
     candidates = [
-        os.path.join(WIKI_DIR, clean),
-        os.path.join(WIKI_DIR, clean + '.md'),
-        os.path.join(BASE_DIR, clean),
-        os.path.join(BASE_DIR, clean + '.md'),
+        wiki_base / clean,
+        wiki_base / (clean + '.md'),
     ]
     page_path = None
     for c in candidates:
-        if os.path.isfile(c) and c.endswith('.md'):
-            page_path = c
+        resolved = c.resolve()
+        # Bounds check: must be within WIKI_DIR
+        if not str(resolved).startswith(str(wiki_base)):
+            continue
+        if resolved.is_file() and str(resolved).endswith('.md'):
+            page_path = str(resolved)
             break
 
     if not page_path:
@@ -219,7 +223,7 @@ class MnemoHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Origin', 'http://localhost:3141')
         self.end_headers()
         self.wfile.write(body)
 
@@ -288,7 +292,7 @@ class MnemoHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Origin', 'http://localhost:3141')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()

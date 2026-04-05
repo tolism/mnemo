@@ -20,8 +20,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -69,6 +72,7 @@ except ImportError:
     mv = None
 
 from config import (
+    ACTIVE_PROFILE_FILE,
     BASE_DIR,
     CHUNK_COMMIT_BATCH,
     ENTITY_STOPWORDS,
@@ -82,9 +86,11 @@ from config import (
     MEMVID_DIR,
     MIN_CHUNK_SIZE,
     PER_CLIENT_DIR,
+    PROFILES_DIR,
     SCHEMA_DIR,
     SOURCES_DIR,
     TEMPLATES_DIR,
+    TRACEABILITY_FILE,
     WIKI_DIR,
 )
 
@@ -465,12 +471,14 @@ def _sanitize_memvid_query(query: str) -> str:
     return words[0] if words else ''
 
 
-def dual_search(query: str, k: int = 10) -> list[dict]:
+def dual_search(query: str, k: int = 10, client: str = None) -> list[dict]:
     """
     Search both wiki (text matching) and memvid master archive (semantic).
 
     Wiki hits get priority - they are structured, curated, source-cited.
     Memvid fills semantic gaps where text matching misses.
+
+    If client is specified, only return results from that client's pages.
 
     Returns a unified list of results with source attribution and deduplication.
     Each result: {'text', 'source', 'title', 'score', 'tags', 'wiki_path'}
@@ -483,6 +491,9 @@ def dual_search(query: str, k: int = 10) -> list[dict]:
     wiki_hits = _search_wiki_text(query, k=k)
     for hit in wiki_hits:
         path = hit.get('wiki_path', '')
+        # Client filter: skip results not from the requested client
+        if client and not path.replace('wiki/', '').startswith(client + '/'):
+            continue
         results.append({
             'text': hit['text'],
             'title': hit['title'],
@@ -1588,6 +1599,1664 @@ def _print_stats(stats: dict) -> None:
 
 
 
+def lint() -> dict:
+    """
+    Health check across the entire knowledge base.
+
+    Checks:
+    1. Orphan pages - wiki pages with no incoming wikilinks from other pages
+    2. Dead links - [[wikilinks]] pointing to pages that don't exist
+    3. Stale pages - pages not updated in 90+ days
+    4. Missing citations - factual claims without (source:) or (inferred) markers
+    5. Schema drift - entities referenced in wiki but not in entities.json
+    6. Coverage gaps - source files with no corresponding wiki pages
+
+    Returns a dict with all issues found and a summary.
+    Writes a lint report to wiki/lint-report-YYYY-MM-DD.md.
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    issues: dict[str, list] = {
+        'orphan_pages': [],
+        'dead_links': [],
+        'stale_pages': [],
+        'missing_citations': [],
+        'schema_drift': [],
+        'coverage_gaps': [],
+    }
+
+    # Collect all wiki pages
+    pattern = os.path.join(WIKI_DIR, '**', '*.md')
+    all_pages = glob.glob(pattern, recursive=True)
+    page_map: dict[str, str] = {}  # slug -> abs path
+    page_content: dict[str, str] = {}  # slug -> content
+    page_frontmatter: dict[str, dict] = {}  # slug -> frontmatter
+    incoming_links: dict[str, set] = {}  # slug -> set of slugs linking to it
+
+    for page in all_pages:
+        rel = os.path.relpath(page, WIKI_DIR)
+        parts = Path(rel).parts
+        if any(p.startswith('_') for p in parts):
+            continue
+        if rel.startswith('lint-report'):
+            continue
+        slug = os.path.splitext(rel)[0]
+        page_map[slug] = page
+        incoming_links[slug] = set()
+        try:
+            with open(page, 'r', encoding='utf-8') as f:
+                content = f.read()
+            page_content[slug] = content
+            fm, _ = parse_frontmatter(content)
+            page_frontmatter[slug] = fm
+        except Exception:
+            page_content[slug] = ''
+            page_frontmatter[slug] = {}
+
+    # 1. Dead links + build incoming link map
+    for slug, content in page_content.items():
+        links = re.findall(r'\[\[(.+?)\]\]', content)
+        for link in links:
+            target = link.strip()
+            if target in page_map:
+                incoming_links[target].add(slug)
+            else:
+                issues['dead_links'].append({
+                    'page': slug,
+                    'broken_link': target,
+                })
+
+    # 2. Orphan pages - no incoming links from other pages
+    for slug in page_map:
+        if not incoming_links[slug]:
+            # overview pages are expected roots
+            if not slug.endswith('/overview') and slug.count('/') > 0:
+                issues['orphan_pages'].append(slug)
+
+    # 3. Stale pages - not updated in 90+ days
+    for slug, fm in page_frontmatter.items():
+        updated = fm.get('updated', '')
+        if updated:
+            try:
+                updated_date = datetime.strptime(updated, '%Y-%m-%d')
+                days_old = (datetime.now() - updated_date).days
+                if days_old > 90:
+                    issues['stale_pages'].append({
+                        'page': slug,
+                        'last_updated': updated,
+                        'days_old': days_old,
+                    })
+            except ValueError:
+                pass
+
+    # 4. Missing citations - lines with factual claims but no source marker
+    citation_pattern = re.compile(r'\(source:|\(inferred\)|\(wiki:')
+    for slug, content in page_content.items():
+        _, body = parse_frontmatter(content)
+        lines = body.strip().splitlines()
+        uncited_count = 0
+        for line in lines:
+            line = line.strip()
+            # Skip headings, empty lines, list markers, links, metadata
+            if not line or line.startswith('#') or line.startswith('---'):
+                continue
+            if line.startswith('- [') or line.startswith('- What') or line.startswith('- '):
+                # Check bullet points for citations
+                if len(line) > 40 and not citation_pattern.search(line):
+                    uncited_count += 1
+        if uncited_count > 3:
+            issues['missing_citations'].append({
+                'page': slug,
+                'uncited_claims': uncited_count,
+            })
+
+    # 5. Schema drift - entities in wiki pages not in entities.json
+    entities_path = os.path.join(SCHEMA_DIR, 'entities.json')
+    registered_ids: set[str] = set()
+    if os.path.exists(entities_path):
+        try:
+            with open(entities_path, 'r') as f:
+                data = json.load(f)
+            for e in data.get('entities', []):
+                if isinstance(e, dict):
+                    registered_ids.add(e.get('id', ''))
+        except Exception:
+            pass
+
+    for slug, content in page_content.items():
+        # Find capitalized multi-word phrases (same logic as entity extraction)
+        found = []
+        for line in content.splitlines():
+            stripped_line = re.sub(r'^#+\s*', '', line)
+            found.extend(re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', stripped_line))
+        for name in set(found):
+            if name.lower() in ENTITY_STOPWORDS:
+                continue
+            entity_id = re.sub(r'\s+', '-', name.lower())
+            entity_id = re.sub(r'[^\w\-]', '', entity_id)
+            if entity_id not in registered_ids:
+                issues['schema_drift'].append({
+                    'page': slug,
+                    'entity': name,
+                    'entity_id': entity_id,
+                })
+
+    # 6. Coverage gaps - source files with no wiki pages
+    if os.path.exists(SOURCES_DIR):
+        for root, _dirs, files in os.walk(SOURCES_DIR):
+            for fname in files:
+                if fname.startswith('.'):
+                    continue
+                source_rel = os.path.relpath(os.path.join(root, fname), BASE_DIR)
+                # Check if any wiki page references this source
+                found_in_wiki = False
+                for content in page_content.values():
+                    if source_rel in content or fname in content:
+                        found_in_wiki = True
+                        break
+                if not found_in_wiki:
+                    issues['coverage_gaps'].append(source_rel)
+
+    # Count total issues
+    total_issues = sum(len(v) for v in issues.values())
+
+    # Write lint report
+    report_path = os.path.join(WIKI_DIR, f'lint-report-{today}.md')
+    report_lines = [
+        f'# Lint Report - {today}',
+        '',
+        f'Total issues found: {total_issues}',
+        '',
+    ]
+
+    if issues['dead_links']:
+        report_lines.append('## Dead Links')
+        report_lines.append('')
+        for item in issues['dead_links']:
+            report_lines.append(f'- `{item["page"]}` links to `[[{item["broken_link"]}]]` which does not exist')
+        report_lines.append('')
+
+    if issues['orphan_pages']:
+        report_lines.append('## Orphan Pages (no incoming links)')
+        report_lines.append('')
+        for slug in issues['orphan_pages']:
+            report_lines.append(f'- `{slug}`')
+        report_lines.append('')
+
+    if issues['stale_pages']:
+        report_lines.append('## Stale Pages (90+ days without update)')
+        report_lines.append('')
+        for item in issues['stale_pages']:
+            report_lines.append(f'- `{item["page"]}` - last updated {item["last_updated"]} ({item["days_old"]} days ago)')
+        report_lines.append('')
+
+    if issues['missing_citations']:
+        report_lines.append('## Missing Citations')
+        report_lines.append('')
+        for item in issues['missing_citations']:
+            report_lines.append(f'- `{item["page"]}` has {item["uncited_claims"]} uncited claims')
+        report_lines.append('')
+
+    if issues['schema_drift']:
+        report_lines.append('## Schema Drift (entities not in entities.json)')
+        report_lines.append('')
+        seen = set()
+        for item in issues['schema_drift']:
+            key = item['entity_id']
+            if key not in seen:
+                report_lines.append(f'- `{item["entity"]}` found in `{item["page"]}` but not registered')
+                seen.add(key)
+        report_lines.append('')
+
+    if issues['coverage_gaps']:
+        report_lines.append('## Coverage Gaps (sources with no wiki pages)')
+        report_lines.append('')
+        for src in issues['coverage_gaps']:
+            report_lines.append(f'- `{src}`')
+        report_lines.append('')
+
+    if total_issues == 0:
+        report_lines.append('All checks passed. Knowledge base is healthy.')
+        report_lines.append('')
+
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(report_lines))
+
+    # Log the lint
+    _append_log(
+        operation='LINT',
+        description=f'{total_issues} issues found | report: wiki/lint-report-{today}.md',
+        details=[
+            f'Dead links: {len(issues["dead_links"])}',
+            f'Orphan pages: {len(issues["orphan_pages"])}',
+            f'Stale pages: {len(issues["stale_pages"])}',
+            f'Missing citations: {len(issues["missing_citations"])}',
+            f'Schema drift: {len(issues["schema_drift"])}',
+            f'Coverage gaps: {len(issues["coverage_gaps"])}',
+        ],
+        date=today,
+    )
+
+    return {
+        'issues': issues,
+        'total_issues': total_issues,
+        'report_path': report_path,
+    }
+
+
+def ingest_dir(directory: str, client_slug: str, force: bool = False) -> dict:
+    """
+    Batch ingest all supported files from a directory.
+
+    Walks the directory (non-recursive by default for safety), ingests each
+    supported file (.md, .txt, .pdf) into the given client.
+
+    Returns a summary of all ingestions.
+    """
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f'Directory not found: {directory}')
+
+    supported_exts = {'.md', '.txt', '.pdf'}
+    files = []
+    for fname in sorted(os.listdir(directory)):
+        fpath = os.path.join(directory, fname)
+        if not os.path.isfile(fpath):
+            continue
+        _, ext = os.path.splitext(fname)
+        if ext.lower() in supported_exts:
+            files.append(fpath)
+
+    if not files:
+        print(f'No supported files found in {directory}')
+        return {'ingested': 0, 'skipped': 0, 'errors': 0, 'results': []}
+
+    print(f'Found {len(files)} files to ingest into client "{client_slug}"')
+    print()
+
+    ingested = 0
+    skipped = 0
+    errors = 0
+    results = []
+
+    for i, fpath in enumerate(files, 1):
+        fname = os.path.basename(fpath)
+        print(f'[{i}/{len(files)}] {fname}...', end=' ')
+        try:
+            result = ingest_source_to_both(fpath, client_slug, force=force)
+            if not result:
+                print('skipped (already ingested)')
+                skipped += 1
+            else:
+                print(f'{result["action"]} -> {result["wiki_page"]}')
+                ingested += 1
+                results.append(result)
+        except Exception as e:
+            print(f'ERROR: {e}')
+            errors += 1
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    _append_log(
+        operation='INGEST',
+        description=f'Batch ingest from {directory} into {client_slug}',
+        details=[
+            f'Files found: {len(files)}',
+            f'Ingested: {ingested}',
+            f'Skipped: {skipped}',
+            f'Errors: {errors}',
+        ],
+        date=today,
+    )
+
+    return {
+        'ingested': ingested,
+        'skipped': skipped,
+        'errors': errors,
+        'results': results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tornado - inbox processor
+# ---------------------------------------------------------------------------
+
+# Type detection keywords - maps content patterns to wiki page types
+_TYPE_KEYWORDS = {
+    'source-summary': ['meeting notes', 'attendees', 'action items', 'minutes', 'transcript'],
+    'entity': ['hazard', 'risk estimation', 'risk evaluation', 'product specification', 'device description'],
+    'concept': ['procedure', 'sop', 'work instruction', 'methodology', 'process description'],
+    'deliverable': ['report', 'audit', 'assessment', 'evaluation report', 'review report'],
+    'comparison': ['comparison', 'versus', 'alternatives', 'trade-off', 'benchmarking'],
+    'overview': ['overview', 'executive summary', 'project summary', 'engagement summary'],
+}
+
+INBOX_DIR = os.path.join(BASE_DIR, 'inbox')
+
+
+def _detect_page_type(content: str, frontmatter: dict) -> str:
+    """Detect wiki page type from frontmatter or content keywords."""
+    # Trust frontmatter first
+    fm_type = frontmatter.get('type', '')
+    if fm_type in ('overview', 'entity', 'concept', 'source-summary', 'comparison', 'deliverable'):
+        return fm_type
+
+    content_lower = content.lower()
+    best_type = 'source-summary'
+    best_score = 0
+
+    for page_type, keywords in _TYPE_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in content_lower)
+        if score > best_score:
+            best_score = score
+            best_type = page_type
+
+    return best_type
+
+
+def _detect_client(content: str, frontmatter: dict, filename: str) -> str | None:
+    """Detect client slug from frontmatter, filename pattern, or content."""
+    # 1. Frontmatter client field
+    fm_client = frontmatter.get('client', '')
+    if fm_client and fm_client != '_shared':
+        return fm_client
+
+    # 2. Filename pattern: client--filename.md or client_filename.md
+    if '--' in filename:
+        candidate = filename.split('--')[0].lower().strip()
+        if re.match(r'^[a-z0-9][a-z0-9\-]*$', candidate):
+            return candidate
+
+    # 3. Check if any existing client slug appears in the content
+    existing_clients = []
+    if os.path.exists(WIKI_DIR):
+        for d in os.listdir(WIKI_DIR):
+            if os.path.isdir(os.path.join(WIKI_DIR, d)) and not d.startswith('_'):
+                existing_clients.append(d)
+
+    content_lower = content.lower()
+    for client in existing_clients:
+        # Match client slug or its title-case form
+        if client in content_lower or client.replace('-', ' ') in content_lower:
+            return client
+
+    return None
+
+
+def tornado(client_slug: str = None, dry_run: bool = False, apply_profile: bool = False) -> dict:
+    """
+    Process all files in the inbox/ directory.
+
+    For each file:
+    1. Read content and parse frontmatter
+    2. Detect page type from content keywords
+    3. Detect or use specified client
+    4. Ingest via ingest_source_to_both() (existing)
+    5. Archive original to sources/{client}/
+    6. Optionally apply vocabulary harmonization from active profile
+
+    Args:
+        client_slug: Force all files into this client. If None, auto-detect per file.
+        dry_run: If True, show what would happen without doing it.
+        apply_profile: If True, run harmonize(fix=True) on each ingested page.
+
+    Returns a summary dict.
+    """
+    os.makedirs(INBOX_DIR, exist_ok=True)
+
+    supported_exts = {'.md', '.txt', '.pdf'}
+    files = []
+    for fname in sorted(os.listdir(INBOX_DIR)):
+        fpath = os.path.join(INBOX_DIR, fname)
+        if not os.path.isfile(fpath):
+            continue
+        _, ext = os.path.splitext(fname)
+        if ext.lower() in supported_exts:
+            files.append(fpath)
+
+    if not files:
+        print('Inbox is empty. Drop files into inbox/ and run again.')
+        return {'processed': 0, 'created': 0, 'updated': 0, 'archived': 0, 'skipped': 0, 'errors': 0}
+
+    print(f'=== Mnemosyne Tornado ===\n')
+    print(f'Scanning inbox/... found {len(files)} files\n')
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    processed = 0
+    created = 0
+    updated = 0
+    archived = 0
+    skipped = 0
+    errors = 0
+    details = []
+
+    for i, fpath in enumerate(files, 1):
+        fname = os.path.basename(fpath)
+        print(f'[{i}/{len(files)}]  {fname}')
+
+        # Read and analyze
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            print(f'        ERROR: Could not read file: {e}\n')
+            errors += 1
+            continue
+
+        fm, body = parse_frontmatter(content)
+        detected_type = _detect_page_type(content, fm)
+        detected_client = client_slug or _detect_client(content, fm, fname)
+
+        if not detected_client:
+            print(f'        SKIP: Could not detect client. Use --client flag.')
+            print()
+            skipped += 1
+            continue
+
+        # Validate client slug
+        if not re.match(r'^[a-z0-9][a-z0-9\-]*$', detected_client):
+            print(f'        SKIP: Invalid client slug "{detected_client}"')
+            print()
+            skipped += 1
+            continue
+
+        print(f'        Type: {detected_type}')
+        print(f'        Client: {detected_client}')
+
+        if dry_run:
+            page_slug = re.sub(r'[^\w\-]', '-', os.path.splitext(fname)[0]).lower()
+            page_slug = re.sub(r'-+', '-', page_slug).strip('-')
+            print(f'        -> wiki/{detected_client}/{page_slug}.md (dry run)')
+            print(f'        -> sources/{detected_client}/{fname} (dry run)')
+            print()
+            processed += 1
+            continue
+
+        # Ingest using existing function
+        try:
+            result = ingest_source_to_both(fpath, detected_client, force=True)
+            if not result:
+                print(f'        Skipped (duplicate)')
+                skipped += 1
+            else:
+                action = result.get('action', 'created')
+                print(f'        -> {result["wiki_page"]} ({action})')
+                if action == 'created':
+                    created += 1
+                else:
+                    updated += 1
+
+                # Apply profile harmonization if requested
+                if apply_profile:
+                    profile = get_active_profile()
+                    if profile:
+                        harm_result = harmonize(detected_client, fix=True)
+                        fixed = harm_result.get('pages_fixed', 0)
+                        if fixed:
+                            print(f'        Profile applied: {fixed} pages harmonized')
+        except Exception as e:
+            print(f'        ERROR: {e}')
+            errors += 1
+            print()
+            continue
+
+        # Archive: move original to sources/{client}/
+        sources_client_dir = os.path.join(SOURCES_DIR, detected_client)
+        os.makedirs(sources_client_dir, exist_ok=True)
+        archive_path = os.path.join(sources_client_dir, fname)
+        try:
+            shutil.move(fpath, archive_path)
+            print(f'        -> sources/{detected_client}/{fname} (archived)')
+            archived += 1
+        except Exception as e:
+            print(f'        WARNING: Could not archive: {e}')
+
+        processed += 1
+        print()
+
+    # Log the tornado run
+    if not dry_run:
+        _append_log(
+            operation='TORNADO',
+            description=f'Inbox processed: {processed} files',
+            details=[
+                f'Created: {created}',
+                f'Updated: {updated}',
+                f'Archived: {archived}',
+                f'Skipped: {skipped}',
+                f'Errors: {errors}',
+            ],
+            date=today,
+        )
+
+    # Summary
+    print(f'Tornado {"(dry run) " if dry_run else ""}complete.')
+    print(f'  Processed:  {processed}')
+    print(f'  Created:    {created} wiki pages')
+    print(f'  Updated:    {updated} wiki pages')
+    print(f'  Archived:   {archived} sources')
+    print(f'  Skipped:    {skipped}')
+    print(f'  Errors:     {errors}')
+    remaining = len(os.listdir(INBOX_DIR)) if os.path.exists(INBOX_DIR) else 0
+    remaining = len([f for f in os.listdir(INBOX_DIR) if os.path.isfile(os.path.join(INBOX_DIR, f))]) if remaining else 0
+    print(f'  Inbox:      {"empty" if remaining == 0 else f"{remaining} files remaining"}')
+
+    return {
+        'processed': processed,
+        'created': created,
+        'updated': updated,
+        'archived': archived,
+        'skipped': skipped,
+        'errors': errors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Status, recent, tags, diff, snapshot, dedupe, export, profile functions
+# ---------------------------------------------------------------------------
+
+def status() -> dict:
+    """
+    Quick summary of the knowledge base health.
+
+    Returns counts of un-ingested sources, recently modified wiki pages,
+    and a rough pending-lint issue count (orphan pages).
+    """
+    # Find all source files
+    source_files = []
+    if os.path.isdir(SOURCES_DIR):
+        for root, dirs, files in os.walk(SOURCES_DIR):
+            for fname in files:
+                if not fname.startswith('.'):
+                    source_files.append(os.path.join(root, fname))
+
+    # Read log.md to find which sources have been ingested
+    ingested_sources = set()
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'r') as f:
+            log_content = f.read()
+        # Match filenames mentioned in INGEST log entries
+        for match in re.finditer(r'INGEST\s*\|\s*(.+)', log_content):
+            desc = match.group(1)
+            ingested_sources.add(desc.strip())
+
+    # Count un-ingested: sources whose basename is not mentioned in any ingest log line
+    uningest_count = 0
+    for sf in source_files:
+        basename = os.path.basename(sf)
+        if basename not in log_content if os.path.exists(LOG_FILE) else True:
+            uningest_count += 1
+
+    # Count wiki pages
+    wiki_pages = []
+    if os.path.isdir(WIKI_DIR):
+        for root, dirs, files in os.walk(WIKI_DIR):
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+            for fname in files:
+                if fname.endswith('.md') and fname not in EXCLUDED_FILES:
+                    wiki_pages.append(os.path.join(root, fname))
+
+    # Count orphan pages (pages with no incoming links from other pages)
+    all_slugs = set()
+    incoming = set()
+    for wp in wiki_pages:
+        rel = os.path.relpath(wp, WIKI_DIR)
+        slug = rel.replace(os.sep, '/').replace('.md', '')
+        all_slugs.add(slug)
+
+    for wp in wiki_pages:
+        with open(wp, 'r') as f:
+            content = f.read()
+        for link_match in re.finditer(r'\[\[([^\]]+)\]\]', content):
+            incoming.add(link_match.group(1))
+
+    orphan_count = len(all_slugs - incoming)
+
+    return {
+        'source_files': len(source_files),
+        'un_ingested': uningest_count,
+        'wiki_pages': len(wiki_pages),
+        'orphan_pages': orphan_count,
+    }
+
+
+def recent(n: int = 10) -> list:
+    """
+    Parse log.md and return the last N log entries.
+
+    Each entry is a dict with {date, operation, description}.
+    """
+    if not os.path.exists(LOG_FILE):
+        return []
+
+    with open(LOG_FILE, 'r') as f:
+        log_content = f.read()
+
+    entries = []
+    for match in re.finditer(
+        r'## \[(\d{4}-\d{2}-\d{2}[\s\d:]*)\]\s+(\w[\w-]*)\s*\|\s*(.+)',
+        log_content,
+    ):
+        entries.append({
+            'date': match.group(1).strip(),
+            'operation': match.group(2).strip(),
+            'description': match.group(3).strip(),
+        })
+
+    return entries[:n]
+
+
+def tags_list() -> dict:
+    """
+    Read schema/tags.json and return the tags dict with counts and pages.
+    """
+    tags_file = os.path.join(SCHEMA_DIR, 'tags.json')
+    if not os.path.exists(tags_file):
+        return {}
+
+    with open(tags_file, 'r') as f:
+        data = json.load(f)
+
+    return data.get('tags', {})
+
+
+def tags_merge(old_tag: str, new_tag: str) -> dict:
+    """
+    Merge old_tag into new_tag in schema/tags.json and all wiki page frontmatter.
+
+    Combines page lists and updates tag counts in schema. Scans all wiki pages
+    and replaces the old tag with the new tag in their frontmatter tags lists.
+
+    Returns {pages_updated, old_tag, new_tag}.
+    """
+    tags_file = os.path.join(SCHEMA_DIR, 'tags.json')
+    pages_updated = 0
+
+    # Update tags.json
+    if os.path.exists(tags_file):
+        def merge_tags_json(content):
+            if not content.strip():
+                return content
+            data = json.loads(content)
+            tags = data.get('tags', {})
+            if old_tag in tags:
+                old_entry = tags.pop(old_tag)
+                if new_tag not in tags:
+                    tags[new_tag] = old_entry
+                else:
+                    # Merge pages lists, deduplicate
+                    merged_pages = list(set(
+                        tags[new_tag].get('pages', []) + old_entry.get('pages', [])
+                    ))
+                    tags[new_tag]['pages'] = merged_pages
+                    tags[new_tag]['count'] = len(merged_pages)
+                data['tags'] = tags
+                data['updated'] = datetime.now().strftime('%Y-%m-%d')
+            return json.dumps(data, indent=2)
+
+        _locked_read_modify_write(tags_file, merge_tags_json)
+
+    # Scan and update all wiki pages
+    if os.path.isdir(WIKI_DIR):
+        for root, dirs, files in os.walk(WIKI_DIR):
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+            for fname in files:
+                if not fname.endswith('.md') or fname in EXCLUDED_FILES:
+                    continue
+                fpath = os.path.join(root, fname)
+
+                def replace_tag(content, _old=old_tag, _new=new_tag):
+                    # Replace tag in frontmatter tags list
+                    updated = re.sub(
+                        r'(^\s+-\s+)' + re.escape(_old) + r'\s*$',
+                        r'\g<1>' + _new,
+                        content,
+                        flags=re.MULTILINE,
+                    )
+                    return updated
+
+                with open(fpath, 'r') as f:
+                    original = f.read()
+
+                new_content = replace_tag(original)
+                if new_content != original:
+                    _locked_read_modify_write(fpath, replace_tag)
+                    pages_updated += 1
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    _append_log(
+        operation='UPDATE',
+        description=f'Merged tag "{old_tag}" into "{new_tag}"',
+        details=[f'Pages updated: {pages_updated}'],
+        date=today,
+    )
+
+    return {
+        'pages_updated': pages_updated,
+        'old_tag': old_tag,
+        'new_tag': new_tag,
+    }
+
+
+def diff_page(page_slug: str) -> str:
+    """
+    Show git diff for a wiki page.
+
+    Uses subprocess to run git diff HEAD on the wiki page file.
+    If the slug has no .md extension, one is appended.
+    Returns the diff output string, or an error message if not in a git repo.
+    """
+    if not page_slug.endswith('.md'):
+        page_slug = page_slug + '.md'
+
+    page_path = os.path.join('wiki', page_slug)
+
+    try:
+        result = subprocess.run(
+            ['git', 'diff', 'HEAD', '--', page_path],
+            capture_output=True,
+            text=True,
+            cwd=BASE_DIR,
+        )
+        if result.returncode != 0 and result.stderr:
+            return f'Error: {result.stderr.strip()}'
+        return result.stdout if result.stdout else '(no changes)'
+    except FileNotFoundError:
+        return 'Error: git is not installed or not found in PATH'
+    except Exception as e:
+        return f'Error: {e}'
+
+
+def snapshot(client_slug: str) -> dict:
+    """
+    Create a zip archive of a client's wiki pages and their schema entries.
+
+    Saves to snapshots/{client_slug}-{date}.zip. Creates snapshots/ dir if needed.
+    Also attempts to create a git tag snapshot/{client_slug}/{date}.
+
+    Returns {path, pages_count, tag}.
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    snapshots_dir = os.path.join(BASE_DIR, 'snapshots')
+    os.makedirs(snapshots_dir, exist_ok=True)
+
+    zip_name = f'{client_slug}-{today}.zip'
+    zip_path = os.path.join(snapshots_dir, zip_name)
+
+    client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
+    pages_count = 0
+
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Add wiki pages
+        if os.path.isdir(client_wiki_dir):
+            for root, dirs, files in os.walk(client_wiki_dir):
+                for fname in files:
+                    if fname.endswith('.md'):
+                        fpath = os.path.join(root, fname)
+                        arcname = os.path.relpath(fpath, BASE_DIR)
+                        zf.write(fpath, arcname)
+                        pages_count += 1
+
+        # Add schema files with client-relevant entries
+        for schema_name in ('entities.json', 'graph.json', 'tags.json'):
+            schema_path = os.path.join(SCHEMA_DIR, schema_name)
+            if os.path.exists(schema_path):
+                zf.write(schema_path, os.path.relpath(schema_path, BASE_DIR))
+
+    # Try to create a git tag
+    tag_name = f'snapshot/{client_slug}/{today}'
+    try:
+        subprocess.run(
+            ['git', 'tag', tag_name, '-m', f'Snapshot of {client_slug} on {today}'],
+            capture_output=True,
+            text=True,
+            cwd=BASE_DIR,
+        )
+    except Exception:
+        pass
+
+    _append_log(
+        operation='UPDATE',
+        description=f'Snapshot created for {client_slug}',
+        details=[f'Path: {zip_path}', f'Pages: {pages_count}', f'Tag: {tag_name}'],
+        date=today,
+    )
+
+    return {
+        'path': zip_path,
+        'pages_count': pages_count,
+        'tag': tag_name,
+    }
+
+
+def dedupe() -> dict:
+    """
+    Scan all wiki pages and find duplicates by content hash.
+
+    Computes a hash of the body text (after frontmatter) for each page,
+    then groups pages with identical hashes.
+
+    Returns {duplicates: list of groups, total_groups: int}.
+    """
+    hash_map = {}  # hash -> list of page slugs
+
+    if os.path.isdir(WIKI_DIR):
+        for root, dirs, files in os.walk(WIKI_DIR):
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+            for fname in files:
+                if not fname.endswith('.md') or fname in EXCLUDED_FILES:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, 'r') as f:
+                    content = f.read()
+
+                _, body = parse_frontmatter(content)
+                body_stripped = body.strip()
+                if not body_stripped:
+                    continue
+
+                h = _content_hash(body_stripped)
+                rel = os.path.relpath(fpath, WIKI_DIR).replace(os.sep, '/')
+                slug = rel.replace('.md', '')
+                hash_map.setdefault(h, []).append(slug)
+
+    duplicates = [group for group in hash_map.values() if len(group) > 1]
+
+    return {
+        'duplicates': duplicates,
+        'total_groups': len(duplicates),
+    }
+
+
+def export_client(client_slug: str, format: str = 'json') -> str:
+    """
+    Export all wiki pages for a client to a single file.
+
+    For 'json' format: array of {slug, frontmatter, body} objects.
+    For 'md' format: concatenated pages with separators.
+
+    Writes output to exports/{client_slug}-{date}.{format}.
+    Creates exports/ dir if needed. Returns the output file path.
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    exports_dir = os.path.join(BASE_DIR, 'exports')
+    os.makedirs(exports_dir, exist_ok=True)
+
+    client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
+    pages = []
+
+    if os.path.isdir(client_wiki_dir):
+        for root, dirs, files in os.walk(client_wiki_dir):
+            for fname in sorted(files):
+                if not fname.endswith('.md'):
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, 'r') as f:
+                    content = f.read()
+
+                fm, body = parse_frontmatter(content)
+                rel = os.path.relpath(fpath, WIKI_DIR).replace(os.sep, '/')
+                slug = rel.replace('.md', '')
+                pages.append({
+                    'slug': slug,
+                    'frontmatter': fm,
+                    'body': body,
+                })
+
+    ext = 'json' if format == 'json' else 'md'
+    out_file = os.path.join(exports_dir, f'{client_slug}-{today}.{ext}')
+
+    if format == 'json':
+        with open(out_file, 'w') as f:
+            json.dump(pages, f, indent=2, default=str)
+    else:
+        with open(out_file, 'w') as f:
+            for page in pages:
+                f.write(f'<!-- {page["slug"]} -->\n')
+                # Reconstruct frontmatter
+                if page['frontmatter']:
+                    f.write('---\n')
+                    for k, v in page['frontmatter'].items():
+                        if isinstance(v, list):
+                            f.write(f'{k}:\n')
+                            for item in v:
+                                f.write(f'  - {item}\n')
+                        else:
+                            f.write(f'{k}: {v}\n')
+                    f.write('---\n')
+                f.write(page['body'])
+                f.write('\n\n---\n\n')
+
+    return out_file
+
+
+def load_profile(name: str) -> dict:
+    """
+    Load a profile from profiles/{name}.json and return the parsed dict.
+    """
+    profile_path = os.path.join(PROFILES_DIR, f'{name}.json')
+    if not os.path.exists(profile_path):
+        raise FileNotFoundError(f'Profile not found: {profile_path}')
+
+    with open(profile_path, 'r') as f:
+        return json.load(f)
+
+
+def get_active_profile() -> Optional[dict]:
+    """
+    Read .mnemo-profile to get the active profile name, then load it.
+
+    Returns the profile dict, or None if no active profile is set.
+    """
+    if not os.path.exists(ACTIVE_PROFILE_FILE):
+        return None
+
+    with open(ACTIVE_PROFILE_FILE, 'r') as f:
+        name = f.read().strip()
+
+    if not name:
+        return None
+
+    try:
+        profile = load_profile(name)
+        profile['_profile_name'] = name
+        return profile
+    except FileNotFoundError:
+        return None
+
+
+def set_active_profile(name: str) -> None:
+    """
+    Write the profile name to .mnemo-profile to set it as active.
+    """
+    profile_path = os.path.join(PROFILES_DIR, f'{name}.json')
+    if not os.path.exists(profile_path):
+        raise FileNotFoundError(f'Profile not found: {profile_path}')
+
+    with open(ACTIVE_PROFILE_FILE, 'w') as f:
+        f.write(name + '\n')
+
+
+# ---------------------------------------------------------------------------
+# QMS: Traceability
+# ---------------------------------------------------------------------------
+
+def _load_traceability() -> dict:
+    """Load traceability.json, creating empty structure if missing."""
+    if os.path.exists(TRACEABILITY_FILE):
+        try:
+            with open(TRACEABILITY_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and 'links' in data:
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {'version': 1, 'updated': '', 'links': []}
+
+
+def trace_add(from_page: str, to_page: str, relationship: str) -> dict:
+    """
+    Add a trace link between two wiki pages.
+
+    Stores the link in schema/traceability.json and updates the from_page's
+    frontmatter to include a 'traces' field if not already present.
+    Validates both pages exist under wiki/.
+    Returns {from, to, type, created}.
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # Validate both pages exist
+    from_path = os.path.join(WIKI_DIR, from_page + '.md')
+    to_path = os.path.join(WIKI_DIR, to_page + '.md')
+    if not os.path.exists(from_path):
+        return {'error': f'Page not found: {from_page}'}
+    if not os.path.exists(to_path):
+        return {'error': f'Page not found: {to_page}'}
+
+    link_entry = {
+        'from': from_page,
+        'to': to_page,
+        'type': relationship,
+        'created': today,
+    }
+
+    os.makedirs(SCHEMA_DIR, exist_ok=True)
+
+    def modifier(raw: str) -> str:
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {'version': 1, 'updated': today, 'links': []}
+        else:
+            data = {'version': 1, 'updated': today, 'links': []}
+
+        if not isinstance(data.get('links'), list):
+            data['links'] = []
+
+        # Avoid duplicate links
+        for existing in data['links']:
+            if (existing.get('from') == from_page and
+                    existing.get('to') == to_page and
+                    existing.get('type') == relationship):
+                return json.dumps(data, indent=2)
+
+        data['links'].append(link_entry)
+        data['updated'] = today
+        return json.dumps(data, indent=2)
+
+    _locked_read_modify_write(TRACEABILITY_FILE, modifier)
+
+    # Update from_page frontmatter to include traces field
+    with open(from_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    fm, body = parse_frontmatter(content)
+    traces = fm.get('traces', [])
+    if isinstance(traces, str):
+        traces = [traces]
+    trace_ref = f'[[{to_page}]] ({relationship})'
+    if trace_ref not in traces:
+        traces.append(trace_ref)
+
+    # Rebuild frontmatter with traces field
+    if 'traces' not in content.split('---')[1] if content.startswith('---') else True:
+        # Insert traces field into frontmatter
+        match = re.match(r'^(---\s*\n)(.*?)(\n---\s*\n)', content, re.DOTALL)
+        if match:
+            fm_text = match.group(2)
+            traces_yaml = '\n'.join(f'  - "{t}"' for t in traces)
+            new_fm = fm_text + f'\ntraces:\n{traces_yaml}'
+            content = match.group(1) + new_fm + match.group(3) + body
+            with open(from_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+    else:
+        # Update existing traces field
+        match = re.match(r'^(---\s*\n)(.*?)(\n---\s*\n)', content, re.DOTALL)
+        if match:
+            fm_text = match.group(2)
+            # Remove old traces block
+            fm_text = re.sub(r'traces:\n(?:\s+-\s+.*\n)*', '', fm_text)
+            traces_yaml = '\n'.join(f'  - "{t}"' for t in traces)
+            new_fm = fm_text.rstrip() + f'\ntraces:\n{traces_yaml}'
+            content = match.group(1) + new_fm + match.group(3) + body
+            with open(from_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+    _append_log(
+        operation='TRACE',
+        description=f'Added trace: {from_page} --{relationship}--> {to_page}',
+        details=[f'Type: {relationship}', f'From: {from_page}', f'To: {to_page}'],
+        date=today,
+    )
+
+    return {'from': from_page, 'to': to_page, 'type': relationship, 'created': today}
+
+
+def trace_show(page_slug: str, direction: str = 'forward') -> dict:
+    """
+    Walk the trace chain from a page using BFS.
+
+    direction='forward': follow from-links outward (page -> what it links to -> ...).
+    direction='backward': follow to-links inward (what links to page -> ...).
+    Returns {root, direction, chain: [{page, relationship, depth}]}.
+    """
+    data = _load_traceability()
+    links = data.get('links', [])
+
+    # Build adjacency lists
+    forward: dict[str, list] = {}  # from -> [(to, type)]
+    backward: dict[str, list] = {}  # to -> [(from, type)]
+    for link in links:
+        f = link.get('from', '')
+        t = link.get('to', '')
+        rel = link.get('type', '')
+        forward.setdefault(f, []).append((t, rel))
+        backward.setdefault(t, []).append((f, rel))
+
+    adj = forward if direction == 'forward' else backward
+
+    # BFS
+    visited = set()
+    queue = [(page_slug, 0)]
+    visited.add(page_slug)
+    chain = []
+
+    while queue:
+        current, depth = queue.pop(0)
+        for neighbor, rel in adj.get(current, []):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                chain.append({
+                    'page': neighbor,
+                    'relationship': rel,
+                    'depth': depth + 1,
+                })
+                queue.append((neighbor, depth + 1))
+
+    return {'root': page_slug, 'direction': direction, 'chain': chain}
+
+
+def trace_matrix(client_slug: str) -> dict:
+    """
+    Generate a traceability matrix for a client.
+
+    Reads all trace links, filters to those involving client pages.
+    Returns {rows, columns, cells, gaps}.
+    """
+    data = _load_traceability()
+    links = data.get('links', [])
+
+    # Filter links to client pages
+    client_links = [
+        link for link in links
+        if link.get('from', '').startswith(client_slug + '/') or
+           link.get('to', '').startswith(client_slug + '/')
+    ]
+
+    # Collect all client pages involved in traces
+    all_pages = set()
+    for link in client_links:
+        f = link.get('from', '')
+        t = link.get('to', '')
+        if f.startswith(client_slug + '/'):
+            all_pages.add(f)
+        if t.startswith(client_slug + '/'):
+            all_pages.add(t)
+
+    rows = sorted(all_pages)
+    columns = sorted(all_pages)
+
+    # Build cells: (from, to) -> relationship
+    cells = {}
+    has_outgoing = set()
+    has_incoming = set()
+    for link in client_links:
+        f = link.get('from', '')
+        t = link.get('to', '')
+        rel = link.get('type', '')
+        cells[f'{f}|{t}'] = rel
+        has_outgoing.add(f)
+        has_incoming.add(t)
+
+    # Gaps: pages with no outgoing or no incoming traces
+    gaps = [p for p in all_pages if p not in has_outgoing or p not in has_incoming]
+
+    return {
+        'rows': rows,
+        'columns': columns,
+        'cells': cells,
+        'gaps': sorted(gaps),
+    }
+
+
+def trace_gaps(client_slug: str) -> dict:
+    """
+    Find items with broken or incomplete trace chains for a client.
+
+    Checks for:
+    - Requirements with no verification trace
+    - Hazards with no mitigation trace
+    - User needs with no requirements trace
+    Returns {unverified, unmitigated, unlinked_needs, total_gaps}.
+    """
+    data = _load_traceability()
+    links = data.get('links', [])
+
+    # Build sets of pages that are targets of specific relationship types
+    verified_pages = set()    # pages that have a 'verified-by' outgoing link
+    mitigated_pages = set()   # pages that have a 'mitigated-by' outgoing link
+    linked_needs = set()      # user-need pages that have a 'derived-from' incoming or outgoing link
+
+    for link in links:
+        f = link.get('from', '')
+        t = link.get('to', '')
+        rel = link.get('type', '')
+        if rel == 'verified-by':
+            verified_pages.add(f)
+        if rel == 'mitigated-by':
+            mitigated_pages.add(f)
+        if rel in ('derived-from', 'implemented-by', 'detailed-in'):
+            linked_needs.add(f)
+            linked_needs.add(t)
+
+    # Scan wiki pages for the client to classify by type from frontmatter
+    pattern = os.path.join(WIKI_DIR, client_slug, '**', '*.md')
+    pages = glob.glob(pattern, recursive=True)
+
+    unverified = []
+    unmitigated = []
+    unlinked_needs = []
+
+    for page_path in pages:
+        rel = os.path.relpath(page_path, WIKI_DIR)
+        slug = os.path.splitext(rel)[0]
+        try:
+            with open(page_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            fm, body = parse_frontmatter(content)
+        except Exception:
+            continue
+
+        page_type = fm.get('type', '')
+        tags = fm.get('tags', [])
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(',')]
+        title_lower = fm.get('title', '').lower()
+
+        # Heuristic classification
+        is_requirement = (
+            page_type in ('entity', 'concept') and
+            any(kw in title_lower for kw in ('requirement', 'req', 'specification', 'spec'))
+        ) or 'requirement' in tags
+
+        is_hazard = (
+            any(kw in title_lower for kw in ('hazard', 'risk', 'failure'))
+        ) or 'hazard' in tags or 'risk' in tags
+
+        is_user_need = (
+            any(kw in title_lower for kw in ('user need', 'user-need', 'intended use', 'intended purpose'))
+        ) or 'user-need' in tags
+
+        if is_requirement and slug not in verified_pages:
+            unverified.append(slug)
+        if is_hazard and slug not in mitigated_pages:
+            unmitigated.append(slug)
+        if is_user_need and slug not in linked_needs:
+            unlinked_needs.append(slug)
+
+    total_gaps = len(unverified) + len(unmitigated) + len(unlinked_needs)
+    return {
+        'unverified': sorted(unverified),
+        'unmitigated': sorted(unmitigated),
+        'unlinked_needs': sorted(unlinked_needs),
+        'total_gaps': total_gaps,
+    }
+
+
+# ---------------------------------------------------------------------------
+# QMS: Vocabulary and structure validation
+# ---------------------------------------------------------------------------
+
+def harmonize(client_slug: str, fix: bool = False) -> dict:
+    """
+    Scan wiki pages for vocabulary inconsistencies against the active profile.
+
+    Loads the active profile and checks each client wiki page for rejected
+    synonyms of preferred terms. If fix=True, replaces rejected terms with
+    preferred terms in all affected pages.
+    Returns {issues, total_issues, pages_fixed (if fix)}.
+    """
+    profile = get_active_profile()
+    if profile is None:
+        return {'error': 'No active profile. Set one with: mnemo profile activate <name>'}
+
+    vocabulary = profile.get('vocabulary', {})
+    preferred_terms = vocabulary.get('preferred', [])
+    if not preferred_terms:
+        return {'issues': [], 'total_issues': 0}
+
+    # Collect client wiki pages
+    pattern = os.path.join(WIKI_DIR, client_slug, '**', '*.md')
+    pages = glob.glob(pattern, recursive=True)
+
+    issues = []
+    pages_fixed = 0
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    for page_path in pages:
+        rel = os.path.relpath(page_path, WIKI_DIR)
+        slug = os.path.splitext(rel)[0]
+
+        try:
+            with open(page_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        page_modified = False
+        new_content = content
+
+        for entry in preferred_terms:
+            preferred = entry.get('term', '')
+            rejects = entry.get('reject', [])
+            for rejected in rejects:
+                # Case-insensitive search for rejected term
+                matches = re.findall(re.escape(rejected), content, re.IGNORECASE)
+                if matches:
+                    issues.append({
+                        'page': slug,
+                        'found_term': rejected,
+                        'preferred_term': preferred,
+                        'count': len(matches),
+                    })
+                    if fix:
+                        new_content = re.sub(
+                            re.escape(rejected), preferred, new_content, flags=re.IGNORECASE
+                        )
+                        page_modified = True
+
+        if fix and page_modified:
+            with open(page_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            pages_fixed += 1
+
+    result = {
+        'issues': issues,
+        'total_issues': len(issues),
+    }
+
+    if fix:
+        result['pages_fixed'] = pages_fixed
+        if pages_fixed > 0:
+            _append_log(
+                operation='HARMONIZE',
+                description=f'Vocabulary harmonization for {client_slug}',
+                details=[
+                    f'Profile: {profile.get("_profile_name", "unknown")}',
+                    f'Issues found: {len(issues)}',
+                    f'Pages fixed: {pages_fixed}',
+                ],
+                date=today,
+            )
+
+    return result
+
+
+def validate_structure(page_slug: str) -> dict:
+    """
+    Check a wiki page against the active profile's section requirements.
+
+    Loads the profile, determines the page type from frontmatter, checks
+    required sections for that type, and scans for ## headings in the page.
+    Returns {page, type, required_sections, present_sections, missing_sections, extra_sections}.
+    """
+    profile = get_active_profile()
+    if profile is None:
+        return {'error': 'No active profile. Set one with: mnemo profile activate <name>'}
+
+    page_path = os.path.join(WIKI_DIR, page_slug + '.md')
+    if not os.path.exists(page_path):
+        return {'error': f'Page not found: {page_slug}'}
+
+    with open(page_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    fm, body = parse_frontmatter(content)
+    page_type = fm.get('type', '')
+
+    # Determine which section template applies
+    sections_config = profile.get('sections', {})
+    # Try to match page type or tags to a section template
+    required_sections = []
+    matched_template = None
+
+    # Check if page tags or type match a section key
+    tags = fm.get('tags', [])
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(',')]
+
+    # Try matching by page slug suffix, tags, or type
+    for section_key, section_def in sections_config.items():
+        normalized_key = section_key.replace('-', ' ').lower()
+        title_lower = fm.get('title', '').lower().replace('-', ' ')
+        slug_lower = page_slug.lower().replace('-', ' ')
+        if (normalized_key in title_lower or
+                normalized_key in slug_lower or
+                section_key in tags):
+            required_sections = section_def.get('required', [])
+            matched_template = section_key
+            break
+
+    # Extract ## headings from page body
+    headings = re.findall(r'^##\s+(.+)$', body, re.MULTILINE)
+    # Normalize headings to slug form for comparison
+    present_normalized = [h.strip().lower().replace(' ', '-') for h in headings]
+    present_sections = [h.strip() for h in headings]
+
+    missing_sections = [s for s in required_sections if s not in present_normalized]
+    extra_sections = [h for h, norm in zip(present_sections, present_normalized)
+                      if norm not in required_sections and required_sections]
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    if missing_sections:
+        _append_log(
+            operation='VALIDATE',
+            description=f'Structure validation for {page_slug}',
+            details=[
+                f'Template: {matched_template or "none"}',
+                f'Missing sections: {", ".join(missing_sections)}',
+            ],
+            date=today,
+        )
+
+    return {
+        'page': page_slug,
+        'type': page_type,
+        'template': matched_template,
+        'required_sections': required_sections,
+        'present_sections': present_sections,
+        'missing_sections': missing_sections,
+        'extra_sections': extra_sections,
+    }
+
+
+def validate_consistency(client_slug: str) -> dict:
+    """
+    Cross-document consistency check for a client.
+
+    Reads all pages for the client and checks for:
+    - Inconsistent standard references (e.g. ISO 14971:2019 vs ISO 14971:2007)
+    - Conflicting version references for the same standard
+    Returns {conflicts, standard_inconsistencies, total_issues}.
+    """
+    pattern = os.path.join(WIKI_DIR, client_slug, '**', '*.md')
+    pages = glob.glob(pattern, recursive=True)
+
+    # Collect all standard references across pages
+    # Pattern: ISO NNNNN:YYYY, IEC NNNNN:YYYY, EN NNNNN:YYYY, etc.
+    std_pattern = re.compile(
+        r'\b((?:ISO|IEC|EN|ANSI|IEEE|BS|DIN|ASTM|FDA)\s*[\d\-]+)\s*:\s*(\d{4})\b',
+        re.IGNORECASE,
+    )
+
+    # standard_name -> {version -> [pages]}
+    std_refs: dict[str, dict[str, list]] = {}
+    conflicts = []
+
+    for page_path in pages:
+        rel = os.path.relpath(page_path, WIKI_DIR)
+        slug = os.path.splitext(rel)[0]
+
+        try:
+            with open(page_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        matches = std_pattern.findall(content)
+        for std_name, version in matches:
+            normalized = re.sub(r'\s+', ' ', std_name.strip().upper())
+            std_refs.setdefault(normalized, {})
+            std_refs[normalized].setdefault(version, [])
+            if slug not in std_refs[normalized][version]:
+                std_refs[normalized][version].append(slug)
+
+    # Find standards with multiple versions cited
+    standard_inconsistencies = []
+    for std_name, versions in std_refs.items():
+        if len(versions) > 1:
+            version_details = []
+            for ver, page_list in sorted(versions.items()):
+                version_details.append({
+                    'version': ver,
+                    'pages': page_list,
+                })
+            standard_inconsistencies.append({
+                'standard': std_name,
+                'versions_found': list(versions.keys()),
+                'details': version_details,
+            })
+
+    total_issues = len(conflicts) + len(standard_inconsistencies)
+    return {
+        'conflicts': conflicts,
+        'standard_inconsistencies': standard_inconsistencies,
+        'total_issues': total_issues,
+    }
+
+
+# ---------------------------------------------------------------------------
+# QMS: Repository scanning
+# ---------------------------------------------------------------------------
+
+def scan_repo(repo_path: str, client_slug: str) -> dict:
+    """
+    Scan a code repository and compare against wiki documentation.
+
+    Scans for dependency files (requirements.txt, package.json, Cargo.toml,
+    CMakeLists.txt, go.mod), parses dependencies, lists top-level directories
+    as architecture modules, and compares findings against wiki page content.
+    Returns {dependencies_found, dependencies_documented, dependencies_missing,
+             modules_found, modules_documented, modules_missing, suggestions}.
+    """
+    if not os.path.isdir(repo_path):
+        return {'error': f'Repository path not found: {repo_path}'}
+
+    # --- Parse dependencies ---
+    deps_found = []
+
+    # requirements.txt
+    req_txt = os.path.join(repo_path, 'requirements.txt')
+    if os.path.exists(req_txt):
+        with open(req_txt, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                match = re.match(r'^([a-zA-Z0-9_\-\.]+)\s*([>=<~!]+\s*[\d\.\*]+)?', line)
+                if match:
+                    name = match.group(1)
+                    version = (match.group(2) or '').strip()
+                    deps_found.append({'name': name, 'version': version, 'source': 'requirements.txt'})
+
+    # package.json
+    pkg_json = os.path.join(repo_path, 'package.json')
+    if os.path.exists(pkg_json):
+        try:
+            with open(pkg_json, 'r', encoding='utf-8') as f:
+                pkg = json.load(f)
+            for section in ('dependencies', 'devDependencies'):
+                for name, version in pkg.get(section, {}).items():
+                    deps_found.append({'name': name, 'version': version, 'source': 'package.json'})
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Cargo.toml
+    cargo_toml = os.path.join(repo_path, 'Cargo.toml')
+    if os.path.exists(cargo_toml):
+        try:
+            with open(cargo_toml, 'r', encoding='utf-8') as f:
+                cargo_content = f.read()
+            in_deps = False
+            for line in cargo_content.splitlines():
+                if re.match(r'^\[dependencies\]', line):
+                    in_deps = True
+                    continue
+                if re.match(r'^\[', line):
+                    in_deps = False
+                    continue
+                if in_deps:
+                    match = re.match(r'^(\w[\w\-]*)\s*=\s*"([^"]*)"', line)
+                    if match:
+                        deps_found.append({'name': match.group(1), 'version': match.group(2), 'source': 'Cargo.toml'})
+        except OSError:
+            pass
+
+    # go.mod
+    go_mod = os.path.join(repo_path, 'go.mod')
+    if os.path.exists(go_mod):
+        try:
+            with open(go_mod, 'r', encoding='utf-8') as f:
+                go_content = f.read()
+            for match in re.finditer(r'^\s+(\S+)\s+(v[\d\.]+)', go_content, re.MULTILINE):
+                module_name = match.group(1).split('/')[-1]
+                deps_found.append({'name': module_name, 'version': match.group(2), 'source': 'go.mod'})
+        except OSError:
+            pass
+
+    # CMakeLists.txt
+    cmake = os.path.join(repo_path, 'CMakeLists.txt')
+    if os.path.exists(cmake):
+        try:
+            with open(cmake, 'r', encoding='utf-8') as f:
+                cmake_content = f.read()
+            for match in re.finditer(r'find_package\s*\(\s*(\w+)', cmake_content):
+                deps_found.append({'name': match.group(1), 'version': '', 'source': 'CMakeLists.txt'})
+        except OSError:
+            pass
+
+    # --- Scan top-level directories as modules ---
+    modules_found = []
+    try:
+        for entry in os.listdir(repo_path):
+            entry_path = os.path.join(repo_path, entry)
+            if os.path.isdir(entry_path) and not entry.startswith('.'):
+                modules_found.append(entry)
+    except OSError:
+        pass
+
+    # --- Compare against wiki pages ---
+    wiki_pattern = os.path.join(WIKI_DIR, client_slug, '**', '*.md')
+    wiki_pages = glob.glob(wiki_pattern, recursive=True)
+
+    # Build a combined text corpus of all client wiki content
+    wiki_corpus = ''
+    for page_path in wiki_pages:
+        try:
+            with open(page_path, 'r', encoding='utf-8') as f:
+                wiki_corpus += f.read().lower() + '\n'
+        except Exception:
+            pass
+
+    dep_names = [d['name'] for d in deps_found]
+    deps_documented = [name for name in dep_names if name.lower() in wiki_corpus]
+    deps_missing = [name for name in dep_names if name.lower() not in wiki_corpus]
+
+    modules_documented = [m for m in modules_found if m.lower() in wiki_corpus]
+    modules_missing = [m for m in modules_found if m.lower() not in wiki_corpus]
+
+    # Generate suggestions
+    suggestions = []
+    for dep in deps_missing:
+        suggestions.append({
+            'action': 'CREATE',
+            'page': f'{client_slug}/{dep.lower().replace(".", "-")}-dependency',
+            'reason': f'Dependency "{dep}" found in repo but not documented in wiki',
+        })
+    for mod in modules_missing:
+        suggestions.append({
+            'action': 'CREATE',
+            'page': f'{client_slug}/{mod.lower()}-module',
+            'reason': f'Module "{mod}" found in repo but not documented in wiki',
+        })
+    # Suggest updates for documented items that might need version info
+    for dep in deps_found:
+        if dep['name'] in deps_documented and dep['version']:
+            suggestions.append({
+                'action': 'UPDATE',
+                'page': f'{client_slug} (containing page)',
+                'reason': f'Verify version {dep["version"]} for "{dep["name"]}" matches wiki documentation',
+            })
+
+    return {
+        'dependencies_found': deps_found,
+        'dependencies_documented': deps_documented,
+        'dependencies_missing': deps_missing,
+        'modules_found': modules_found,
+        'modules_documented': modules_documented,
+        'modules_missing': modules_missing,
+        'suggestions': suggestions,
+    }
+
+
 def repair() -> dict:
     """
     Repair corrupted Mnemosyne archives and schema files.
@@ -1667,6 +3336,7 @@ def main() -> None:
     search_parser = subparsers.add_parser('search', help='Dual-layer search (wiki + memvid)')
     search_parser.add_argument('query', help='Search query')
     search_parser.add_argument('-k', type=int, default=10, help='Max results (default: 10)')
+    search_parser.add_argument('--client', type=str, default=None, help='Scope search to a specific client')
 
     # drift
     subparsers.add_parser('drift', help='Check sync drift between wiki and memvid')
@@ -1685,6 +3355,93 @@ def main() -> None:
     init_parser.add_argument('--project', type=str, default=None, help='Project name (default: current directory name)')
     init_parser.add_argument('--clients', type=str, default=None, help='Comma-separated client slugs (default: default)')
 
+    # lint
+    subparsers.add_parser('lint', help='Health check: orphan pages, dead links, stale pages, missing citations')
+
+    # ingest-dir
+    ingest_dir_parser = subparsers.add_parser('ingest-dir', help='Batch ingest all files from a directory')
+    ingest_dir_parser.add_argument('directory', help='Path to directory containing source files')
+    ingest_dir_parser.add_argument('client_slug', help='Client slug (e.g. demo-retail, my-client)')
+    ingest_dir_parser.add_argument('--force', action='store_true', help='Re-ingest even if sources were previously ingested')
+
+    # tornado
+    tornado_parser = subparsers.add_parser('tornado', help='Process inbox: auto-detect, ingest, archive')
+    tornado_parser.add_argument('--client', type=str, default=None, help='Force all files into this client')
+    tornado_parser.add_argument('--dry-run', action='store_true', help='Show what would happen without doing it')
+    tornado_parser.add_argument('--profile', action='store_true', help='Apply active profile vocabulary after ingest')
+
+    # status
+    subparsers.add_parser('status', help='Quick summary of pending work')
+
+    # recent
+    recent_parser = subparsers.add_parser('recent', help='Show recent activity')
+    recent_parser.add_argument('-n', type=int, default=10, help='Number of entries (default: 10)')
+
+    # tags
+    tags_parser = subparsers.add_parser('tags', help='Tag management')
+    tags_sub = tags_parser.add_subparsers(dest='tags_command')
+    tags_sub.add_parser('list', help='List all tags with counts')
+    tags_merge_parser = tags_sub.add_parser('merge', help='Merge one tag into another')
+    tags_merge_parser.add_argument('old_tag', help='Tag to merge from (will be removed)')
+    tags_merge_parser.add_argument('new_tag', help='Tag to merge into')
+
+    # diff
+    diff_parser = subparsers.add_parser('diff', help='Show git diff for a wiki page')
+    diff_parser.add_argument('page', help='Page slug (e.g. demo-retail/sample-proposal)')
+
+    # snapshot
+    snap_parser = subparsers.add_parser('snapshot', help='Create versioned archive of a client')
+    snap_parser.add_argument('client_slug', help='Client slug')
+
+    # dedupe
+    subparsers.add_parser('dedupe', help='Detect near-duplicate wiki pages')
+
+    # export
+    export_parser = subparsers.add_parser('export', help='Export client knowledge base')
+    export_parser.add_argument('client_slug', help='Client slug')
+    export_parser.add_argument('--format', choices=['json', 'md'], default='json', help='Output format (default: json)')
+
+    # profile
+    profile_parser = subparsers.add_parser('profile', help='Manage writing style profiles')
+    profile_sub = profile_parser.add_subparsers(dest='profile_command')
+    profile_sub.add_parser('list', help='List available profiles')
+    profile_set_parser = profile_sub.add_parser('set', help='Set active profile')
+    profile_set_parser.add_argument('name', help='Profile name (e.g. eu-mdr, iso-13485)')
+    profile_sub.add_parser('show', help='Show active profile details')
+
+    # trace
+    trace_parser = subparsers.add_parser('trace', help='Traceability management')
+    trace_sub = trace_parser.add_subparsers(dest='trace_command')
+    trace_add_parser = trace_sub.add_parser('add', help='Add a trace link')
+    trace_add_parser.add_argument('from_page', help='Source page slug')
+    trace_add_parser.add_argument('to_page', help='Target page slug')
+    trace_add_parser.add_argument('relationship', help='Relationship type (e.g. mitigated-by, verified-by)')
+    trace_show_parser = trace_sub.add_parser('show', help='Show trace chain for a page')
+    trace_show_parser.add_argument('page', help='Page slug')
+    trace_show_parser.add_argument('--direction', choices=['forward', 'backward'], default='forward', help='Chain direction')
+    trace_matrix_parser = trace_sub.add_parser('matrix', help='Generate traceability matrix')
+    trace_matrix_parser.add_argument('client_slug', help='Client slug')
+    trace_gaps_parser = trace_sub.add_parser('gaps', help='Find incomplete trace chains')
+    trace_gaps_parser.add_argument('client_slug', help='Client slug')
+
+    # harmonize
+    harmonize_parser = subparsers.add_parser('harmonize', help='Vocabulary harmonization against active profile')
+    harmonize_parser.add_argument('--client', required=True, help='Client slug')
+    harmonize_parser.add_argument('--fix', action='store_true', help='Auto-fix inconsistencies')
+
+    # validate
+    validate_parser = subparsers.add_parser('validate', help='Validate document structure and consistency')
+    validate_sub = validate_parser.add_subparsers(dest='validate_command')
+    validate_struct_parser = validate_sub.add_parser('structure', help='Check page structure against profile')
+    validate_struct_parser.add_argument('page', help='Page slug')
+    validate_consist_parser = validate_sub.add_parser('consistency', help='Cross-document consistency check')
+    validate_consist_parser.add_argument('--client', required=True, help='Client slug')
+
+    # scan-repo
+    scan_parser = subparsers.add_parser('scan-repo', help='Scan code repo and compare against QMS docs')
+    scan_parser.add_argument('repo_path', help='Path to code repository')
+    scan_parser.add_argument('client_slug', help='Client slug')
+
     # repair
     subparsers.add_parser('repair', help='Repair corrupted archives and schema')
 
@@ -1698,7 +3455,7 @@ def main() -> None:
         if not args.query.strip():
             print('Error: search query cannot be empty.', file=sys.stderr)
             sys.exit(1)
-        results = dual_search(args.query, k=args.k)
+        results = dual_search(args.query, k=args.k, client=args.client)
         _print_search_results(results)
 
     elif args.command == 'drift':
@@ -1731,6 +3488,296 @@ def main() -> None:
     elif args.command == 'init':
         client_list = [c.strip() for c in args.clients.split(',')] if args.clients else None
         init_workspace(project_name=args.project, clients=client_list)
+
+    elif args.command == 'lint':
+        result = lint()
+        total = result['total_issues']
+        issues = result['issues']
+        print(f'=== Mnemosyne Lint ===\n')
+        if total == 0:
+            print('All checks passed. Knowledge base is healthy.')
+        else:
+            print(f'Found {total} issue(s):\n')
+            if issues['dead_links']:
+                print(f'  Dead links:          {len(issues["dead_links"])}')
+            if issues['orphan_pages']:
+                print(f'  Orphan pages:        {len(issues["orphan_pages"])}')
+            if issues['stale_pages']:
+                print(f'  Stale pages:         {len(issues["stale_pages"])}')
+            if issues['missing_citations']:
+                print(f'  Missing citations:   {len(issues["missing_citations"])}')
+            if issues['schema_drift']:
+                # Deduplicate by entity_id for count
+                unique_drift = len({item['entity_id'] for item in issues['schema_drift']})
+                print(f'  Schema drift:        {unique_drift}')
+            if issues['coverage_gaps']:
+                print(f'  Coverage gaps:       {len(issues["coverage_gaps"])}')
+        print(f'\nReport: {result["report_path"]}')
+
+    elif args.command == 'ingest-dir':
+        if not re.match(r'^[a-z0-9][a-z0-9\-]*$', args.client_slug):
+            print(f'Error: invalid client slug "{args.client_slug}". Use lowercase letters, numbers, hyphens only.', file=sys.stderr)
+            sys.exit(1)
+        try:
+            result = ingest_dir(args.directory, args.client_slug, force=args.force)
+            print(f'\nBatch ingest complete.')
+            print(f'  Ingested:  {result["ingested"]}')
+            print(f'  Skipped:   {result["skipped"]}')
+            print(f'  Errors:    {result["errors"]}')
+        except (FileNotFoundError, ValueError, OSError) as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == 'tornado':
+        if args.client and not re.match(r'^[a-z0-9][a-z0-9\-]*$', args.client):
+            print(f'Error: invalid client slug "{args.client}".', file=sys.stderr)
+            sys.exit(1)
+        tornado(client_slug=args.client, dry_run=args.dry_run, apply_profile=args.profile)
+
+    elif args.command == 'status':
+        result = status()
+        print('=== Mnemosyne Status ===\n')
+        print(f'  Sources:           {result.get("total_sources", 0)}')
+        print(f'  Un-ingested:       {result.get("un_ingested", 0)}')
+        print(f'  Wiki pages:        {result.get("total_wiki_pages", 0)}')
+        print(f'  Orphan pages:      {result.get("orphan_pages", 0)}')
+        if result.get('un_ingested_files'):
+            print('\n  Pending ingest:')
+            for f in result['un_ingested_files'][:10]:
+                print(f'    - {f}')
+
+    elif args.command == 'recent':
+        entries = recent(n=args.n)
+        if not entries:
+            print('No recent activity.')
+        else:
+            print('=== Recent Activity ===\n')
+            for e in entries:
+                print(f'  [{e["date"]}] {e["operation"]} | {e["description"]}')
+
+    elif args.command == 'tags':
+        if args.tags_command == 'list':
+            result = tags_list()
+            if not result:
+                print('No tags found.')
+            else:
+                print('=== Tags ===\n')
+                for tag, info in sorted(result.items()):
+                    count = info.get('count', 0) if isinstance(info, dict) else 0
+                    print(f'  {tag}: {count} pages')
+        elif args.tags_command == 'merge':
+            result = tags_merge(args.old_tag, args.new_tag)
+            print(f'Merged "{result["old_tag"]}" into "{result["new_tag"]}"')
+            print(f'  Pages updated: {result["pages_updated"]}')
+        else:
+            print('Usage: mnemo tags {list|merge}', file=sys.stderr)
+
+    elif args.command == 'diff':
+        output = diff_page(args.page)
+        if output:
+            print(output)
+        else:
+            print('No changes detected.')
+
+    elif args.command == 'snapshot':
+        result = snapshot(args.client_slug)
+        print(f'Snapshot created.')
+        print(f'  Path:   {result["path"]}')
+        print(f'  Pages:  {result["pages_count"]}')
+        if result.get('tag'):
+            print(f'  Git tag: {result["tag"]}')
+
+    elif args.command == 'dedupe':
+        result = dedupe()
+        groups = result.get('duplicates', [])
+        if not groups:
+            print('No duplicates found.')
+        else:
+            print(f'Found {result["total_groups"]} duplicate group(s):\n')
+            for group in groups:
+                print(f'  Hash: {group["hash"][:12]}...')
+                for page in group['pages']:
+                    print(f'    - {page}')
+                print()
+
+    elif args.command == 'export':
+        try:
+            path = export_client(args.client_slug, format=args.format)
+            print(f'Exported to: {path}')
+        except Exception as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == 'profile':
+        if args.profile_command == 'list':
+            if os.path.exists(PROFILES_DIR):
+                profiles = [f[:-5] for f in os.listdir(PROFILES_DIR) if f.endswith('.json')]
+                active = None
+                if os.path.exists(ACTIVE_PROFILE_FILE):
+                    with open(ACTIVE_PROFILE_FILE, 'r') as f:
+                        active = f.read().strip()
+                if profiles:
+                    print('Available profiles:\n')
+                    for p in sorted(profiles):
+                        marker = ' (active)' if p == active else ''
+                        print(f'  - {p}{marker}')
+                else:
+                    print('No profiles found in profiles/ directory.')
+            else:
+                print('No profiles/ directory found.')
+        elif args.profile_command == 'set':
+            try:
+                set_active_profile(args.name)
+                print(f'Active profile set to: {args.name}')
+            except (FileNotFoundError, ValueError) as e:
+                print(f'Error: {e}', file=sys.stderr)
+                sys.exit(1)
+        elif args.profile_command == 'show':
+            profile = get_active_profile()
+            if not profile:
+                print('No active profile. Set one with: mnemo profile set <name>')
+            else:
+                print(f'Active profile: {profile.get("name", "unknown")}\n')
+                print(f'  Description: {profile.get("description", "")}')
+                vocab = profile.get('vocabulary', {}).get('preferred', [])
+                print(f'  Vocabulary rules: {len(vocab)}')
+                sections = profile.get('sections', {})
+                print(f'  Section templates: {len(sections)}')
+                print(f'  Tone: {profile.get("tone", "not set")}')
+                print(f'  Voice: {profile.get("voice", "not set")}')
+        else:
+            print('Usage: mnemo profile {list|set|show}', file=sys.stderr)
+
+    elif args.command == 'trace':
+        if args.trace_command == 'add':
+            try:
+                result = trace_add(args.from_page, args.to_page, args.relationship)
+                print(f'Trace link added: {result["from"]} --[{result["type"]}]--> {result["to"]}')
+            except (FileNotFoundError, ValueError) as e:
+                print(f'Error: {e}', file=sys.stderr)
+                sys.exit(1)
+        elif args.trace_command == 'show':
+            result = trace_show(args.page, direction=args.direction)
+            chain = result.get('chain', [])
+            if not chain:
+                print(f'No trace links found for {args.page} ({args.direction}).')
+            else:
+                print(f'=== Trace Chain ({result["direction"]}) ===\n')
+                print(f'  Root: {result["root"]}')
+                for item in chain:
+                    indent = '    ' * item['depth']
+                    print(f'  {indent}{item["relationship"]} -> {item["page"]}')
+        elif args.trace_command == 'matrix':
+            result = trace_matrix(args.client_slug)
+            rows = result.get('rows', [])
+            if not rows:
+                print('No trace links found for this client.')
+            else:
+                print(f'=== Traceability Matrix: {args.client_slug} ===\n')
+                print(f'  Items traced: {len(rows)}')
+                gaps = result.get('gaps', [])
+                if gaps:
+                    print(f'  Gaps (no links): {len(gaps)}')
+                    for g in gaps[:10]:
+                        print(f'    - {g}')
+        elif args.trace_command == 'gaps':
+            result = trace_gaps(args.client_slug)
+            total = result.get('total_gaps', 0)
+            if total == 0:
+                print('No trace gaps found. All chains are complete.')
+            else:
+                print(f'=== Trace Gaps: {args.client_slug} ===\n')
+                print(f'  Total gaps: {total}\n')
+                if result.get('unverified'):
+                    print(f'  Requirements with no verification:')
+                    for item in result['unverified']:
+                        print(f'    - {item}')
+                if result.get('unmitigated'):
+                    print(f'  Hazards with no mitigation:')
+                    for item in result['unmitigated']:
+                        print(f'    - {item}')
+                if result.get('unlinked_needs'):
+                    print(f'  User needs with no requirements:')
+                    for item in result['unlinked_needs']:
+                        print(f'    - {item}')
+        else:
+            print('Usage: mnemo trace {add|show|matrix|gaps}', file=sys.stderr)
+
+    elif args.command == 'harmonize':
+        result = harmonize(args.client, fix=args.fix)
+        if 'error' in result:
+            print(f'Error: {result["error"]}', file=sys.stderr)
+            sys.exit(1)
+        total = result.get('total_issues', 0)
+        if total == 0:
+            print('No vocabulary issues found. Documents are harmonized.')
+        else:
+            print(f'Found {total} vocabulary issue(s):\n')
+            seen = set()
+            for item in result.get('issues', []):
+                key = (item['found_term'], item['preferred_term'])
+                if key not in seen:
+                    print(f'  "{item["found_term"]}" -> should be "{item["preferred_term"]}"')
+                    seen.add(key)
+            if args.fix:
+                print(f'\n  Pages fixed: {result.get("pages_fixed", 0)}')
+            else:
+                print(f'\n  Run with --fix to auto-replace.')
+
+    elif args.command == 'validate':
+        if args.validate_command == 'structure':
+            result = validate_structure(args.page)
+            if 'error' in result:
+                print(f'Error: {result["error"]}', file=sys.stderr)
+                sys.exit(1)
+            print(f'=== Structure Validation: {result.get("page", args.page)} ===\n')
+            print(f'  Type: {result.get("type", "unknown")}')
+            missing = result.get('missing_sections', [])
+            present = result.get('present_sections', [])
+            print(f'  Required sections present: {len(present)}')
+            if missing:
+                print(f'  Missing sections: {len(missing)}')
+                for s in missing:
+                    print(f'    - {s}')
+            else:
+                print('  All required sections present.')
+        elif args.validate_command == 'consistency':
+            result = validate_consistency(args.client)
+            total = result.get('total_issues', 0)
+            if total == 0:
+                print('No consistency issues found.')
+            else:
+                print(f'=== Consistency Check ===\n')
+                print(f'  Total issues: {total}\n')
+                for conflict in result.get('conflicts', []):
+                    print(f'  CONFLICT: {conflict}')
+                for incon in result.get('standard_inconsistencies', []):
+                    print(f'  WARNING: Standard "{incon.get("standard", "")}" cited as versions: {", ".join(incon.get("versions", []))}')
+        else:
+            print('Usage: mnemo validate {structure|consistency}', file=sys.stderr)
+
+    elif args.command == 'scan-repo':
+        try:
+            result = scan_repo(args.repo_path, args.client_slug)
+            deps_found = len(result.get('dependencies_found', []))
+            deps_missing = len(result.get('dependencies_missing', []))
+            mods_found = len(result.get('modules_found', []))
+            mods_missing = len(result.get('modules_missing', []))
+            suggestions = result.get('suggestions', [])
+            print(f'=== Repo Scan: {args.repo_path} ===\n')
+            print(f'  Dependencies found:      {deps_found}')
+            print(f'  Dependencies documented:  {len(result.get("dependencies_documented", []))}')
+            print(f'  Dependencies missing:     {deps_missing}')
+            print(f'  Modules found:           {mods_found}')
+            print(f'  Modules documented:       {len(result.get("modules_documented", []))}')
+            print(f'  Modules missing:          {mods_missing}')
+            if suggestions:
+                print(f'\n  Suggestions:')
+                for s in suggestions:
+                    print(f'    {s["action"]}: {s.get("page", "")} - {s.get("reason", "")}')
+        except (FileNotFoundError, ValueError) as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == 'repair':
         result = repair()

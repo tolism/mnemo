@@ -1,1 +1,29 @@
-{"synced_pages": {}}
+{
+  "synced_pages": {
+    "/Users/apomou/Desktop/Projects/mnemo/wiki/demo-retail/sample-meeting-notes.md": {
+      "hash": "eee22ff2e022250c2843ba541d4b5816",
+      "frame_count": 10,
+      "synced_at": "2026-04-05 23:23"
+    },
+    "/Users/apomou/Desktop/Projects/mnemo/wiki/demo-retail/sample-proposal.md": {
+      "hash": "be74bdfcaf0f73b21ddf50871d96898f",
+      "frame_count": 14,
+      "synced_at": "2026-04-05 23:23"
+    },
+    "/Users/apomou/Desktop/Projects/mnemo/wiki/demo-retail/sample-research.md": {
+      "hash": "699ef1673d8fe3c6e0caeba239100960",
+      "frame_count": 10,
+      "synced_at": "2026-04-05 23:23"
+    },
+    "/Users/apomou/Desktop/Projects/mnemo/wiki/demo-retail/meeting-notes-april.md": {
+      "hash": "e5811d21aec7e4e502fb4bb4fac1e861",
+      "frame_count": 8,
+      "synced_at": "2026-04-05 23:58"
+    },
+    "/Users/apomou/Desktop/Projects/mnemo/wiki/demo-retail/risk-assessment-draft.md": {
+      "hash": "55faa2eecd77530b648c78e0008805d3",
+      "frame_count": 12,
+      "synced_at": "2026-04-05 23:59"
+    }
+  }
+}
