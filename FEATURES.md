@@ -1,6 +1,6 @@
 # Mnemosyne - Feature Roadmap
 
-## Current Features (v0.3.1)
+## Current Features (v0.3.2)
 
 ### CLI Commands
 
@@ -35,6 +35,7 @@
 | `mnemo validate consistency` | Cross-document consistency check |
 | `mnemo scan-repo` | Scan code repo, compare against QMS docs, find gaps |
 | `mnemo tornado` | Inbox processor: auto-detect type/client, ingest, archive to sources |
+| `mnemo ingest-csv` | CSV ingest: one row = one wiki page, with column-to-frontmatter mapping and auto trace links |
 
 ### Web UI (localhost:3141)
 

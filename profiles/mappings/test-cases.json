@@ -1,0 +1,21 @@
+{
+  "name": "Test Cases Import",
+  "description": "Maps CSV rows to verification wiki pages. Links back to requirements and design specs.",
+  "page_type": "verification",
+  "id_column": "ID",
+  "title_column": "Title",
+  "detect_headers": ["test case", "test id", "expected result", "pass/fail", "test method", "verification"],
+  "mapping": {
+    "ID": "frontmatter.id",
+    "Title": "frontmatter.title",
+    "Description": "body.summary",
+    "Test Method": "body.test-method",
+    "Expected Result": "body.expected-result",
+    "Actual Result": "body.actual-result",
+    "Pass/Fail": "body.result",
+    "Requirement": "traces.derived-from",
+    "Design Spec": "traces.derived-from",
+    "DDS": "traces.derived-from",
+    "Status": "frontmatter.tags"
+  }
+}

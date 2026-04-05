@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import csv
 from contextlib import contextmanager
 import glob
 import hashlib
@@ -2001,7 +2002,7 @@ def tornado(client_slug: str = None, dry_run: bool = False, apply_profile: bool 
     """
     os.makedirs(INBOX_DIR, exist_ok=True)
 
-    supported_exts = {'.md', '.txt', '.pdf'}
+    supported_exts = {'.md', '.txt', '.pdf', '.csv'}
     files = []
     for fname in sorted(os.listdir(INBOX_DIR)):
         fpath = os.path.join(INBOX_DIR, fname)
@@ -2069,28 +2070,36 @@ def tornado(client_slug: str = None, dry_run: bool = False, apply_profile: bool 
             processed += 1
             continue
 
-        # Ingest using existing function
+        # Route CSV files through ingest_csv, everything else through ingest_source_to_both
+        _, file_ext = os.path.splitext(fname)
         try:
-            result = ingest_source_to_both(fpath, detected_client, force=True)
-            if not result:
-                print(f'        Skipped (duplicate)')
-                skipped += 1
+            if file_ext.lower() == '.csv':
+                csv_result = ingest_csv(fpath, detected_client)
+                csv_created = csv_result.get('pages_created', 0)
+                csv_updated = csv_result.get('pages_updated', 0)
+                created += csv_created
+                updated += csv_updated
             else:
-                action = result.get('action', 'created')
-                print(f'        -> {result["wiki_page"]} ({action})')
-                if action == 'created':
-                    created += 1
+                result = ingest_source_to_both(fpath, detected_client, force=True)
+                if not result:
+                    print(f'        Skipped (duplicate)')
+                    skipped += 1
                 else:
-                    updated += 1
+                    action = result.get('action', 'created')
+                    print(f'        -> {result["wiki_page"]} ({action})')
+                    if action == 'created':
+                        created += 1
+                    else:
+                        updated += 1
 
-                # Apply profile harmonization if requested
-                if apply_profile:
-                    profile = get_active_profile()
-                    if profile:
-                        harm_result = harmonize(detected_client, fix=True)
-                        fixed = harm_result.get('pages_fixed', 0)
-                        if fixed:
-                            print(f'        Profile applied: {fixed} pages harmonized')
+                    # Apply profile harmonization if requested
+                    if apply_profile:
+                        profile = get_active_profile()
+                        if profile:
+                            harm_result = harmonize(detected_client, fix=True)
+                            fixed = harm_result.get('pages_fixed', 0)
+                            if fixed:
+                                print(f'        Profile applied: {fixed} pages harmonized')
         except Exception as e:
             print(f'        ERROR: {e}')
             errors += 1
@@ -2146,6 +2155,388 @@ def tornado(client_slug: str = None, dry_run: bool = False, apply_profile: bool 
         'skipped': skipped,
         'errors': errors,
     }
+
+
+# ---------------------------------------------------------------------------
+# CSV Ingest
+# ---------------------------------------------------------------------------
+
+MAPPINGS_DIR = os.path.join(PROFILES_DIR, 'mappings')
+
+
+def _load_csv_mapping(name: str) -> dict:
+    """Load a CSV mapping template from profiles/mappings/{name}.json."""
+    path = os.path.join(MAPPINGS_DIR, f'{name}.json')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'Mapping not found: {path}')
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _detect_csv_mapping(headers: list[str]) -> str | None:
+    """
+    Auto-detect which mapping template matches a CSV's column headers.
+    Scores each mapping by how many detect_headers keywords appear in the columns.
+    """
+    if not os.path.exists(MAPPINGS_DIR):
+        return None
+
+    headers_lower = [h.lower().strip() for h in headers]
+    headers_joined = ' '.join(headers_lower)
+
+    best_name = None
+    best_score = 0
+
+    for fname in os.listdir(MAPPINGS_DIR):
+        if not fname.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(MAPPINGS_DIR, fname), 'r') as f:
+                mapping = json.load(f)
+        except Exception:
+            continue
+
+        detect_keys = mapping.get('detect_headers', [])
+        score = sum(1 for dk in detect_keys if dk.lower() in headers_joined)
+
+        # Also check if mapping column names match actual headers
+        for col_name in mapping.get('mapping', {}).keys():
+            if col_name.lower() in headers_lower:
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_name = fname[:-5]  # strip .json
+
+    return best_name if best_score >= 2 else None
+
+
+def _csv_row_to_wiki_page(row: dict, mapping: dict, client_slug: str, today: str) -> tuple[str, str, dict]:
+    """
+    Convert a single CSV row to a wiki page using the mapping template.
+
+    Returns (page_slug, page_content, trace_links) where trace_links is
+    {relationship_type: [target_page_slug, ...]}.
+    """
+    col_map = mapping.get('mapping', {})
+    page_type = mapping.get('page_type', 'source-summary')
+
+    # Extract frontmatter fields
+    fm_fields = {}
+    body_sections = {}
+    trace_links = {}
+
+    for csv_col, target in col_map.items():
+        value = row.get(csv_col, '').strip()
+        if not value:
+            continue
+
+        if target.startswith('frontmatter.'):
+            field = target.split('.', 1)[1]
+            if field == 'tags':
+                # Accumulate tags
+                existing = fm_fields.get('tags', [])
+                existing.append(value.lower().replace(' ', '-'))
+                fm_fields['tags'] = existing
+            else:
+                fm_fields[field] = value
+        elif target.startswith('body.'):
+            section = target.split('.', 1)[1]
+            body_sections[section] = value
+        elif target.startswith('traces.'):
+            rel_type = target.split('.', 1)[1]
+            # Value might be a comma-separated list of IDs
+            targets = [v.strip() for v in value.split(',') if v.strip()]
+            if targets:
+                trace_links[rel_type] = targets
+
+    # Build page slug from ID or title
+    title = fm_fields.get('title', fm_fields.get('id', f'row-{hash(str(row)) % 10000}'))
+    item_id = fm_fields.get('id', '')
+
+    if item_id:
+        page_slug = re.sub(r'[^\w\-]', '-', item_id).lower().strip('-')
+    else:
+        page_slug = re.sub(r'[^\w\-]', '-', title).lower().strip('-')
+    page_slug = re.sub(r'-+', '-', page_slug)
+
+    # Build tags
+    tags = fm_fields.get('tags', [])
+    if client_slug not in tags:
+        tags.insert(0, client_slug)
+
+    # Build body
+    body_parts = []
+    body_parts.append('## Summary\n')
+    if 'summary' in body_sections:
+        body_parts.append(body_sections.pop('summary'))
+    elif item_id and title != item_id:
+        body_parts.append(f'{item_id}: {title}')
+    else:
+        body_parts.append(title)
+    body_parts.append('')
+
+    for section_name, section_content in body_sections.items():
+        heading = section_name.replace('-', ' ').title()
+        body_parts.append(f'## {heading}\n')
+        body_parts.append(section_content)
+        body_parts.append('')
+
+    if trace_links:
+        body_parts.append('## Trace Links\n')
+        for rel_type, targets in trace_links.items():
+            for t in targets:
+                t_slug = re.sub(r'[^\w\-]', '-', t).lower().strip('-')
+                t_slug = re.sub(r'-+', '-', t_slug)
+                body_parts.append(f'- {rel_type}: [[{client_slug}/{t_slug}]]')
+        body_parts.append('')
+
+    body = '\n'.join(body_parts)
+
+    # Build frontmatter
+    sources_yaml = f'  - csv-import-{today}'
+    tags_yaml = '\n'.join(f'  - {t}' for t in tags) if tags else '  []'
+
+    page_content = f"""---
+title: {title}
+type: {page_type}
+client: {client_slug}
+sources:
+{sources_yaml}
+tags:
+{tags_yaml}
+related: []
+created: {today}
+updated: {today}
+confidence: medium
+---
+
+{body}
+"""
+    return page_slug, page_content, trace_links
+
+
+def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_run: bool = False) -> dict:
+    """
+    Ingest a CSV file, creating one wiki page per row.
+
+    Uses column mapping templates to determine how CSV columns map to
+    wiki page frontmatter, body sections, and trace links.
+
+    Args:
+        csv_path: Path to the CSV file
+        client_slug: Target client
+        mapping_name: Explicit mapping template name. If None, auto-detect from headers.
+        dry_run: Show what would happen without creating pages.
+
+    Returns summary dict.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f'CSV file not found: {csv_path}')
+
+    # Read CSV
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+        rows = list(reader)
+
+    if not headers or not rows:
+        return {'error': 'CSV is empty or has no headers', 'pages_created': 0}
+
+    # Detect or load mapping
+    if mapping_name:
+        try:
+            mapping = _load_csv_mapping(mapping_name)
+        except FileNotFoundError:
+            return {'error': f'Mapping "{mapping_name}" not found in profiles/mappings/'}
+    else:
+        detected = _detect_csv_mapping(headers)
+        if detected:
+            mapping = _load_csv_mapping(detected)
+            mapping_name = detected
+        else:
+            # Fallback: create a generic mapping from headers
+            mapping = {
+                'name': 'Auto-generated',
+                'page_type': 'source-summary',
+                'id_column': headers[0],
+                'title_column': headers[1] if len(headers) > 1 else headers[0],
+                'mapping': {},
+            }
+            # Map first column to ID, second to title, rest to body
+            mapping['mapping'][headers[0]] = 'frontmatter.id'
+            if len(headers) > 1:
+                mapping['mapping'][headers[1]] = 'frontmatter.title'
+            for h in headers[2:]:
+                section = re.sub(r'[^\w\-]', '-', h).lower().strip('-')
+                mapping['mapping'][h] = f'body.{section}'
+            mapping_name = 'auto'
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    fname = os.path.basename(csv_path)
+
+    print(f'=== CSV Ingest ===\n')
+    print(f'File: {fname} ({len(rows)} rows, {len(headers)} columns)')
+    print(f'Mapping: {mapping_name} ({mapping.get("name", "")})')
+    print(f'Type: {mapping.get("page_type", "source-summary")}')
+    print()
+
+    pages_created = 0
+    pages_updated = 0
+    trace_links_created = 0
+    errors = 0
+
+    client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
+    os.makedirs(client_wiki_dir, exist_ok=True)
+
+    for i, row in enumerate(rows, 1):
+        # Skip empty rows
+        if not any(v.strip() for v in row.values() if v):
+            continue
+
+        try:
+            page_slug, page_content, traces = _csv_row_to_wiki_page(row, mapping, client_slug, today)
+        except Exception as e:
+            print(f'[{i}/{len(rows)}]  ERROR: {e}')
+            errors += 1
+            continue
+
+        # Get a display title
+        id_col = mapping.get('id_column', '')
+        title_col = mapping.get('title_column', '')
+        display_id = row.get(id_col, '').strip() or page_slug
+        display_title = row.get(title_col, '').strip() or ''
+        display = f'{display_id}: {display_title}' if display_title and display_title != display_id else display_id
+
+        wiki_path = os.path.join(client_wiki_dir, f'{page_slug}.md')
+        action = 'update' if os.path.exists(wiki_path) else 'create'
+
+        if dry_run:
+            print(f'[{i}/{len(rows)}]  {display}')
+            print(f'        -> wiki/{client_slug}/{page_slug}.md ({action}, dry run)')
+            if traces:
+                for rel, targets in traces.items():
+                    for t in targets:
+                        print(f'        -> trace: {rel} -> {t}')
+            continue
+
+        # Write wiki page
+        with open(wiki_path, 'w', encoding='utf-8') as f:
+            f.write(page_content)
+
+        if action == 'create':
+            pages_created += 1
+        else:
+            pages_updated += 1
+
+        # Create trace links
+        for rel_type, targets in traces.items():
+            for target_id in targets:
+                target_slug = re.sub(r'[^\w\-]', '-', target_id).lower().strip('-')
+                target_slug = re.sub(r'-+', '-', target_slug)
+                target_page = f'{client_slug}/{target_slug}'
+                from_page = f'{client_slug}/{page_slug}'
+                try:
+                    trace_add(from_page, target_page, rel_type)
+                    trace_links_created += 1
+                except Exception:
+                    # Target page may not exist yet - that's ok, trace is stored
+                    # Try storing just in traceability.json without page validation
+                    _store_trace_link(from_page, target_page, rel_type, today)
+                    trace_links_created += 1
+
+        # Update index
+        _update_index(client_slug, page_slug, os.path.relpath(wiki_path, BASE_DIR), today)
+
+        # Sync to memvid
+        try:
+            sync_page_to_memvid(wiki_path, client_slug=client_slug)
+        except Exception:
+            pass
+
+        print(f'[{i}/{len(rows)}]  {display}')
+        print(f'        -> wiki/{client_slug}/{page_slug}.md ({action}d)')
+        if traces:
+            for rel, targets in traces.items():
+                for t in targets:
+                    print(f'        -> trace: {rel} -> {t}')
+
+    # Update entities schema for all new pages
+    if not dry_run:
+        try:
+            for fname_wiki in os.listdir(client_wiki_dir):
+                if fname_wiki.endswith('.md'):
+                    wp = os.path.join(client_wiki_dir, fname_wiki)
+                    with open(wp, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    _update_entities_schema(client_slug, wp, content, today)
+                    fm, _ = parse_frontmatter(content)
+                    _update_tags_schema(wp, fm)
+        except Exception:
+            pass
+
+        _append_log(
+            operation='INGEST',
+            description=f'CSV ingest: {os.path.basename(csv_path)} -> {client_slug} ({pages_created} created, {pages_updated} updated)',
+            details=[
+                f'Source: {csv_path}',
+                f'Mapping: {mapping_name}',
+                f'Rows: {len(rows)}',
+                f'Pages created: {pages_created}',
+                f'Pages updated: {pages_updated}',
+                f'Trace links: {trace_links_created}',
+                f'Errors: {errors}',
+            ],
+            date=today,
+        )
+
+    print(f'\nCSV ingest {"(dry run) " if dry_run else ""}complete.')
+    print(f'  Pages created:  {pages_created}')
+    print(f'  Pages updated:  {pages_updated}')
+    print(f'  Trace links:    {trace_links_created}')
+    print(f'  Errors:         {errors}')
+
+    return {
+        'pages_created': pages_created,
+        'pages_updated': pages_updated,
+        'trace_links_created': trace_links_created,
+        'errors': errors,
+        'mapping_used': mapping_name,
+    }
+
+
+def _store_trace_link(from_page: str, to_page: str, relationship: str, today: str) -> None:
+    """Store a trace link in traceability.json without validating page existence."""
+    trace_file = TRACEABILITY_FILE
+    os.makedirs(os.path.dirname(trace_file), exist_ok=True)
+
+    def modifier(raw: str) -> str:
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {'version': 1, 'updated': today, 'links': []}
+        else:
+            data = {'version': 1, 'updated': today, 'links': []}
+
+        if 'links' not in data:
+            data['links'] = []
+
+        # Check for duplicate
+        for link in data['links']:
+            if link.get('from') == from_page and link.get('to') == to_page and link.get('type') == relationship:
+                return json.dumps(data, indent=2)
+
+        data['links'].append({
+            'from': from_page,
+            'to': to_page,
+            'type': relationship,
+            'created': today,
+        })
+        data['updated'] = today
+        return json.dumps(data, indent=2)
+
+    _locked_read_modify_write(trace_file, modifier)
 
 
 # ---------------------------------------------------------------------------
@@ -3370,6 +3761,13 @@ def main() -> None:
     tornado_parser.add_argument('--dry-run', action='store_true', help='Show what would happen without doing it')
     tornado_parser.add_argument('--profile', action='store_true', help='Apply active profile vocabulary after ingest')
 
+    # ingest-csv
+    csv_parser = subparsers.add_parser('ingest-csv', help='Ingest CSV file: one row = one wiki page')
+    csv_parser.add_argument('file', help='Path to CSV file')
+    csv_parser.add_argument('client_slug', help='Client slug')
+    csv_parser.add_argument('--mapping', type=str, default=None, help='Mapping template name (e.g. user-needs, requirements, risk-register, dds, test-cases)')
+    csv_parser.add_argument('--dry-run', action='store_true', help='Show what would happen without creating pages')
+
     # status
     subparsers.add_parser('status', help='Quick summary of pending work')
 
@@ -3533,6 +3931,19 @@ def main() -> None:
             print(f'Error: invalid client slug "{args.client}".', file=sys.stderr)
             sys.exit(1)
         tornado(client_slug=args.client, dry_run=args.dry_run, apply_profile=args.profile)
+
+    elif args.command == 'ingest-csv':
+        if not re.match(r'^[a-z0-9][a-z0-9\-]*$', args.client_slug):
+            print(f'Error: invalid client slug "{args.client_slug}".', file=sys.stderr)
+            sys.exit(1)
+        try:
+            result = ingest_csv(args.file, args.client_slug, mapping_name=args.mapping, dry_run=args.dry_run)
+            if 'error' in result:
+                print(f'Error: {result["error"]}', file=sys.stderr)
+                sys.exit(1)
+        except (FileNotFoundError, ValueError) as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == 'status':
         result = status()

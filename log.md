@@ -1,5 +1,48 @@
 # Mnemosyne - Activity Log
 
+## [2026-04-06 00:08] TORNADO | Inbox processed: 2 files
+- Created: 0
+- Updated: 8
+- Archived: 2
+- Skipped: 0
+- Errors: 0
+
+## [2026-04-06 00:08] INGEST | CSV ingest: user-needs.csv -> demo-retail (0 created, 5 updated)
+- Source: /Users/apomou/Desktop/Projects/mnemo/inbox/user-needs.csv
+- Mapping: requirements
+- Rows: 5
+- Pages created: 0
+- Pages updated: 5
+- Trace links: 0
+- Errors: 0
+
+## [2026-04-06 00:08] INGEST | CSV ingest: risk-register.csv -> demo-retail (0 created, 3 updated)
+- Source: /Users/apomou/Desktop/Projects/mnemo/inbox/risk-register.csv
+- Mapping: risk-register
+- Rows: 3
+- Pages created: 0
+- Pages updated: 3
+- Trace links: 6
+- Errors: 0
+
+## [2026-04-06 00:08] INGEST | CSV ingest: risk-register.csv -> demo-retail (3 created, 0 updated)
+- Source: inbox/risk-register.csv
+- Mapping: risk-register
+- Rows: 3
+- Pages created: 3
+- Pages updated: 0
+- Trace links: 6
+- Errors: 0
+
+## [2026-04-06 00:08] INGEST | CSV ingest: user-needs.csv -> demo-retail (5 created, 0 updated)
+- Source: inbox/user-needs.csv
+- Mapping: user-needs
+- Rows: 5
+- Pages created: 5
+- Pages updated: 0
+- Trace links: 5
+- Errors: 0
+
 ## [2026-04-05 23:59] TORNADO | Inbox processed: 2 files
 - Created: 0
 - Updated: 2

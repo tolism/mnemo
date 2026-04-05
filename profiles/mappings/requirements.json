@@ -1,0 +1,22 @@
+{
+  "name": "Requirements Import",
+  "description": "Maps CSV rows to requirement wiki pages. Supports trace links to design specs and tests.",
+  "page_type": "requirement",
+  "id_column": "ID",
+  "title_column": "Title",
+  "detect_headers": ["requirement", "req-", "req id", "shall", "acceptance criteria"],
+  "mapping": {
+    "ID": "frontmatter.id",
+    "Title": "frontmatter.title",
+    "Description": "body.summary",
+    "Acceptance Criteria": "body.acceptance-criteria",
+    "Priority": "frontmatter.tags",
+    "Category": "frontmatter.tags",
+    "Source": "frontmatter.sources",
+    "Derived From": "traces.derived-from",
+    "Design Spec": "traces.detailed-in",
+    "Verification": "traces.verified-by",
+    "User Need": "traces.derived-from",
+    "Status": "frontmatter.tags"
+  }
+}

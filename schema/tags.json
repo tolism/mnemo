@@ -1,15 +1,43 @@
 {
   "version": 1,
-  "updated": "2026-04-05",
+  "updated": "2026-04-06",
   "tags": {
     "demo-retail": {
-      "count": 5,
+      "count": 13,
       "pages": [
         "demo-retail/sample-meeting-notes.md",
         "demo-retail/sample-proposal.md",
         "demo-retail/sample-research.md",
         "demo-retail/meeting-notes-april.md",
-        "demo-retail/risk-assessment-draft.md"
+        "demo-retail/risk-assessment-draft.md",
+        "demo-retail/un-001.md",
+        "demo-retail/un-002.md",
+        "demo-retail/un-003.md",
+        "demo-retail/un-004.md",
+        "demo-retail/un-005.md",
+        "demo-retail/haz-001.md",
+        "demo-retail/haz-002.md",
+        "demo-retail/haz-003.md"
+      ]
+    },
+    "critical": {
+      "count": 2,
+      "pages": [
+        "demo-retail/un-001.md",
+        "demo-retail/un-003.md"
+      ]
+    },
+    "high": {
+      "count": 2,
+      "pages": [
+        "demo-retail/un-002.md",
+        "demo-retail/un-005.md"
+      ]
+    },
+    "medium": {
+      "count": 1,
+      "pages": [
+        "demo-retail/un-004.md"
       ]
     }
   }

@@ -1,0 +1,19 @@
+{
+  "name": "User Needs Import",
+  "description": "Maps CSV rows to user-need wiki pages. Each row becomes one page.",
+  "page_type": "user-need",
+  "id_column": "ID",
+  "title_column": "Title",
+  "detect_headers": ["user need", "un-", "need id", "stakeholder need"],
+  "mapping": {
+    "ID": "frontmatter.id",
+    "Title": "frontmatter.title",
+    "Description": "body.summary",
+    "Priority": "frontmatter.tags",
+    "Source": "frontmatter.sources",
+    "Acceptance Criteria": "body.acceptance-criteria",
+    "Rationale": "body.rationale",
+    "Linked Requirement": "traces.implemented-by",
+    "Status": "frontmatter.tags"
+  }
+}

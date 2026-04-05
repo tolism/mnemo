@@ -1,0 +1,24 @@
+{
+  "name": "Risk Register Import",
+  "description": "Maps CSV rows to hazard wiki pages with severity, probability, and risk control measures.",
+  "page_type": "hazard",
+  "id_column": "ID",
+  "title_column": "Hazard",
+  "detect_headers": ["hazard", "severity", "probability", "risk level", "risk control", "harm"],
+  "mapping": {
+    "ID": "frontmatter.id",
+    "Hazard": "frontmatter.title",
+    "Harm": "body.harm",
+    "Hazardous Situation": "body.hazardous-situation",
+    "Severity": "body.severity",
+    "Probability": "body.probability",
+    "Risk Level": "body.risk-level",
+    "Risk Control": "body.risk-control",
+    "Residual Risk": "body.residual-risk",
+    "Mitigation": "traces.mitigated-by",
+    "RMA": "traces.mitigated-by",
+    "Linked Requirement": "traces.implemented-by",
+    "Verification": "traces.verified-by",
+    "Status": "frontmatter.tags"
+  }
+}

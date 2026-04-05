@@ -1,0 +1,21 @@
+{
+  "name": "Design Specification Import",
+  "description": "Maps CSV rows to design-spec wiki pages. Links back to requirements and forward to tests.",
+  "page_type": "design-spec",
+  "id_column": "ID",
+  "title_column": "Title",
+  "detect_headers": ["design spec", "dds", "design detail", "module", "component"],
+  "mapping": {
+    "ID": "frontmatter.id",
+    "Title": "frontmatter.title",
+    "Description": "body.summary",
+    "Module": "body.module",
+    "Interface": "body.interface",
+    "Constraints": "body.constraints",
+    "Requirement": "traces.derived-from",
+    "Linked Requirement": "traces.derived-from",
+    "Test Case": "traces.verified-by",
+    "Verification": "traces.verified-by",
+    "Status": "frontmatter.tags"
+  }
+}
