@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Mnemosyne" width="200">
+  <img src="assets/logo.png" alt="Mnemosyne" width="400">
 </p>
 
-<h1 align="center">Mnemosyne (mnemo)</h1>
+<h1 align="center"></h1>
 
-<p align="center"><em>Ingest once. Query forever.</em></p>
+
 
 A CLI tool that turns your documents into a searchable second brain. Drop files in, get a structured knowledge layer out -- browsable by humans in Obsidian, queryable by machines in under 5ms.
 
