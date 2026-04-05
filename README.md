@@ -21,15 +21,32 @@ That's it. Your knowledge compounds instead of decaying.
 
 ## Why
 
-You have 200 documents across 5 projects. Someone asks "what did we agree on pricing?" and you spend 20 minutes digging through folders.
+You're building a medical device. You have a risk analysis in a PDF, user needs in a spreadsheet, meeting notes in markdown, and 47 requirements in a CSV. An auditor asks "show me the trace from hazard HAZ-001 to the test that verifies its mitigation." You spend two hours searching folders.
 
 Mnemo fixes this:
 
-1. **You ingest** -- drop a PDF, markdown, or text file
-2. **Mnemo builds** -- a wiki page (human-readable) + a memory frame (machine-searchable) + entity extraction, all in one atomic operation
-3. **You query** -- `mnemo search "pricing agreement"` returns results in milliseconds with citations back to the source
+```bash
+# Import everything
+mnemo ingest risk-analysis.pdf cardio-monitor
+mnemo ingest-csv user-needs.csv cardio-monitor --mapping user-needs
+mnemo ingest-csv risk-register.csv cardio-monitor --mapping risk-register
 
-No databases. No servers. No infrastructure. Plain markdown files + a single `.mv2` archive you can copy anywhere.
+# Answer the auditor in 2 seconds
+mnemo trace show cardio-monitor/haz-001 --direction forward
+#   haz-001 (Electrical Shock)
+#     mitigated-by -> rma-003 (Insulation Barrier)
+#       implemented-by -> req-007 (Double Insulation)
+#         verified-by -> test-042 (Dielectric Strength Test)
+
+# Find gaps before the auditor does
+mnemo trace gaps cardio-monitor
+#   Requirements with no verification: req-011, req-023
+#   Hazards with no mitigation: haz-009
+```
+
+Every document ingested once. Every trace link tracked. Every vocabulary term harmonized. Every gap found automatically.
+
+No databases. No servers. No infrastructure. Plain markdown files + JSON schemas that any system can read.
 
 ---
 

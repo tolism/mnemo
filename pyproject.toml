@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemo"
-version = "0.3.2"
+version = "0.3.3"
 description = "Mnemosyne - CLI tool that turns documents into a searchable second brain. Ingest once, query forever."
 readme = "README.md"
 license = "MIT"
