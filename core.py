@@ -3843,6 +3843,14 @@ def main() -> None:
     # repair
     subparsers.add_parser('repair', help='Repair corrupted archives and schema')
 
+    # demo
+    demo_parser = subparsers.add_parser('demo', help='Demo content management')
+    demo_sub = demo_parser.add_subparsers(dest='demo_action')
+    demo_clean = demo_sub.add_parser('clean', help='Remove all demo content (files, wiki, schema, memvid, log/index entries)')
+    demo_clean.add_argument('--client', default='demo-retail', help='Client slug to remove (default: demo-retail)')
+    demo_clean.add_argument('--dry-run', action='store_true', help='Preview without deleting')
+    demo_clean.add_argument('--yes', action='store_true', help='Skip confirmation prompt')
+
     args = parser.parse_args()
 
     if args.command == 'sync':
@@ -4190,6 +4198,45 @@ def main() -> None:
             print(f'Error: {e}', file=sys.stderr)
             sys.exit(1)
 
+    elif args.command == 'demo':
+        if args.demo_action != 'clean':
+            print('Usage: mnemo demo clean [--client SLUG] [--dry-run] [--yes]', file=sys.stderr)
+            sys.exit(1)
+        if not re.match(r'^[a-z0-9][a-z0-9\-]*$', args.client):
+            print(f'Error: invalid client slug "{args.client}".', file=sys.stderr)
+            sys.exit(1)
+        mode = 'DRY RUN' if args.dry_run else 'DELETE'
+        print(f'mnemo demo clean [{mode}] -- target client: {args.client}')
+        if not args.dry_run and not args.yes:
+            try:
+                resp = input(f'This will permanently delete all "{args.client}" content and the demo/ folder. Continue? [y/N] ')
+            except EOFError:
+                resp = ''
+            if resp.strip().lower() not in ('y', 'yes'):
+                print('Aborted.')
+                sys.exit(0)
+        result = clean_demo(client_slug=args.client, dry_run=args.dry_run)
+        print(f'  Directories removed:    {len(result["directories"])}')
+        for d in result['directories']:
+            print(f'    - {d}')
+        print(f'  Files removed:          {len(result["files"])}')
+        for f in result['files']:
+            print(f'    - {f}')
+        print(f'  Schema entities:        {result["schema_entities_removed"]}')
+        print(f'  Schema tag pages:       {result["schema_tag_pages_removed"]}')
+        print(f'  Schema tags emptied:    {result["schema_tags_removed"]}')
+        print(f'  Graph nodes:            {result["graph_nodes_removed"]}')
+        print(f'  Graph edges:            {result["graph_edges_removed"]}')
+        print(f'  Trace links:            {result["trace_links_removed"]}')
+        print(f'  Memvid manifest entries:{result["manifest_entries_removed"]}')
+        print(f'  Memvid archives:        {result["memvid_archives_removed"]}')
+        print(f'  Index lines:            {result["index_lines_removed"]}')
+        print(f'  Log entries:            {result["log_entries_removed"]}')
+        if args.dry_run:
+            print('Dry run -- nothing was modified. Re-run without --dry-run to apply.')
+        else:
+            print('Done. Note: master.mv2 frames are not removed; run `mnemo repair` or rebuild memvid to drop them.')
+
     elif args.command == 'repair':
         result = repair()
         if result['ok']:
@@ -4203,6 +4250,271 @@ def main() -> None:
                 print('repair: warnings:')
                 for w in result['warnings']:
                     print(f'  - {w}')
+
+
+def clean_demo(client_slug: str = 'demo-retail', dry_run: bool = False) -> dict:
+    """
+    Remove all demo content: wiki pages, sources, schema entries, memvid sync
+    manifest entries, index.md and log.md entries, and stray top-level demo dirs.
+
+    Returns a dict with what was (or would be) removed.
+    """
+    import shutil
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    removed = {
+        'directories': [],
+        'files': [],
+        'schema_entities_removed': 0,
+        'schema_tags_removed': 0,
+        'schema_tag_pages_removed': 0,
+        'graph_nodes_removed': 0,
+        'graph_edges_removed': 0,
+        'trace_links_removed': 0,
+        'manifest_entries_removed': 0,
+        'index_lines_removed': 0,
+        'log_entries_removed': 0,
+        'memvid_archives_removed': 0,
+    }
+
+    page_prefix = f'{client_slug}/'
+
+    # 1. Directories to wipe entirely
+    candidate_dirs = [
+        os.path.join(WIKI_DIR, client_slug),
+        os.path.join(SOURCES_DIR, client_slug),
+        os.path.join(BASE_DIR, 'demo'),          # bundled sample files
+        os.path.join(BASE_DIR, client_slug),     # stray top-level dir if any
+    ]
+    for d in candidate_dirs:
+        if os.path.isdir(d):
+            removed['directories'].append(os.path.relpath(d, BASE_DIR))
+            if not dry_run:
+                shutil.rmtree(d)
+
+    # 2. Per-client memvid archive
+    per_client_mv2 = os.path.join(PER_CLIENT_DIR, f'{client_slug}.mv2')
+    if os.path.exists(per_client_mv2):
+        removed['files'].append(os.path.relpath(per_client_mv2, BASE_DIR))
+        removed['memvid_archives_removed'] += 1
+        if not dry_run:
+            os.remove(per_client_mv2)
+
+    # 3. Lint reports referencing the client
+    if os.path.isdir(WIKI_DIR):
+        for fn in os.listdir(WIKI_DIR):
+            if fn.startswith('lint-report-') and fn.endswith('.md'):
+                fp = os.path.join(WIKI_DIR, fn)
+                try:
+                    with open(fp, 'r', encoding='utf-8') as f:
+                        if client_slug in f.read():
+                            removed['files'].append(os.path.relpath(fp, BASE_DIR))
+                            if not dry_run:
+                                os.remove(fp)
+                except OSError:
+                    pass
+
+    # 4. schema/entities.json — drop entities for the client
+    entities_file = os.path.join(SCHEMA_DIR, 'entities.json')
+    if os.path.exists(entities_file):
+        def ent_mod(content: str) -> str:
+            try:
+                data = json.loads(content) if content.strip() else {}
+            except json.JSONDecodeError:
+                return content
+            ents = data.get('entities', [])
+            kept = [e for e in ents if e.get('client') != client_slug
+                    and not str(e.get('wiki_page', '')).startswith(page_prefix)]
+            removed['schema_entities_removed'] = len(ents) - len(kept)
+            data['entities'] = kept
+            data['updated'] = today
+            return json.dumps(data, indent=2)
+        if dry_run:
+            with open(entities_file, 'r', encoding='utf-8') as f:
+                ent_mod(f.read())
+        else:
+            _locked_read_modify_write(entities_file, ent_mod)
+
+    # 5. schema/tags.json — drop tag pages referencing the client
+    tags_file = os.path.join(SCHEMA_DIR, 'tags.json')
+    if os.path.exists(tags_file):
+        def tags_mod(content: str) -> str:
+            try:
+                data = json.loads(content) if content.strip() else {}
+            except json.JSONDecodeError:
+                return content
+            tags = data.get('tags', {})
+            new_tags = {}
+            for tag, info in tags.items():
+                pages = info.get('pages', [])
+                kept_pages = [p for p in pages if not p.startswith(page_prefix)]
+                removed['schema_tag_pages_removed'] += len(pages) - len(kept_pages)
+                if kept_pages:
+                    info['pages'] = kept_pages
+                    info['count'] = len(kept_pages)
+                    new_tags[tag] = info
+                else:
+                    removed['schema_tags_removed'] += 1
+            data['tags'] = new_tags
+            data['updated'] = today
+            return json.dumps(data, indent=2)
+        if dry_run:
+            with open(tags_file, 'r', encoding='utf-8') as f:
+                tags_mod(f.read())
+        else:
+            _locked_read_modify_write(tags_file, tags_mod)
+
+    # 6. schema/graph.json — drop nodes/edges for the client
+    graph_file = os.path.join(SCHEMA_DIR, 'graph.json')
+    if os.path.exists(graph_file):
+        def graph_mod(content: str) -> str:
+            try:
+                data = json.loads(content) if content.strip() else {}
+            except json.JSONDecodeError:
+                return content
+            nodes = data.get('nodes', [])
+            kept_nodes = [n for n in nodes if n.get('client') != client_slug
+                          and not str(n.get('id', '')).startswith(page_prefix)]
+            removed['graph_nodes_removed'] = len(nodes) - len(kept_nodes)
+            data['nodes'] = kept_nodes
+            edges = data.get('edges', [])
+            kept_edges = [e for e in edges
+                          if not str(e.get('from', '')).startswith(page_prefix)
+                          and not str(e.get('to', '')).startswith(page_prefix)]
+            removed['graph_edges_removed'] = len(edges) - len(kept_edges)
+            data['edges'] = kept_edges
+            data['updated'] = today
+            return json.dumps(data, indent=2)
+        if dry_run:
+            with open(graph_file, 'r', encoding='utf-8') as f:
+                graph_mod(f.read())
+        else:
+            _locked_read_modify_write(graph_file, graph_mod)
+
+    # 7. schema/traceability.json — drop trace links touching the client
+    if os.path.exists(TRACEABILITY_FILE):
+        def trace_mod(content: str) -> str:
+            try:
+                data = json.loads(content) if content.strip() else {}
+            except json.JSONDecodeError:
+                return content
+            links = data.get('links', [])
+            kept = [l for l in links
+                    if not str(l.get('from', '')).startswith(page_prefix)
+                    and not str(l.get('to', '')).startswith(page_prefix)]
+            removed['trace_links_removed'] = len(links) - len(kept)
+            data['links'] = kept
+            data['updated'] = today
+            return json.dumps(data, indent=2)
+        if dry_run:
+            with open(TRACEABILITY_FILE, 'r', encoding='utf-8') as f:
+                trace_mod(f.read())
+        else:
+            _locked_read_modify_write(TRACEABILITY_FILE, trace_mod)
+
+    # 8. memvid/.sync-manifest.json — drop entries pointing at the client
+    manifest_file = os.path.join(MEMVID_DIR, '.sync-manifest.json')
+    if os.path.exists(manifest_file):
+        def manifest_mod(content: str) -> str:
+            try:
+                data = json.loads(content) if content.strip() else {}
+            except json.JSONDecodeError:
+                return content
+            synced = data.get('synced_pages', {})
+            needle = f'/wiki/{client_slug}/'
+            needle_win = f'\\wiki\\{client_slug}\\'
+            kept = {k: v for k, v in synced.items()
+                    if needle not in k.replace('\\', '/') and needle_win not in k}
+            removed['manifest_entries_removed'] = len(synced) - len(kept)
+            data['synced_pages'] = kept
+            return json.dumps(data, indent=2)
+        if dry_run:
+            with open(manifest_file, 'r', encoding='utf-8') as f:
+                manifest_mod(f.read())
+        else:
+            _locked_read_modify_write(manifest_file, manifest_mod)
+
+    # 9. index.md — strip the client section and any line referencing the client
+    if os.path.exists(INDEX_FILE):
+        def index_mod(content: str) -> str:
+            lines = content.split('\n')
+            out = []
+            skip_section = False
+            removed_count = 0
+            section_headers = {f'### {client_slug}', f'## {client_slug}'}
+            for line in lines:
+                stripped = line.strip()
+                if stripped in section_headers:
+                    skip_section = True
+                    removed_count += 1
+                    continue
+                if skip_section:
+                    if stripped.startswith('## ') or stripped.startswith('### ') or stripped.startswith('---'):
+                        skip_section = False
+                    else:
+                        if stripped:
+                            removed_count += 1
+                        continue
+                if f'[[{client_slug}/' in line or f'/{client_slug}/' in line:
+                    removed_count += 1
+                    continue
+                out.append(line)
+            new_content = '\n'.join(out)
+            # Recount totals
+            total_pages = len(re.findall(r'^\| \[\[', new_content, re.MULTILINE))
+            new_content = re.sub(
+                r'(\| Total pages\s*\|)\s*\d+',
+                f'\\g<1> {total_pages}',
+                new_content,
+            )
+            new_content = re.sub(
+                r'Last updated: \d{4}-\d{2}-\d{2}',
+                f'Last updated: {today}',
+                new_content,
+            )
+            removed['index_lines_removed'] = removed_count
+            return new_content
+        if dry_run:
+            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                index_mod(f.read())
+        else:
+            _locked_read_modify_write(INDEX_FILE, index_mod)
+
+    # 10. log.md — strip log entries that mention the client
+    if os.path.exists(LOG_FILE):
+        def log_mod(content: str) -> str:
+            # Entries are blocks separated by "## [date]" headers
+            blocks = re.split(r'(?m)(?=^## \[)', content)
+            kept = []
+            count_removed = 0
+            for block in blocks:
+                if block.startswith('## [') and client_slug in block:
+                    count_removed += 1
+                    continue
+                kept.append(block)
+            removed['log_entries_removed'] = count_removed
+            return ''.join(kept)
+        if dry_run:
+            with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                log_mod(f.read())
+        else:
+            _locked_read_modify_write(LOG_FILE, log_mod)
+
+    if not dry_run:
+        _append_log(
+            operation='DEMO-CLEAN',
+            description=f'Removed demo client "{client_slug}" and all related content',
+            details=[
+                f'Directories: {len(removed["directories"])}',
+                f'Files: {len(removed["files"])}',
+                f'Entities: {removed["schema_entities_removed"]}',
+                f'Tag pages: {removed["schema_tag_pages_removed"]}',
+                f'Manifest entries: {removed["manifest_entries_removed"]}',
+            ],
+            date=today,
+        )
+
+    return removed
 
 
 if __name__ == '__main__':

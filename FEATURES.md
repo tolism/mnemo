@@ -36,6 +36,7 @@
 | `mnemo scan-repo` | Scan code repo, compare against QMS docs, find gaps |
 | `mnemo tornado` | Inbox processor: auto-detect type/client, ingest, archive to sources |
 | `mnemo ingest-csv` | CSV ingest: one row = one wiki page, with column-to-frontmatter mapping and auto trace links |
+| `mnemo demo clean` | Remove all demo content: demo-retail client, demo/ folder, schema entries, memvid manifest, index/log entries |
 
 ### Web UI (localhost:3141)
 
