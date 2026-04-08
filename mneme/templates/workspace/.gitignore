@@ -3,6 +3,7 @@ memvid/per-client/
 memvid/.sync-manifest.json
 exports/
 snapshots/
+.mneme/
 __pycache__/
 *.pyc
 .DS_Store

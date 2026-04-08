@@ -343,13 +343,31 @@ Then add `'your_check_name': []` to the `issues` dict at the top of lint(), and 
 
 | Function | Purpose |
 |---|---|
-| `load_profile()` | Read profile JSON from profiles/ |
+| `load_profile()` | Read profile from profiles/<name>.md |
+| `_load_profile_from_md()` | Markdown profile parser (frontmatter + recognised H1 headings) |
 | `get_active_profile()` | Get currently active profile |
 | `set_active_profile()` | Set active profile name |
 | `harmonize()` | Check/fix vocabulary against profile |
 | `validate_writing_style()` | Build an LLM review packet from active profile + page |
 | `validate_consistency()` | Cross-document consistency check |
 | `scan_repo()` | Code repo vs wiki coverage analysis |
+
+### Draft + Agent loop (v0.4.0)
+
+| Function | Purpose |
+|---|---|
+| `draft_document()` | Build a write packet for an LLM agent (one section at a time). Symmetric counterpart to `validate_writing_style`. |
+| `_format_write_packet()` | Render a write packet as markdown |
+| `agent_plan()` | Generate a deterministic TODO plan from the active profile + persist under `<workspace>/.mneme/agent-plans/<id>.json` |
+| `agent_show_plan()` | Return `{plan, state}` for the most recent (or named) plan |
+| `agent_next_task()` | Return the next ready task respecting the dependency graph |
+| `agent_task_done()` | Mark a task complete; idempotent |
+| `agent_list_plans()` | List all plans in the workspace, newest first |
+| `_plan_dir()` / `_plan_path()` / `_plan_state_path()` | Plan persistence path helpers |
+| `_load_plan()` / `_save_plan()` / `_load_plan_state()` / `_save_plan_state()` | Plan I/O helpers |
+| `_resolve_plan_id()` | Resolve a plan id (most recent if None) |
+
+The agent loop is documented from the agent's perspective in [AGENTS.md](AGENTS.md). Plans are persisted as JSON under `<workspace>/.mneme/agent-plans/`. State is a separate `<id>.state.json` file alongside each plan so the plan document stays immutable while statuses move. The directory is gitignored via the bundled workspace template.
 
 ### Utilities
 

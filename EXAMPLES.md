@@ -865,6 +865,186 @@ The profile is just a file in your project. Treat it like any other project asse
 
 ---
 
+## Example 14: Producing a Design Validation Report with the Agent Loop
+
+This example shows the headline workflow of v0.4.0: a user gives an LLM agent (Claude Code, an SDK app, anything) a high-level goal, and the agent walks a deterministic plan generated from the active profile, calling `mneme draft` and `mneme validate writing-style` along the way. Mneme assembles the contracts; the agent does the writing and grading.
+
+If you are an LLM agent reading these examples, also read [AGENTS.md](AGENTS.md) at the repo root for the full protocol.
+
+### Scenario
+
+You're producing a Design Validation Report (DVR) for the Tremor Detection Algorithm (TDA), an accelerometer-based feature on a wrist-worn device. The eu-mdr profile already ships a `design-validation-report` document type with 11 sections of writing-style guidance derived from real reviewer comments.
+
+### Step 1 -- Set up the workspace
+
+```bash
+mneme new ~/projects/cardio-monitor --name "CardioMonitor" --client tda --profile eu-mdr
+cd ~/projects/cardio-monitor
+mneme profile show
+#   Active profile: EU MDR
+#     Vocabulary rules: 15
+#     ...
+```
+
+Drop your evidence into `sources/tda/`: the algorithm code (or a notebook export), the validation result CSV, the dataset description, the reference standards. Then ingest:
+
+```bash
+mneme ingest sources/tda/algorithm-spec.md tda
+mneme ingest sources/tda/validation-results.md tda
+mneme ingest-csv sources/tda/datasets.csv tda --mapping datasets
+```
+
+### Step 2 -- Generate the plan
+
+The user (you) tells the agent the goal:
+
+> Produce a Design Validation Report for the TDA algorithm.
+
+The agent runs:
+
+```bash
+mneme agent plan \
+  --goal "Produce a Design Validation Report for the TDA algorithm" \
+  --doc-type design-validation-report \
+  --client tda
+```
+
+Mneme reads the active eu-mdr profile, walks `sections.design-validation-report.section_notes`, and generates a 15-task plan:
+
+```
+Plan: design-validation-report-tda-2026-04-09
+  Goal: Produce a Design Validation Report for the TDA algorithm
+  Doc type: design-validation-report
+  Client: tda
+  Profile: EU MDR
+  Tasks: 15
+
+Tasks:
+  - [draft-section] section-purpose-and-scope
+      goal: Draft the `purpose-and-scope` section of the design-validation-report
+      depends on: (none)
+  - [draft-section] section-context
+      goal: Draft the `context` section of the design-validation-report
+      depends on: (none)
+  ... (one per section in the eu-mdr profile)
+  - [assemble-document] assemble-document
+      depends on: section-purpose-and-scope, section-context, ... (all 11)
+  - [harmonize] harmonize
+      depends on: assemble-document
+  - [review-page] review-page
+      depends on: harmonize
+  - [submission-check] submission-check
+      depends on: review-page
+
+Next: mneme agent next-task --plan design-validation-report-tda-2026-04-09
+```
+
+The plan and per-task statuses are persisted under `.mneme/agent-plans/` (gitignored). The agent can resume across sessions by reading the plan file.
+
+### Step 3 -- Walk the plan
+
+The agent loops `next-task` -> do work -> `task-done` until done.
+
+```bash
+mneme agent next-task
+#   Next task: section-purpose-and-scope
+#     Kind:    draft-section
+#     Goal:    Draft the `purpose-and-scope` section of the design-validation-report
+#
+#     Instructions:
+#       Run the next_command to assemble a write packet for the
+#       `purpose-and-scope` section. Then write the section as a single
+#       markdown block starting with `## purpose-and-scope` and following
+#       the section notes, principles, general rules, and terminology
+#       guidance in the packet. Use only the evidence provided. Cite each
+#       non-trivial claim. Use [TO ADD REF] for missing refs.
+#
+#     Preconditions:
+#       - Active profile must be "EU MDR"
+#
+#     Run:        mneme draft --doc-type design-validation-report --section purpose-and-scope --client tda
+#     After done: mneme agent task-done section-purpose-and-scope --plan design-validation-report-tda-2026-04-09
+```
+
+The agent runs the `Run:` line:
+
+```bash
+mneme draft --doc-type design-validation-report --section purpose-and-scope --client tda
+```
+
+Mneme returns a write packet: the section's notes from the profile, the full writing_style block (principles, general_rules, terminology_guidance, framing_examples), the submission_checklist, candidate evidence (drawn from a wiki text search using the section name as the query, scoped to the `tda` client), and a write prompt that tells the agent exactly what to do.
+
+The agent writes the section, saves it (typically into a working draft file or directly into `wiki/tda/design-validation-report.md`), then marks the task done:
+
+```bash
+mneme agent task-done section-purpose-and-scope
+#   Marked task "section-purpose-and-scope" as done.
+#   Run `mneme agent next-task` to get the next ready task.
+```
+
+Repeat for each section. **The agent can spawn parallel sub-agents** -- one section-writer per section -- because all 11 section tasks have empty `depends_on` lists. See [AGENTS.md](AGENTS.md) section 7 for the sub-agent patterns.
+
+### Step 4 -- Assemble, harmonize, review, submission check
+
+Once all section tasks are done, `next-task` returns the assemble-document task:
+
+```bash
+mneme agent next-task
+#   Next task: assemble-document
+#     Goal: Assemble all section drafts into wiki/tda/design-validation-report.md
+#     Instructions: Combine the drafted sections (in the order listed in
+#       the active profile) into a single wiki page at the deliverable
+#       target_page. Add proper frontmatter: title, type:
+#       design-validation-report, client: tda, created/updated dates,
+#       sources from the evidence used, confidence: medium.
+```
+
+The agent assembles, marks done, then walks the remaining tasks: `harmonize` (mechanical vocabulary fix), `review-page` (build a review packet via `validate writing-style` and apply the LLM grade), `submission-check` (walk the profile's submission_checklist).
+
+```bash
+mneme harmonize --client tda --fix
+mneme agent task-done harmonize
+
+mneme validate writing-style tda/design-validation-report > /tmp/review.md
+# Agent reads /tmp/review.md, applies the recommendations to the page
+mneme agent task-done review-page
+
+# Walk the submission_checklist from the profile
+mneme profile show
+mneme agent task-done submission-check
+```
+
+### Step 5 -- Confirm done
+
+```bash
+mneme agent show
+#   Plan: design-validation-report-tda-2026-04-09
+#     Goal: Produce a Design Validation Report for the TDA algorithm
+#
+#   Progress: 15/15
+#
+#     [x] section-purpose-and-scope  (draft-section)
+#     [x] section-context            (draft-section)
+#     ...
+#     [x] submission-check           (submission-check)
+
+mneme agent next-task
+#   All tasks done.
+```
+
+### Why this matters
+
+The agent didn't have to know the eu-mdr profile structure, the section list for a DVR, the writing style rules, or the order of operations. It only had to:
+
+1. Run `mneme agent plan` once with the goal.
+2. Loop `next-task` -> read envelope -> run `next_command` -> mark done.
+
+Mneme generated the plan deterministically from the profile. Every command the agent ran (`mneme draft`, `mneme harmonize`, `mneme validate writing-style`) returns a self-contained packet with no external context required. **The agent's job is to write and grade prose. Mneme's job is to give the agent every piece of context it needs to do that well.**
+
+For the full agent protocol, including the standard task templates for CER (Part A), risk management files, resync workflows, project migration, and pre-submission readiness checks -- read [AGENTS.md](AGENTS.md).
+
+---
+
 ## Bundled CSV Mapping Templates
 
 | Mapping | CSV columns it expects | Page type created |

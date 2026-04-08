@@ -4,6 +4,8 @@
 include README.md
 include LICENSE
 include CLAUDE.md
+include AGENTS.md
+include CHANGELOG.md
 include CODER.md
 include EXAMPLES.md
 include FEATURES.md
@@ -11,7 +13,8 @@ include pyproject.toml
 include MANIFEST.in
 
 # Bundled package assets
-recursive-include mneme/profiles *.json
+recursive-include mneme/profiles *.md
+recursive-include mneme/profiles/mappings *.json
 recursive-include mneme/templates *
 include mneme/ui.html
 
@@ -41,6 +44,7 @@ prune demo-retail
 prune exports
 prune snapshots
 prune inbox
+prune .mneme
 exclude index.md
 exclude log.md
 exclude .mneme-profile

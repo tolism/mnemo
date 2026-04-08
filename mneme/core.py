@@ -4397,6 +4397,620 @@ def _format_writing_style_packet(packet: dict) -> str:
     return '\n'.join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Draft (write packet for an LLM agent)
+# ---------------------------------------------------------------------------
+#
+# `mneme draft` is the symmetric counterpart to `mneme validate writing-style`:
+#
+#     validate writing-style  -> review packet (grade existing prose)
+#     draft                   -> write packet  (produce new prose)
+#
+# Mneme does not call any LLM. It assembles a "write packet" the agent
+# consumes to produce a single section of a document. The packet contains:
+#
+#   * The section's name and description
+#   * The section's specific notes from the active profile
+#   * The full writing-style block (principles, rules, terminology, framing)
+#   * The submission checklist (so the agent knows what "done" looks like)
+#   * Candidate evidence drawn either from a specific source file (--source)
+#     or from a wiki text search (--query, defaults to the section name)
+#   * A ready-to-paste write prompt
+#
+# Like the review packet, the agent receives this and writes the section.
+
+def draft_document(
+    doc_type: str,
+    section: str,
+    client_slug: str,
+    source_path: Optional[str] = None,
+    query: Optional[str] = None,
+    k: int = 10,
+) -> dict:
+    """
+    Build a write packet for an LLM agent that will produce one section of a
+    document of type `doc_type` for client `client_slug`.
+
+    Returns the packet as a dict. CLI rendering is the caller's job.
+    """
+    profile = get_active_profile()
+    if profile is None:
+        return {'error': 'No active profile. Set one with: mneme profile set <name>'}
+
+    sections_config = profile.get('sections', {}) or {}
+    if doc_type not in sections_config:
+        available = ', '.join(sorted(sections_config.keys())) or '(none)'
+        return {'error': f'Unknown doc-type "{doc_type}" for profile "{profile.get("name", "?")}". '
+                         f'Available doc-types: {available}'}
+
+    doc_def = sections_config[doc_type]
+    section_notes = doc_def.get('section_notes', {}) or {}
+    if section not in section_notes:
+        available = ', '.join(sorted(section_notes.keys())) or '(none)'
+        return {'error': f'Unknown section "{section}" for doc-type "{doc_type}". '
+                         f'Available sections: {available}'}
+
+    # Gather candidate evidence
+    evidence: list[dict] = []
+
+    if source_path:
+        if not os.path.exists(source_path):
+            return {'error': f'Source not found: {source_path}'}
+        with open(source_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+        evidence.append({
+            'kind': 'explicit-source',
+            'path': os.path.relpath(source_path, BASE_DIR).replace(os.sep, '/'),
+            'content': content,
+        })
+
+    # Run a text search if asked, OR if no explicit source was given.
+    # If neither --query nor --source was given, fall back to the section
+    # name as a query so the agent always sees something.
+    effective_query = query
+    if effective_query is None and source_path is None:
+        effective_query = section.replace('-', ' ')
+
+    if effective_query:
+        try:
+            hits = _search_wiki_text(effective_query, k=k)
+        except Exception:
+            hits = []
+        for hit in hits:
+            wiki_path = hit.get('wiki_path', '')
+            # Filter to the requested client only
+            normalized = wiki_path.replace('\\', '/')
+            if client_slug and not normalized.replace('wiki/', '').startswith(client_slug + '/'):
+                continue
+            evidence.append({
+                'kind': 'wiki-search-hit',
+                'path': wiki_path,
+                'title': hit.get('title', ''),
+                'score': hit.get('score', 0),
+                'excerpt': hit.get('text', ''),
+            })
+
+    writing_style = profile.get('writing_style', {}) or {}
+    submission_checklist = profile.get('submission_checklist', []) or []
+
+    write_prompt = (
+        f'You are writing the "{section}" section of a {doc_type} document for the '
+        f'"{client_slug}" client, against the "{profile.get("name", "active")}" profile. '
+        f'Use ONLY the evidence in this packet. Cite each non-trivial claim with a '
+        f'source path. Where you cannot find a citation, insert the placeholder '
+        f'{writing_style.get("placeholder_for_missing_refs", "[TO ADD REF]")} at '
+        f'the exact spot. Follow the writing style block strictly: principles, '
+        f'general rules, terminology guidance, and framing examples are all '
+        f'normative. Do not invent facts. Do not use editorial language. Output '
+        f'a single markdown section starting with `## {section}` followed by the '
+        f'body. No frontmatter, no surrounding prose.'
+    )
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    _append_log(
+        operation='DRAFT-PACKET',
+        description=f'Write packet built for {client_slug}/{doc_type}/{section}',
+        details=[
+            f'Profile: {profile.get("name", "?")}',
+            f'Doc type: {doc_type}',
+            f'Section: {section}',
+            f'Evidence pieces: {len(evidence)}',
+        ],
+        date=today,
+    )
+
+    return {
+        'profile_name': profile.get('name', ''),
+        'doc_type': doc_type,
+        'doc_description': doc_def.get('description', ''),
+        'section': section,
+        'section_notes': section_notes[section],
+        'all_section_notes': section_notes,  # so the agent sees the full doc structure
+        'writing_style': writing_style,
+        'submission_checklist': submission_checklist,
+        'client_slug': client_slug,
+        'evidence': evidence,
+        'write_prompt': write_prompt,
+    }
+
+
+def _format_write_packet(packet: dict) -> str:
+    """Render a write packet as markdown for piping to an LLM agent."""
+    lines: list[str] = []
+    lines.append('# Write packet')
+    lines.append('')
+    lines.append(f'- **Profile:** {packet["profile_name"]}')
+    lines.append(f'- **Document type:** `{packet["doc_type"]}`')
+    if packet.get('doc_description'):
+        lines.append(f'  - {packet["doc_description"]}')
+    lines.append(f'- **Section:** `{packet["section"]}`')
+    lines.append(f'- **Client:** `{packet["client_slug"]}`')
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    lines.append('## Write prompt')
+    lines.append('')
+    lines.append(packet['write_prompt'])
+    lines.append('')
+
+    lines.append(f'## Section notes for `{packet["section"]}`')
+    lines.append('')
+    lines.append(packet['section_notes'])
+    lines.append('')
+
+    style = packet.get('writing_style', {}) or {}
+    if style.get('principles'):
+        lines.append('## Principles')
+        lines.append('')
+        for p in style['principles']:
+            lines.append(f'- {p}')
+        lines.append('')
+    if style.get('general_rules'):
+        lines.append('## General writing rules')
+        lines.append('')
+        for r in style['general_rules']:
+            lines.append(f'- {r}')
+        lines.append('')
+    if style.get('terminology_guidance'):
+        lines.append('## Terminology guidance')
+        lines.append('')
+        lines.append('| Use | Instead of | Why |')
+        lines.append('|---|---|---|')
+        for entry in style['terminology_guidance']:
+            instead = ', '.join(entry.get('instead_of', []))
+            lines.append(f'| {entry.get("use", "")} | {instead} | {entry.get("rationale", "")} |')
+        lines.append('')
+    if style.get('framing_examples'):
+        lines.append('## Framing examples')
+        lines.append('')
+        for ex in style['framing_examples']:
+            lines.append(f'**Context:** {ex.get("context", "")}')
+            lines.append('')
+            lines.append('**Wrong:**')
+            lines.append('')
+            lines.append(f'> {ex.get("wrong", "")}')
+            lines.append('')
+            lines.append('**Correct:**')
+            lines.append('')
+            lines.append(f'> {ex.get("correct", "")}')
+            lines.append('')
+            if ex.get('why'):
+                lines.append(f'*Why:* {ex["why"]}')
+                lines.append('')
+
+    if packet.get('submission_checklist'):
+        lines.append('## Submission checklist (for the final document)')
+        lines.append('')
+        for item in packet['submission_checklist']:
+            lines.append(f'- [ ] {item}')
+        lines.append('')
+
+    evidence = packet.get('evidence', []) or []
+    lines.append(f'## Evidence ({len(evidence)} piece(s))')
+    lines.append('')
+    if not evidence:
+        lines.append('_No evidence found. The agent will need to ask the user for '
+                     'a source file or run additional ingest commands first._')
+        lines.append('')
+    else:
+        for i, ev in enumerate(evidence, 1):
+            lines.append(f'### Evidence #{i}: `{ev.get("path", "?")}`')
+            lines.append(f'- Kind: `{ev.get("kind", "?")}`')
+            if ev.get('title'):
+                lines.append(f'- Title: {ev["title"]}')
+            if ev.get('score') is not None and ev.get('kind') != 'explicit-source':
+                lines.append(f'- Score: {ev["score"]}')
+            lines.append('')
+            content = ev.get('content') or ev.get('excerpt') or ''
+            lines.append('```markdown')
+            lines.append(content)
+            lines.append('```')
+            lines.append('')
+
+    return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Agent loop (plan, next-task, task-done, show, list)
+# ---------------------------------------------------------------------------
+#
+# The agent loop turns "produce a Design Validation Report" into a structured
+# TODO list the agent can walk one task at a time. Mneme generates the plan
+# deterministically from the active profile - the agent does the intelligent
+# work (writing, finding evidence, judging quality), mneme does the mechanical
+# work (knowing which sections exist, what command runs next, what depends on
+# what).
+#
+# Plans are persisted under <workspace>/.mneme/agent-plans/<id>.json (the
+# plan document) and <id>.state.json (per-task statuses). The .mneme/
+# directory is workspace-internal and gitignored.
+
+def _plan_dir() -> str:
+    return os.path.join(BASE_DIR, '.mneme', 'agent-plans')
+
+
+def _plan_path(plan_id: str) -> str:
+    return os.path.join(_plan_dir(), f'{plan_id}.json')
+
+
+def _plan_state_path(plan_id: str) -> str:
+    return os.path.join(_plan_dir(), f'{plan_id}.state.json')
+
+
+def _ensure_plan_dir() -> None:
+    os.makedirs(_plan_dir(), exist_ok=True)
+
+
+def _save_plan(plan: dict) -> None:
+    _ensure_plan_dir()
+    with open(_plan_path(plan['plan_id']), 'w', encoding='utf-8') as f:
+        json.dump(plan, f, indent=2)
+
+
+def _load_plan(plan_id: str) -> Optional[dict]:
+    path = _plan_path(plan_id)
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _save_plan_state(plan_id: str, state: dict) -> None:
+    _ensure_plan_dir()
+    with open(_plan_state_path(plan_id), 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2)
+
+
+def _load_plan_state(plan_id: str) -> dict:
+    path = _plan_state_path(plan_id)
+    if not os.path.exists(path):
+        return {'plan_id': plan_id, 'task_status': {}}
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _resolve_plan_id(plan_id: Optional[str]) -> Optional[str]:
+    """If plan_id is None, return the most-recently-modified plan id, else
+    return plan_id verbatim. Returns None if no plans exist."""
+    if plan_id:
+        return plan_id
+    d = _plan_dir()
+    if not os.path.isdir(d):
+        return None
+    candidates = []
+    for fn in os.listdir(d):
+        if fn.endswith('.json') and not fn.endswith('.state.json'):
+            full = os.path.join(d, fn)
+            candidates.append((os.path.getmtime(full), fn[:-5]))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def agent_plan(goal: str, doc_type: str, client_slug: str, plan_id: Optional[str] = None) -> dict:
+    """
+    Generate a deterministic TODO list for a goal like "produce a Design
+    Validation Report". Persists the plan to disk and returns it.
+
+    The plan is built from the active profile's section_notes for the given
+    doc_type. Each section becomes either a draft-section task (if the
+    document doesn't exist yet) or a review-page task (if it does). An
+    assemble-document task depends on all the section tasks. A harmonize
+    task depends on assembly. A review task depends on harmonize. A
+    submission-check task depends on review.
+    """
+    profile = get_active_profile()
+    if profile is None:
+        return {'error': 'No active profile. Set one with: mneme profile set <name>'}
+
+    sections_config = profile.get('sections', {}) or {}
+    if doc_type not in sections_config:
+        available = ', '.join(sorted(sections_config.keys())) or '(none)'
+        return {'error': f'Unknown doc-type "{doc_type}" for profile "{profile.get("name", "?")}". '
+                         f'Available: {available}'}
+
+    section_notes = sections_config[doc_type].get('section_notes', {}) or {}
+    if not section_notes:
+        return {'error': f'Profile "{profile.get("name", "?")}" doc-type "{doc_type}" '
+                         f'has no section_notes; nothing to plan.'}
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    if plan_id is None:
+        # Stable id derived from doc_type + client + date
+        slug_doc = re.sub(r'[^a-z0-9-]+', '-', doc_type.lower()).strip('-')
+        slug_client = re.sub(r'[^a-z0-9-]+', '-', client_slug.lower()).strip('-')
+        plan_id = f'{slug_doc}-{slug_client}-{today}'
+
+    # Stable assembled-document filename: <doc_type>.md under the client dir
+    page_path = os.path.join(WIKI_DIR, client_slug, f'{doc_type}.md')
+    page_exists = os.path.exists(page_path)
+
+    tasks: list[dict] = []
+    section_task_ids: list[str] = []
+
+    for section_slug in section_notes.keys():
+        task_id = f'section-{section_slug}'
+        section_task_ids.append(task_id)
+
+        if page_exists:
+            kind = 'review-section'
+            instructions = (
+                f'The page already exists. Read the existing `{section_slug}` section '
+                f'and grade it against the section notes below. If issues are found, '
+                f'rewrite the section in place.'
+            )
+            next_command = (
+                f'mneme validate writing-style {client_slug}/{doc_type}'
+            )
+        else:
+            kind = 'draft-section'
+            instructions = (
+                f'Run the next_command to assemble a write packet for the '
+                f'`{section_slug}` section. Then write the section as a single '
+                f'markdown block starting with `## {section_slug}` and following '
+                f'the section notes, principles, general rules, and terminology '
+                f'guidance in the packet. Use only the evidence provided. Cite '
+                f'each non-trivial claim. Use [TO ADD REF] for missing refs.'
+            )
+            next_command = (
+                f'mneme draft --doc-type {doc_type} --section {section_slug} '
+                f'--client {client_slug}'
+            )
+
+        tasks.append({
+            'id': task_id,
+            'kind': kind,
+            'goal': f'{"Review" if page_exists else "Draft"} the `{section_slug}` section of the {doc_type}',
+            'instructions': instructions,
+            'preconditions': [
+                f'Active profile must be "{profile.get("name", "?")}"',
+            ],
+            'deliverable': {
+                'kind': 'markdown-section',
+                'target_page': os.path.relpath(page_path, BASE_DIR).replace(os.sep, '/'),
+                'section_slug': section_slug,
+            },
+            'next_command': next_command,
+            'after_done': f'mneme agent task-done {task_id} --plan {plan_id}',
+            'depends_on': [],
+            'blocks': ['assemble-document'],
+            'status': 'pending',
+        })
+
+    tasks.append({
+        'id': 'assemble-document',
+        'kind': 'assemble-document',
+        'goal': f'Assemble all section drafts into wiki/{client_slug}/{doc_type}.md',
+        'instructions': (
+            f'Combine the drafted sections (in the order listed in the active '
+            f'profile) into a single wiki page at the deliverable target_page. '
+            f'Add proper frontmatter: title, type: {doc_type}, client: {client_slug}, '
+            f'created/updated dates, sources from the evidence used, '
+            f'confidence: medium. Then run the after_done command.'
+        ),
+        'preconditions': ['All section tasks must be done'],
+        'deliverable': {
+            'kind': 'wiki-page',
+            'target_page': os.path.relpath(page_path, BASE_DIR).replace(os.sep, '/'),
+        },
+        'next_command': f'# manual: write {os.path.relpath(page_path, BASE_DIR).replace(os.sep, "/")}',
+        'after_done': f'mneme agent task-done assemble-document --plan {plan_id}',
+        'depends_on': list(section_task_ids),
+        'blocks': ['harmonize'],
+        'status': 'pending',
+    })
+
+    tasks.append({
+        'id': 'harmonize',
+        'kind': 'harmonize',
+        'goal': f'Apply vocabulary harmonization to {client_slug}',
+        'instructions': (
+            'Run the next_command to mechanically replace rejected vocabulary '
+            'with preferred terms across the entire client.'
+        ),
+        'preconditions': ['assemble-document must be done'],
+        'deliverable': {'kind': 'harmonized-pages'},
+        'next_command': f'mneme harmonize --client {client_slug} --fix',
+        'after_done': f'mneme agent task-done harmonize --plan {plan_id}',
+        'depends_on': ['assemble-document'],
+        'blocks': ['review-page'],
+        'status': 'pending',
+    })
+
+    tasks.append({
+        'id': 'review-page',
+        'kind': 'review-page',
+        'goal': f'Run the writing-style review on the assembled document',
+        'instructions': (
+            'Run the next_command to build the review packet, then grade the '
+            'document against the writing style. For each issue found, quote '
+            'the offending text, explain why, and propose a concrete rewrite. '
+            'Apply your own corrections. The user will read your final report.'
+        ),
+        'preconditions': ['harmonize must be done'],
+        'deliverable': {'kind': 'review-report'},
+        'next_command': f'mneme validate writing-style {client_slug}/{doc_type}',
+        'after_done': f'mneme agent task-done review-page --plan {plan_id}',
+        'depends_on': ['harmonize'],
+        'blocks': ['submission-check'],
+        'status': 'pending',
+    })
+
+    tasks.append({
+        'id': 'submission-check',
+        'kind': 'submission-check',
+        'goal': 'Walk the submission checklist from the active profile and report pass/fail per item',
+        'instructions': (
+            'Open the active profile (run `mneme profile show` for a summary, '
+            'or read the .md file directly). For each item in the submission '
+            'checklist, walk the assembled document and report pass/fail with '
+            'a one-line justification. Stop. Do NOT mark the document final '
+            'until the user has reviewed.'
+        ),
+        'preconditions': ['review-page must be done'],
+        'deliverable': {'kind': 'submission-checklist-report'},
+        'next_command': f'mneme profile show',
+        'after_done': f'mneme agent task-done submission-check --plan {plan_id}',
+        'depends_on': ['review-page'],
+        'blocks': [],
+        'status': 'pending',
+    })
+
+    plan = {
+        'plan_id': plan_id,
+        'goal': goal,
+        'doc_type': doc_type,
+        'client_slug': client_slug,
+        'profile': profile.get('name', ''),
+        'created': today,
+        'tasks': tasks,
+    }
+
+    _save_plan(plan)
+    # Initialize empty state file
+    state = {'plan_id': plan_id, 'task_status': {t['id']: 'pending' for t in tasks}}
+    _save_plan_state(plan_id, state)
+
+    _append_log(
+        operation='AGENT-PLAN',
+        description=f'Generated plan {plan_id} ({len(tasks)} tasks)',
+        details=[
+            f'Goal: {goal}',
+            f'Doc type: {doc_type}',
+            f'Client: {client_slug}',
+        ],
+        date=today,
+    )
+
+    return plan
+
+
+def agent_show_plan(plan_id: Optional[str] = None) -> dict:
+    """Return the plan + state. Picks the most recent plan if id is omitted."""
+    resolved = _resolve_plan_id(plan_id)
+    if resolved is None:
+        return {'error': 'No plans found in this workspace.'}
+    plan = _load_plan(resolved)
+    if plan is None:
+        return {'error': f'Plan not found: {resolved}'}
+    state = _load_plan_state(resolved)
+    return {'plan': plan, 'state': state}
+
+
+def agent_next_task(plan_id: Optional[str] = None) -> dict:
+    """
+    Return the next ready task: the first task whose status is `pending` and
+    whose dependencies are all `done`. Returns {done: True} if every task is
+    done. Returns {error: ...} if no plan exists.
+    """
+    resolved = _resolve_plan_id(plan_id)
+    if resolved is None:
+        return {'error': 'No plans found in this workspace.'}
+    plan = _load_plan(resolved)
+    if plan is None:
+        return {'error': f'Plan not found: {resolved}'}
+    state = _load_plan_state(resolved)
+    statuses = state.get('task_status', {})
+
+    all_done = True
+    for task in plan['tasks']:
+        if statuses.get(task['id'], 'pending') != 'done':
+            all_done = False
+            break
+    if all_done:
+        return {'plan_id': resolved, 'done': True}
+
+    for task in plan['tasks']:
+        tid = task['id']
+        if statuses.get(tid, 'pending') != 'pending':
+            continue
+        deps = task.get('depends_on', []) or []
+        if all(statuses.get(d, 'pending') == 'done' for d in deps):
+            return {'plan_id': resolved, 'task': task}
+
+    return {'plan_id': resolved, 'blocked': True,
+            'message': 'No ready tasks (all remaining tasks are blocked on dependencies).'}
+
+
+def agent_task_done(task_id: str, plan_id: Optional[str] = None) -> dict:
+    """Mark a task as done. Returns the updated state."""
+    resolved = _resolve_plan_id(plan_id)
+    if resolved is None:
+        return {'error': 'No plans found in this workspace.'}
+    plan = _load_plan(resolved)
+    if plan is None:
+        return {'error': f'Plan not found: {resolved}'}
+    if not any(t['id'] == task_id for t in plan['tasks']):
+        valid = ', '.join(t['id'] for t in plan['tasks'])
+        return {'error': f'Task "{task_id}" not in plan {resolved}. Valid tasks: {valid}'}
+    state = _load_plan_state(resolved)
+    state.setdefault('task_status', {})[task_id] = 'done'
+    _save_plan_state(resolved, state)
+    today = datetime.now().strftime('%Y-%m-%d')
+    _append_log(
+        operation='AGENT-TASK-DONE',
+        description=f'Plan {resolved}: task {task_id} marked done',
+        details=[],
+        date=today,
+    )
+    return {'plan_id': resolved, 'task_id': task_id, 'state': state}
+
+
+def agent_list_plans() -> list[dict]:
+    """List all plans in this workspace, newest first."""
+    d = _plan_dir()
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in os.listdir(d):
+        if not fn.endswith('.json') or fn.endswith('.state.json'):
+            continue
+        plan_id = fn[:-5]
+        plan = _load_plan(plan_id)
+        if plan is None:
+            continue
+        state = _load_plan_state(plan_id)
+        statuses = state.get('task_status', {})
+        total = len(plan['tasks'])
+        done = sum(1 for s in statuses.values() if s == 'done')
+        out.append({
+            'plan_id': plan_id,
+            'goal': plan.get('goal', ''),
+            'doc_type': plan.get('doc_type', ''),
+            'client_slug': plan.get('client_slug', ''),
+            'profile': plan.get('profile', ''),
+            'created': plan.get('created', ''),
+            'progress': f'{done}/{total}',
+            'mtime': os.path.getmtime(os.path.join(d, fn)),
+        })
+    out.sort(key=lambda p: p['mtime'], reverse=True)
+    for entry in out:
+        entry.pop('mtime', None)
+    return out
+
+
 def validate_consistency(client_slug: str) -> dict:
     """
     Cross-document consistency check for a client.
@@ -4944,6 +5558,61 @@ def main() -> None:
     validate_consist_parser = validate_sub.add_parser('consistency', help='Cross-document consistency check')
     validate_consist_parser.add_argument('--client', required=True, help='Client slug')
 
+    # draft (write packet for an LLM agent)
+    draft_parser = subparsers.add_parser(
+        'draft',
+        help='Build a write packet for an LLM agent (the symmetric counterpart to validate writing-style)',
+    )
+    draft_parser.add_argument('--doc-type', required=True, dest='doc_type',
+                              help='Document type (must match a section in the active profile)')
+    draft_parser.add_argument('--section', required=True,
+                              help='Section slug within the doc-type')
+    draft_parser.add_argument('--client', required=True, help='Client slug')
+    draft_parser.add_argument('--source', type=str, default=None,
+                              help='Path to a source file to include as evidence verbatim')
+    draft_parser.add_argument('--query', type=str, default=None,
+                              help='Wiki text search query to gather evidence (defaults to the section name)')
+    draft_parser.add_argument('-k', type=int, default=10,
+                              help='Max evidence pieces from the wiki search (default: 10)')
+    draft_parser.add_argument('--json', action='store_true',
+                              help='Emit JSON instead of human-readable markdown')
+    draft_parser.add_argument('--out', type=str, default=None,
+                              help='Write packet to a file instead of stdout')
+
+    # agent (the structured agent loop)
+    agent_parser = subparsers.add_parser(
+        'agent',
+        help='Structured agent loop: plan a goal, walk tasks, mark them done',
+    )
+    agent_sub = agent_parser.add_subparsers(dest='agent_command')
+
+    agent_plan_parser = agent_sub.add_parser('plan', help='Generate a TODO plan for a goal')
+    agent_plan_parser.add_argument('--goal', required=True, help='High-level goal in plain English')
+    agent_plan_parser.add_argument('--doc-type', required=True, dest='doc_type',
+                                   help='Document type (must match a section in the active profile)')
+    agent_plan_parser.add_argument('--client', required=True, help='Client slug')
+    agent_plan_parser.add_argument('--id', type=str, default=None, dest='plan_id',
+                                   help='Optional explicit plan id (default: auto-derived)')
+    agent_plan_parser.add_argument('--json', action='store_true', help='Emit JSON instead of markdown')
+
+    agent_show_parser = agent_sub.add_parser('show', help='Show a plan and its task statuses')
+    agent_show_parser.add_argument('--plan', type=str, default=None, dest='plan_id',
+                                   help='Plan id (default: most recently modified)')
+    agent_show_parser.add_argument('--json', action='store_true', help='Emit JSON instead of markdown')
+
+    agent_next_parser = agent_sub.add_parser('next-task', help='Return the next ready task')
+    agent_next_parser.add_argument('--plan', type=str, default=None, dest='plan_id',
+                                   help='Plan id (default: most recently modified)')
+    agent_next_parser.add_argument('--json', action='store_true', help='Emit JSON instead of markdown')
+
+    agent_done_parser = agent_sub.add_parser('task-done', help='Mark a task as done')
+    agent_done_parser.add_argument('task_id', help='Task id')
+    agent_done_parser.add_argument('--plan', type=str, default=None, dest='plan_id',
+                                   help='Plan id (default: most recently modified)')
+
+    agent_list_parser = agent_sub.add_parser('list', help='List all plans in this workspace')
+    agent_list_parser.add_argument('--json', action='store_true', help='Emit JSON instead of a table')
+
     # scan-repo
     scan_parser = subparsers.add_parser('scan-repo', help='Scan code repo and compare against QMS docs')
     scan_parser.add_argument('repo_path', help='Path to code repository')
@@ -5309,7 +5978,140 @@ def main() -> None:
                 for incon in result.get('standard_inconsistencies', []):
                     print(f'  WARNING: Standard "{incon.get("standard", "")}" cited as versions: {", ".join(incon.get("versions", []))}')
         else:
-            print('Usage: mneme validate {structure|consistency}', file=sys.stderr)
+            print('Usage: mneme validate {writing-style|consistency}', file=sys.stderr)
+
+    elif args.command == 'draft':
+        if not re.match(r'^[a-z0-9][a-z0-9\-]*$', args.client):
+            print(f'Error: invalid client slug "{args.client}".', file=sys.stderr)
+            sys.exit(1)
+        packet = draft_document(
+            doc_type=args.doc_type,
+            section=args.section,
+            client_slug=args.client,
+            source_path=args.source,
+            query=args.query,
+            k=args.k,
+        )
+        if 'error' in packet:
+            print(f'Error: {packet["error"]}', file=sys.stderr)
+            sys.exit(1)
+        if args.json:
+            output = json.dumps(packet, indent=2, default=str)
+        else:
+            output = _format_write_packet(packet)
+        if args.out:
+            with open(args.out, 'w', encoding='utf-8') as f:
+                f.write(output)
+            print(f'Wrote write packet to {args.out}')
+        else:
+            print(output)
+
+    elif args.command == 'agent':
+        if args.agent_command == 'plan':
+            if not re.match(r'^[a-z0-9][a-z0-9\-]*$', args.client):
+                print(f'Error: invalid client slug "{args.client}".', file=sys.stderr)
+                sys.exit(1)
+            plan = agent_plan(args.goal, args.doc_type, args.client, plan_id=args.plan_id)
+            if 'error' in plan:
+                print(f'Error: {plan["error"]}', file=sys.stderr)
+                sys.exit(1)
+            if args.json:
+                print(json.dumps(plan, indent=2, default=str))
+            else:
+                print(f'Plan: {plan["plan_id"]}')
+                print(f'  Goal: {plan["goal"]}')
+                print(f'  Doc type: {plan["doc_type"]}')
+                print(f'  Client: {plan["client_slug"]}')
+                print(f'  Profile: {plan["profile"]}')
+                print(f'  Tasks: {len(plan["tasks"])}')
+                print()
+                print('Tasks:')
+                for t in plan['tasks']:
+                    deps = ', '.join(t['depends_on']) if t['depends_on'] else '(none)'
+                    print(f'  - [{t["kind"]}] {t["id"]}')
+                    print(f'      goal: {t["goal"]}')
+                    print(f'      depends on: {deps}')
+                print()
+                print(f'Next: mneme agent next-task --plan {plan["plan_id"]}')
+
+        elif args.agent_command == 'show':
+            result = agent_show_plan(args.plan_id)
+            if 'error' in result:
+                print(f'Error: {result["error"]}', file=sys.stderr)
+                sys.exit(1)
+            if args.json:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                plan = result['plan']
+                state = result['state']
+                statuses = state.get('task_status', {})
+                print(f'Plan: {plan["plan_id"]}')
+                print(f'  Goal: {plan.get("goal", "?")}')
+                print(f'  Doc type: {plan.get("doc_type", "?")}')
+                print(f'  Client: {plan.get("client_slug", "?")}')
+                print()
+                done = sum(1 for s in statuses.values() if s == 'done')
+                print(f'Progress: {done}/{len(plan["tasks"])}')
+                print()
+                for t in plan['tasks']:
+                    status = statuses.get(t['id'], 'pending')
+                    marker = '[x]' if status == 'done' else '[ ]'
+                    print(f'  {marker} {t["id"]}  ({t["kind"]})')
+                    print(f'      {t["goal"]}')
+
+        elif args.agent_command == 'next-task':
+            result = agent_next_task(args.plan_id)
+            if 'error' in result:
+                print(f'Error: {result["error"]}', file=sys.stderr)
+                sys.exit(1)
+            if args.json:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                if result.get('done'):
+                    print('All tasks done.')
+                elif result.get('blocked'):
+                    print(result.get('message', 'Blocked.'))
+                else:
+                    t = result['task']
+                    print(f'Next task: {t["id"]}')
+                    print(f'  Kind:    {t["kind"]}')
+                    print(f'  Goal:    {t["goal"]}')
+                    print()
+                    print('  Instructions:')
+                    print(f'    {t["instructions"]}')
+                    print()
+                    if t.get('preconditions'):
+                        print('  Preconditions:')
+                        for p in t['preconditions']:
+                            print(f'    - {p}')
+                        print()
+                    print(f'  Run:        {t["next_command"]}')
+                    print(f'  After done: {t["after_done"]}')
+
+        elif args.agent_command == 'task-done':
+            result = agent_task_done(args.task_id, args.plan_id)
+            if 'error' in result:
+                print(f'Error: {result["error"]}', file=sys.stderr)
+                sys.exit(1)
+            print(f'Marked task "{result["task_id"]}" as done in plan {result["plan_id"]}.')
+            print()
+            print('Run `mneme agent next-task` to get the next ready task.')
+
+        elif args.agent_command == 'list':
+            plans = agent_list_plans()
+            if args.json:
+                print(json.dumps(plans, indent=2, default=str))
+            else:
+                if not plans:
+                    print('No plans in this workspace.')
+                else:
+                    print(f'{"PLAN":<40}  {"PROGRESS":<10}  {"DOC TYPE":<25}  GOAL')
+                    for p in plans:
+                        print(f'{p["plan_id"]:<40}  {p["progress"]:<10}  {p["doc_type"]:<25}  {p["goal"]}')
+
+        else:
+            print('Usage: mneme agent {plan|show|next-task|task-done|list}', file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == 'scan-repo':
         try:

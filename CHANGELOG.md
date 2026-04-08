@@ -6,6 +6,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`mneme draft`** -- the symmetric counterpart to `mneme validate
+  writing-style`. Where validate produces a *review* packet (grade existing
+  prose), draft produces a *write* packet (produce new prose). Takes
+  `--doc-type`, `--section`, `--client`, optional `--source` (include a file
+  verbatim) or `--query` (text-search the wiki for evidence), `--json` and
+  `--out` for output control. Mneme assembles the contract; the LLM agent
+  consuming the packet does the writing.
+- **`mneme agent` namespace** -- the structured agent loop:
+  - `mneme agent plan --goal "..." --doc-type <t> --client <c>` generates a
+    deterministic TODO plan from the active profile's section_notes. For a
+    `design-validation-report` against the eu-mdr profile, this produces 15
+    tasks: one `draft-section` (or `review-section` if the page already
+    exists) per section in the profile, then `assemble-document`,
+    `harmonize`, `review-page`, `submission-check`. Tasks have a
+    `depends_on` graph and a `next_command` field that tells the agent
+    exactly what to run.
+  - `mneme agent next-task` returns the next ready task whose dependencies
+    are satisfied.
+  - `mneme agent task-done <id>` marks a task complete and unblocks the next.
+  - `mneme agent show` displays the plan + per-task statuses.
+  - `mneme agent list` lists all plans in the workspace.
+  - Plans and state are persisted under `<workspace>/.mneme/agent-plans/`
+    (gitignored automatically by the bundled workspace template).
+- **`AGENTS.md`** at the repo root -- the canonical agent protocol document.
+  Describes the agent loop, six standard task templates (DVR, CER, risk
+  file, resync workflow, migration, pre-submission), four sub-agent
+  spawning patterns (section-writer, reviewer, vocabulary-fixer,
+  evidence-finder), the rituals an agent must read on every operation, and
+  the hard rules an agent must never violate. Shipped at the repo root and
+  scaffolded into every new workspace by `mneme new`.
+- New log operations: `DRAFT-PACKET`, `AGENT-PLAN`, `AGENT-TASK-DONE`.
+- Bundled workspace template `.gitignore` now includes `.mneme/`.
+
 ### Changed (BREAKING)
 - **Profiles are now markdown files.** The previous `.json` profile format
   has been removed entirely. Profiles live in `<workspace>/profiles/<name>.md`

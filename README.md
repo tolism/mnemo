@@ -120,12 +120,48 @@ One installed CLI serves many projects — each workspace is just a directory.
 | `mneme resync <file> <client>` | Re-ingest an updated source via 3-way merge, preserving hand edits |
 | `mneme resync-resolve <client/page>` | Finalize a conflicted resync after editing out markers |
 | `mneme search "<query>"` | Search across all layers |
+| `mneme draft --doc-type <t> --section <s> --client <c>` | Build a *write packet* for an LLM agent to produce one section |
+| `mneme validate writing-style <page>` | Build a *review packet* for an LLM agent to grade a page |
+| `mneme agent plan --goal "..." --doc-type <t> --client <c>` | Generate a deterministic TODO plan from the active profile |
+| `mneme agent next-task` | Return the next ready task in the active plan |
+| `mneme agent task-done <id>` | Mark a task as done |
 | `mneme sync` | Sync wiki to Memvid memory |
 | `mneme drift` | Detect layer desynchronization |
 | `mneme stats` | Health overview |
 | `mneme repair` | Fix corrupted archives |
 
 **Formats:** `.md`, `.txt`, `.pdf`
+
+---
+
+## For LLM agents
+
+If you are an LLM agent driving mneme on a user's behalf — read **[AGENTS.md](AGENTS.md)** first. It is the canonical contract for the agent loop, the standard task templates (DVR, CER, risk file, resync, migration, pre-submission), the sub-agent spawning patterns, and the hard rules you must never violate.
+
+The 30-second version of the agent loop:
+
+```bash
+# 1. Generate a plan from the active profile
+mneme agent plan --goal "Produce a Design Validation Report" \
+                 --doc-type design-validation-report \
+                 --client tda
+
+# 2. Walk the plan one task at a time
+mneme agent next-task        # returns a self-contained task envelope
+# (do the work the envelope describes -- usually `mneme draft` or
+#  `mneme validate writing-style`, then write or grade prose)
+mneme agent task-done section-context
+
+# 3. Repeat until done
+mneme agent next-task
+# ...
+
+# 4. Inspect progress at any time
+mneme agent show
+mneme agent list
+```
+
+Mneme generates the plan deterministically from the active profile's section_notes. Tasks have a dependency graph; `next-task` only returns ones whose dependencies are satisfied. The plan and per-task state are persisted under `<workspace>/.mneme/agent-plans/` (gitignored). Mneme does not call any LLM — you (the agent) do the writing. Mneme assembles the contracts.
 
 ---
 

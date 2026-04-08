@@ -45,6 +45,12 @@
 | `mneme harmonize` | Vocabulary harmonization against active profile |
 | `mneme validate writing-style` | Build a writing-style review packet for an LLM agent (replaces `validate structure`) |
 | `mneme validate consistency` | Cross-document consistency check |
+| `mneme draft` | Build a write packet for an LLM agent (the symmetric counterpart to `validate writing-style`) |
+| `mneme agent plan` | Generate a deterministic TODO plan for a goal (e.g. produce a DVR), persisted under `.mneme/agent-plans/` |
+| `mneme agent show` | Show a plan and per-task statuses |
+| `mneme agent next-task` | Return the next ready task in the plan (respects dependency graph) |
+| `mneme agent task-done` | Mark a task as done |
+| `mneme agent list` | List all plans in this workspace |
 | `mneme scan-repo` | Scan code repo, compare against QMS docs, find gaps |
 | `mneme tornado` | Inbox processor: auto-detect type/client, ingest, archive to sources |
 | `mneme ingest-csv` | CSV ingest: one row = one wiki page, with column-to-frontmatter mapping and auto trace links |
