@@ -43,7 +43,7 @@
 | `mneme trace matrix` | Generate traceability matrix for a client |
 | `mneme trace gaps` | Find incomplete trace chains |
 | `mneme harmonize` | Vocabulary harmonization against active profile |
-| `mneme validate structure` | Check page sections against profile requirements |
+| `mneme validate writing-style` | Build a writing-style review packet for an LLM agent (replaces `validate structure`) |
 | `mneme validate consistency` | Cross-document consistency check |
 | `mneme scan-repo` | Scan code repo, compare against QMS docs, find gaps |
 | `mneme tornado` | Inbox processor: auto-detect type/client, ingest, archive to sources |
@@ -68,7 +68,7 @@
 ### Workspace-local Profiles (v0.4.0+)
 
 Drop a `<name>.json` file into `{workspace}/profiles/` and it becomes available
-to `mneme profile set`, `harmonize`, and `validate structure`. Workspace profiles
+to `mneme profile set`, `harmonize`, and `validate writing-style`. Workspace profiles
 **shadow** any bundled profile with the same name, so a project can override
 an industry profile with project-specific tweaks. The same applies to CSV
 column mappings under `{workspace}/profiles/mappings/`. `mneme new` scaffolds

@@ -3789,17 +3789,34 @@ def harmonize(client_slug: str, fix: bool = False) -> dict:
     return result
 
 
-def validate_structure(page_slug: str) -> dict:
+def validate_writing_style(page_slug: str) -> dict:
     """
-    Check a wiki page against the active profile's section requirements.
+    Build a "writing-style review packet" for an LLM agent.
 
-    Loads the profile, determines the page type from frontmatter, checks
-    required sections for that type, and scans for ## headings in the page.
-    Returns {page, type, required_sections, present_sections, missing_sections, extra_sections}.
+    Mneme does not grade prose itself - that requires reasoning. Instead this
+    function assembles everything an agent needs to grade the page against
+    the active profile's writing style:
+
+      - the page content
+      - the active profile's writing_style block (principles, general_rules,
+        terminology_guidance, framing_examples)
+      - the section_notes for the document type that matches the page (resolved
+        from the page's frontmatter `type:` field; falls back to no notes if
+        there is no match)
+      - the profile's submission_checklist
+      - a ready-to-paste review prompt the user can hand to any LLM
+
+    Returns a dict containing all of the above. CLI rendering is handled by
+    the caller; see `--json` for raw output.
+
+    The page's frontmatter `type:` field is the canonical way to associate a
+    page with a profile section. If a profile defines `sections.foo`, the
+    user should set `type: foo` in the page frontmatter to opt into the
+    `section_notes` for `foo`.
     """
     profile = get_active_profile()
     if profile is None:
-        return {'error': 'No active profile. Set one with: mneme profile activate <name>'}
+        return {'error': 'No active profile. Set one with: mneme profile set <name>'}
 
     page_path = os.path.join(WIKI_DIR, page_slug + '.md')
     if not os.path.exists(page_path):
@@ -3809,62 +3826,162 @@ def validate_structure(page_slug: str) -> dict:
         content = f.read()
 
     fm, body = parse_frontmatter(content)
-    page_type = fm.get('type', '')
+    page_type = (fm.get('type') or '').strip()
 
-    # Determine which section template applies
     sections_config = profile.get('sections', {})
-    # Try to match page type or tags to a section template
-    required_sections = []
-    matched_template = None
+    matched_section = None
+    section_notes: dict = {}
+    section_description = ''
+    if page_type and page_type in sections_config:
+        matched_section = page_type
+        sec_def = sections_config[page_type]
+        section_notes = sec_def.get('section_notes', {}) or {}
+        section_description = sec_def.get('description', '')
 
-    # Check if page tags or type match a section key
-    tags = fm.get('tags', [])
-    if isinstance(tags, str):
-        tags = [t.strip() for t in tags.split(',')]
+    writing_style = profile.get('writing_style', {}) or {}
+    submission_checklist = profile.get('submission_checklist', []) or []
 
-    # Try matching by page slug suffix, tags, or type
-    for section_key, section_def in sections_config.items():
-        normalized_key = section_key.replace('-', ' ').lower()
-        title_lower = fm.get('title', '').lower().replace('-', ' ')
-        slug_lower = page_slug.lower().replace('-', ' ')
-        if (normalized_key in title_lower or
-                normalized_key in slug_lower or
-                section_key in tags):
-            required_sections = section_def.get('required', [])
-            matched_template = section_key
-            break
-
-    # Extract ## headings from page body
-    headings = re.findall(r'^##\s+(.+)$', body, re.MULTILINE)
-    # Normalize headings to slug form for comparison
-    present_normalized = [h.strip().lower().replace(' ', '-') for h in headings]
-    present_sections = [h.strip() for h in headings]
-
-    missing_sections = [s for s in required_sections if s not in present_normalized]
-    extra_sections = [h for h, norm in zip(present_sections, present_normalized)
-                      if norm not in required_sections and required_sections]
+    # Build a copy-pasteable review prompt for any LLM agent.
+    review_prompt = (
+        f'You are reviewing the wiki page below against the writing style of the '
+        f'"{profile.get("name", "active")}" profile. Use the principles, general '
+        f'rules, terminology guidance, framing examples, and any section-specific '
+        f'notes provided. For each issue you find, quote the offending text, '
+        f'explain why it violates the style, and propose a concrete rewrite. '
+        f'Then walk the submission checklist and report pass/fail per item with '
+        f'a one-line justification. Be specific. Do not hedge.'
+    )
 
     today = datetime.now().strftime('%Y-%m-%d')
-    if missing_sections:
-        _append_log(
-            operation='VALIDATE',
-            description=f'Structure validation for {page_slug}',
-            details=[
-                f'Template: {matched_template or "none"}',
-                f'Missing sections: {", ".join(missing_sections)}',
-            ],
-            date=today,
-        )
+    _append_log(
+        operation='VALIDATE-STYLE',
+        description=f'Writing-style review packet built for {page_slug}',
+        details=[
+            f'Profile: {profile.get("name", "?")}',
+            f'Document type: {matched_section or "(none matched)"}',
+            f'Section notes available: {len(section_notes)}',
+        ],
+        date=today,
+    )
 
     return {
         'page': page_slug,
-        'type': page_type,
-        'template': matched_template,
-        'required_sections': required_sections,
-        'present_sections': present_sections,
-        'missing_sections': missing_sections,
-        'extra_sections': extra_sections,
+        'page_path': os.path.relpath(page_path, BASE_DIR).replace(os.sep, '/'),
+        'page_content': content,
+        'frontmatter': fm,
+        'profile_name': profile.get('name', ''),
+        'profile_description': profile.get('description', ''),
+        'document_type': matched_section,
+        'section_description': section_description,
+        'section_notes': section_notes,
+        'writing_style': writing_style,
+        'submission_checklist': submission_checklist,
+        'review_prompt': review_prompt,
     }
+
+
+def _format_writing_style_packet(packet: dict) -> str:
+    """Render a validate_writing_style packet as a markdown text packet
+    suitable for piping into Claude Code or pasting into an LLM chat."""
+    lines: list[str] = []
+    lines.append(f'# Writing-style review packet')
+    lines.append('')
+    lines.append(f'- **Page:** `{packet["page_path"]}`')
+    lines.append(f'- **Profile:** {packet["profile_name"]}')
+    if packet['document_type']:
+        lines.append(f'- **Document type:** `{packet["document_type"]}`')
+        if packet['section_description']:
+            lines.append(f'  - {packet["section_description"]}')
+    else:
+        lines.append('- **Document type:** (none matched - frontmatter `type` did '
+                     'not match any profile section; only the general writing style applies)')
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    lines.append('## Review prompt')
+    lines.append('')
+    lines.append(packet['review_prompt'])
+    lines.append('')
+
+    style = packet.get('writing_style') or {}
+
+    principles = style.get('principles') or []
+    if principles:
+        lines.append('## Principles')
+        lines.append('')
+        for p in principles:
+            lines.append(f'- {p}')
+        lines.append('')
+
+    general_rules = style.get('general_rules') or []
+    if general_rules:
+        lines.append('## General writing rules')
+        lines.append('')
+        for r in general_rules:
+            lines.append(f'- {r}')
+        lines.append('')
+
+    terminology = style.get('terminology_guidance') or []
+    if terminology:
+        lines.append('## Terminology guidance')
+        lines.append('')
+        lines.append('| Use | Instead of | Why |')
+        lines.append('|---|---|---|')
+        for entry in terminology:
+            instead = ', '.join(entry.get('instead_of', []))
+            lines.append(f'| {entry.get("use", "")} | {instead} | {entry.get("rationale", "")} |')
+        lines.append('')
+
+    framing = style.get('framing_examples') or []
+    if framing:
+        lines.append('## Framing examples')
+        lines.append('')
+        for ex in framing:
+            lines.append(f'**Context:** {ex.get("context", "")}')
+            lines.append('')
+            lines.append('**Wrong:**')
+            lines.append('')
+            lines.append(f'> {ex.get("wrong", "")}')
+            lines.append('')
+            lines.append('**Correct:**')
+            lines.append('')
+            lines.append(f'> {ex.get("correct", "")}')
+            lines.append('')
+            if ex.get('why'):
+                lines.append(f'*Why:* {ex["why"]}')
+                lines.append('')
+
+    if style.get('placeholder_for_missing_refs'):
+        lines.append(f'**Missing-reference placeholder:** `{style["placeholder_for_missing_refs"]}`')
+        lines.append('')
+
+    section_notes = packet.get('section_notes') or {}
+    if section_notes:
+        lines.append(f'## Section-specific notes for `{packet["document_type"]}`')
+        lines.append('')
+        for slug, note in section_notes.items():
+            lines.append(f'### `{slug}`')
+            lines.append('')
+            lines.append(note)
+            lines.append('')
+
+    checklist = packet.get('submission_checklist') or []
+    if checklist:
+        lines.append('## Submission checklist')
+        lines.append('')
+        for item in checklist:
+            lines.append(f'- [ ] {item}')
+        lines.append('')
+
+    lines.append('---')
+    lines.append('')
+    lines.append('## Page content')
+    lines.append('')
+    lines.append(packet['page_content'])
+    lines.append('')
+
+    return '\n'.join(lines)
 
 
 def validate_consistency(client_slug: str) -> dict:
@@ -4397,10 +4514,20 @@ def main() -> None:
     harmonize_parser.add_argument('--fix', action='store_true', help='Auto-fix inconsistencies')
 
     # validate
-    validate_parser = subparsers.add_parser('validate', help='Validate document structure and consistency')
+    validate_parser = subparsers.add_parser(
+        'validate',
+        help='Validate writing style (LLM agent packet) and cross-doc consistency',
+    )
     validate_sub = validate_parser.add_subparsers(dest='validate_command')
-    validate_struct_parser = validate_sub.add_parser('structure', help='Check page structure against profile')
-    validate_struct_parser.add_argument('page', help='Page slug')
+    validate_style_parser = validate_sub.add_parser(
+        'writing-style',
+        help='Build a writing-style review packet for an LLM agent',
+    )
+    validate_style_parser.add_argument('page', help='Page slug (e.g. cardio-monitor/dvr-tda)')
+    validate_style_parser.add_argument('--json', action='store_true',
+                                       help='Emit JSON instead of human-readable markdown')
+    validate_style_parser.add_argument('--out', type=str, default=None,
+                                       help='Write packet to a file instead of stdout')
     validate_consist_parser = validate_sub.add_parser('consistency', help='Cross-document consistency check')
     validate_consist_parser.add_argument('--client', required=True, help='Client slug')
 
@@ -4741,22 +4868,21 @@ def main() -> None:
                 print(f'\n  Run with --fix to auto-replace.')
 
     elif args.command == 'validate':
-        if args.validate_command == 'structure':
-            result = validate_structure(args.page)
-            if 'error' in result:
-                print(f'Error: {result["error"]}', file=sys.stderr)
+        if args.validate_command == 'writing-style':
+            packet = validate_writing_style(args.page)
+            if 'error' in packet:
+                print(f'Error: {packet["error"]}', file=sys.stderr)
                 sys.exit(1)
-            print(f'=== Structure Validation: {result.get("page", args.page)} ===\n')
-            print(f'  Type: {result.get("type", "unknown")}')
-            missing = result.get('missing_sections', [])
-            present = result.get('present_sections', [])
-            print(f'  Required sections present: {len(present)}')
-            if missing:
-                print(f'  Missing sections: {len(missing)}')
-                for s in missing:
-                    print(f'    - {s}')
+            if args.json:
+                output = json.dumps(packet, indent=2, default=str)
             else:
-                print('  All required sections present.')
+                output = _format_writing_style_packet(packet)
+            if args.out:
+                with open(args.out, 'w', encoding='utf-8') as f:
+                    f.write(output)
+                print(f'Wrote review packet to {args.out}')
+            else:
+                print(output)
         elif args.validate_command == 'consistency':
             result = validate_consistency(args.client)
             total = result.get('total_issues', 0)

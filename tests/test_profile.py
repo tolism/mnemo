@@ -13,7 +13,7 @@ from mneme.core import (
     get_active_profile,
     set_active_profile,
     harmonize,
-    validate_structure,
+    validate_writing_style,
     validate_consistency,
     _apply_workspace_override,
 )
@@ -182,34 +182,93 @@ class TestHarmonize:
         assert 'error' in result
 
 
-class TestValidateStructure:
-    def test_conforming_page(self, temp_workspace):
-        set_active_profile('eu-mdr')
-        # Use 'risk-management' template
-        required = EU_MDR['sections']['risk-management']['required']
-        body = '\n\n'.join(f'## {s.replace("-", " ")}\n\nContent.' for s in required)
-        _make_page(temp_workspace, 'demo', 'risk-management-file', body,
-                   title='Risk Management File')
-        result = validate_structure('demo/risk-management-file')
-        assert 'error' not in result
-        assert result['missing_sections'] == []
-        assert result['template'] == 'risk-management'
+class TestValidateWritingStyle:
+    """
+    validate_writing_style assembles a "review packet" for an LLM agent.
+    Mneme does NOT grade prose itself; it just hands the agent the page +
+    the active profile's writing-style block + section notes for the
+    matched document type.
+    """
 
-    def test_missing_sections(self, temp_workspace):
+    def test_packet_includes_profile_writing_style(self, temp_workspace):
         set_active_profile('eu-mdr')
-        _make_page(temp_workspace, 'demo', 'risk-management-doc',
-                   '## scope\n\nOnly scope here.',
-                   title='Risk Management Doc')
-        result = validate_structure('demo/risk-management-doc')
-        assert 'error' not in result
-        assert result['template'] == 'risk-management'
-        assert len(result['missing_sections']) > 0
-        assert 'scope' not in result['missing_sections']
+        _make_page(temp_workspace, 'demo', 'dvr-tda',
+                   'Some draft body content.',
+                   title='Design Validation Report - TDA',
+                   page_type='design-validation-report')
+        packet = validate_writing_style('demo/dvr-tda')
+        assert 'error' not in packet
+        assert packet['profile_name'] == 'EU MDR'
+        # Writing style block must travel with the packet
+        ws = packet['writing_style']
+        assert 'principles' in ws and ws['principles']
+        assert 'general_rules' in ws and ws['general_rules']
+        assert 'terminology_guidance' in ws
+        assert 'framing_examples' in ws
 
-    def test_nonexistent_page(self, temp_workspace):
+    def test_packet_resolves_section_notes_via_frontmatter_type(self, temp_workspace):
         set_active_profile('eu-mdr')
-        result = validate_structure('demo/does-not-exist')
-        assert 'error' in result
+        _make_page(temp_workspace, 'demo', 'dvr-tda',
+                   'Body.',
+                   title='DVR',
+                   page_type='design-validation-report')
+        packet = validate_writing_style('demo/dvr-tda')
+        assert packet['document_type'] == 'design-validation-report'
+        notes = packet['section_notes']
+        # eu-mdr ships notes for these sections under design-validation-report
+        assert 'context' in notes
+        assert 'dataset-descriptions' in notes
+        # And each note is a non-empty string
+        assert all(isinstance(v, str) and v.strip() for v in notes.values())
+
+    def test_no_section_match_when_frontmatter_type_unknown(self, temp_workspace):
+        set_active_profile('eu-mdr')
+        _make_page(temp_workspace, 'demo', 'random-page',
+                   'Body.',
+                   title='Random',
+                   page_type='source-summary')
+        packet = validate_writing_style('demo/random-page')
+        # source-summary is not a profile section, so no notes apply
+        assert packet['document_type'] is None
+        assert packet['section_notes'] == {}
+        # But the general writing_style block is still present
+        assert packet['writing_style']
+
+    def test_packet_includes_submission_checklist(self, temp_workspace):
+        set_active_profile('eu-mdr')
+        _make_page(temp_workspace, 'demo', 'dvr-tda', 'Body.',
+                   page_type='design-validation-report')
+        packet = validate_writing_style('demo/dvr-tda')
+        assert isinstance(packet['submission_checklist'], list)
+        assert len(packet['submission_checklist']) > 0
+
+    def test_packet_includes_review_prompt(self, temp_workspace):
+        set_active_profile('eu-mdr')
+        _make_page(temp_workspace, 'demo', 'dvr-tda', 'Body.',
+                   page_type='design-validation-report')
+        packet = validate_writing_style('demo/dvr-tda')
+        assert isinstance(packet['review_prompt'], str)
+        assert 'EU MDR' in packet['review_prompt'] or 'profile' in packet['review_prompt']
+
+    def test_packet_includes_full_page_content(self, temp_workspace):
+        set_active_profile('eu-mdr')
+        body_marker = 'UNIQUE_BODY_TOKEN_42'
+        _make_page(temp_workspace, 'demo', 'dvr-tda', body_marker,
+                   page_type='design-validation-report')
+        packet = validate_writing_style('demo/dvr-tda')
+        assert body_marker in packet['page_content']
+
+    def test_no_active_profile_returns_error(self, temp_workspace):
+        # Don't set a profile
+        _make_page(temp_workspace, 'demo', 'dvr-tda', 'Body.',
+                   page_type='design-validation-report')
+        packet = validate_writing_style('demo/dvr-tda')
+        assert 'error' in packet
+
+    def test_nonexistent_page_returns_error(self, temp_workspace):
+        set_active_profile('eu-mdr')
+        packet = validate_writing_style('demo/does-not-exist')
+        assert 'error' in packet
 
 
 class TestValidateConsistency:

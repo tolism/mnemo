@@ -1,7 +1,7 @@
 {
   "name": "ISO 13485",
   "description": "ISO 13485:2016 Quality Management System for Medical Devices",
-  "version": "1.0",
+  "version": "2.0",
   "vocabulary": {
     "preferred": [
       {"term": "medical device", "reject": ["product", "unit", "item"]},
@@ -26,30 +26,106 @@
   },
   "sections": {
     "quality-manual": {
-      "required": ["scope", "exclusions", "quality-policy", "quality-objectives", "qms-processes", "document-control", "record-control"],
-      "description": "Quality manual per clause 4.2.2"
+      "description": "Quality manual per clause 4.2.2",
+      "section_notes": {
+        "scope": "Define the scope of the QMS clearly. State which products, processes, and sites are covered, and explicitly list any exclusions with justification per clause 1.2.",
+        "quality-policy": "State the quality policy as approved by top management. Reference the controlling document by ID and version.",
+        "qms-processes": "Describe the QMS processes, their sequence, and their interactions. Cross-reference the documented procedures by ID."
+      }
     },
     "management-review": {
-      "required": ["review-input", "review-output", "actions", "resource-needs"],
-      "description": "Management review per clause 5.6"
+      "description": "Management review per clause 5.6",
+      "section_notes": {
+        "review-input": "List every input topic required by clause 5.6.2 (audits, feedback, complaints, monitoring data, status of CAPA, follow-up from previous reviews, regulatory changes, recommendations for improvement).",
+        "review-output": "Document decisions and actions per clause 5.6.3, with owners and target dates."
+      }
     },
     "design-control": {
-      "required": ["design-planning", "design-inputs", "design-outputs", "design-review", "design-verification", "design-validation", "design-transfer", "design-changes"],
-      "description": "Design and development per clause 7.3"
+      "description": "Design and development per clause 7.3",
+      "section_notes": {
+        "design-inputs": "Capture user needs, intended use, regulatory requirements, applicable standards, and risk management outputs. Each input must be testable and traceable.",
+        "design-outputs": "Outputs must satisfy inputs, contain or reference acceptance criteria, identify essential characteristics for safe use, and be approved before release.",
+        "design-verification": "Demonstrate that design outputs meet design input requirements. Reference the verification protocol by ID and version.",
+        "design-validation": "Demonstrate that the device meets the user needs and intended use under defined operating conditions. Use production-equivalent units. Reference the validation protocol by ID and version.",
+        "design-changes": "Every change must be reviewed, verified, validated as appropriate, and approved before implementation. Maintain the change log."
+      }
     },
     "risk-management": {
-      "required": ["scope", "hazard-identification", "risk-estimation", "risk-evaluation", "risk-control"],
-      "description": "Risk management per clause 7.1"
+      "description": "Risk management per clause 7.1, aligned with ISO 14971",
+      "section_notes": {
+        "hazard-identification": "Identify hazards across the lifecycle. Include foreseeable misuse. Cross-reference the risk register by ID.",
+        "risk-control": "Apply controls in the order required by ISO 14971: inherently safe design, protective measures, information for safety. Document residual risk for each."
+      }
     },
     "capa": {
-      "required": ["nonconformity-identification", "root-cause-analysis", "corrective-action", "preventive-action", "effectiveness-review"],
-      "description": "CAPA process per clause 8.5.2 and 8.5.3"
+      "description": "CAPA process per clauses 8.5.2 and 8.5.3",
+      "section_notes": {
+        "root-cause-analysis": "Use a structured technique (e.g. 5-Whys, fishbone, fault tree). State the technique used and its outcome - do not jump straight to corrective actions.",
+        "effectiveness-review": "Define how effectiveness will be measured, the timeframe, and the acceptance criteria before closing the CAPA."
+      }
     },
     "supplier-management": {
-      "required": ["supplier-evaluation", "purchasing-requirements", "incoming-inspection", "supplier-monitoring"],
-      "description": "Purchasing and supplier control per clause 7.4"
+      "description": "Purchasing and supplier control per clause 7.4",
+      "section_notes": {
+        "supplier-evaluation": "Document the evaluation criteria, the evaluation result, and the approval decision. Re-evaluate at defined intervals.",
+        "incoming-inspection": "State the acceptance activities for purchased product. Records must show what was inspected and the disposition."
+      }
     }
   },
+  "writing_style": {
+    "principles": [
+      "Auditable: every claim must be traceable to a documented source - a procedure ID, a record, a controlled form, or a regulatory clause. An ISO 13485 auditor should be able to follow any statement in the document back to its evidence.",
+      "Procedural, not narrative: this is a quality system document. It describes what is done, by whom, and against what criteria. It does not tell a story.",
+      "Controlled: every referenced document must be a controlled document with an ID, version, and effective date. Uncontrolled references invalidate the chain."
+    ],
+    "general_rules": [
+      "Use the controlled vocabulary. ISO 13485 uses specific terms ('nonconformity', 'corrective action', 'documented procedure', 'management representative') with specific meanings - do not substitute synonyms.",
+      "Reference everything by ID and version. 'See SOP-007 v3.2' is acceptable; 'see the design control procedure' is not.",
+      "Define before you use. Every abbreviation, role, metric, and form must be defined at first use.",
+      "Distinguish 'shall' (mandatory), 'should' (recommended), and 'may' (permitted). Reserve 'shall' for actual ISO 13485 mandates.",
+      "Avoid editorial language. 'The supplier was thoroughly evaluated' is unauditable; 'The supplier was evaluated against SUP-EVAL-001 v2 with the result documented in record SR-2026-014' is auditable.",
+      "Never leave a section blank. If a clause requires content, the section must contain content or be removed."
+    ],
+    "terminology_guidance": [
+      {
+        "use": "Nonconformity",
+        "instead_of": ["Defect", "Bug", "Issue", "Problem"],
+        "rationale": "ISO 13485 defines 'nonconformity' as the failure to meet a requirement. Use the controlled term."
+      },
+      {
+        "use": "Corrective action",
+        "instead_of": ["Fix", "Resolution", "Remedy"],
+        "rationale": "Corrective action specifically addresses the cause of a detected nonconformity (clause 8.5.2)."
+      },
+      {
+        "use": "Preventive action",
+        "instead_of": ["Prevention", "Proactive fix"],
+        "rationale": "Preventive action addresses potential nonconformities (clause 8.5.3) and is distinct from corrective action."
+      },
+      {
+        "use": "Documented procedure",
+        "instead_of": ["SOP", "Work instruction"],
+        "rationale": "ISO 13485 uses 'documented procedure' as the formal term."
+      }
+    ],
+    "framing_examples": [
+      {
+        "context": "Describing a nonconformity",
+        "wrong": "We had an issue with the bonding step where some parts were defective and we fixed it.",
+        "correct": "Nonconformity NCR-2026-018 was raised against the bonding process on 2026-03-12. Root cause analysis (CAPA-2026-022) identified a deviation from BOND-WI-004 v2.1. Corrective action C-2026-022-01 was approved and implemented; effectiveness will be reviewed at the next batch release per CAPA-2026-022.",
+        "why": "The correct version uses controlled vocabulary, references controlled documents by ID and version, and shows the audit trail. The wrong version is narrative and unauditable."
+      }
+    ],
+    "placeholder_for_missing_refs": "[TO ADD REF]"
+  },
+  "submission_checklist": [
+    "Every claim is supported by a controlled document reference (ID + version)",
+    "All controlled vocabulary terms are used correctly (nonconformity, corrective action, etc.)",
+    "Roles are named and traceable to job descriptions or organisational records",
+    "Every record referenced is identified by record ID",
+    "Sections corresponding to mandatory ISO 13485 clauses are populated, not left blank",
+    "Document is approved by the management representative before release"
+  ],
   "trace_types": [
     "derived-from",
     "implemented-by",

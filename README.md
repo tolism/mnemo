@@ -208,7 +208,7 @@ A profile defines the vocabulary and document structure rules for a regulatory f
 | `eu-mdr` | EU Medical Device Regulation (2017/745) -- 15 vocabulary rules, 6 section templates |
 | `iso-13485` | ISO 13485:2016 QMS -- 13 vocabulary rules, 6 section templates |
 
-Activate one in any workspace with `mneme profile set eu-mdr`. From then on, `mneme harmonize`, `mneme validate structure`, and `mneme validate consistency` enforce its rules.
+Activate one in any workspace with `mneme profile set eu-mdr`. From then on, `mneme harmonize` enforces vocabulary, `mneme validate writing-style` builds an LLM review packet for prose, and `mneme validate consistency` checks cross-document standard versions.
 
 ### Adding your own profile
 
@@ -251,7 +251,7 @@ mneme profile show
 # 4. Use it
 mneme harmonize parkiwatch          # flag "parking ticket" -> should be "parking violation"
 mneme harmonize parkiwatch --fix    # auto-fix vocabulary
-mneme validate structure parkiwatch/incident-001
+mneme validate writing-style parkiwatch/incident-001 > review.md  # paste into Claude
 ```
 
 ### How resolution works
@@ -272,14 +272,24 @@ If neither file exists, you get a clear error listing both paths it checked.
 
 ### What goes into a profile
 
+A profile is a JSON file. It carries **vocabulary rules** (mechanically enforced by `mneme harmonize`) and **writing-style guidance** (free-form prose consumed by an LLM agent via `mneme validate writing-style`).
+
 | Field | What it does | Used by |
 |---|---|---|
 | `name`, `description`, `version` | Display metadata | `mneme profile show` |
-| `vocabulary.preferred[].term` / `.reject[]` | Terminology rules | `mneme harmonize` |
+| `vocabulary.preferred[].term` / `.reject[]` | Terminology swaps | `mneme harmonize` (mechanical) |
 | `vocabulary.requirement_levels` | Reserved words like `shall`, `should`, `may` | Documentation |
-| `sections.<doc-type>.required` | Required section names per document type | `mneme validate structure` |
+| `sections.<doc-type>.description` | Per-document-type description | `mneme profile show` |
+| `sections.<doc-type>.section_notes` | Per-section prose guidance for an LLM agent | `mneme validate writing-style` |
+| `writing_style.principles` | High-level principles (e.g. "reproducibility", "technical not clinical") | `mneme validate writing-style` |
+| `writing_style.general_rules` | Cross-cutting writing rules | `mneme validate writing-style` |
+| `writing_style.terminology_guidance` | Phrase-level use-this/instead-of/why | `mneme validate writing-style` |
+| `writing_style.framing_examples` | Worked correct/incorrect pairs with rationale | `mneme validate writing-style` |
+| `submission_checklist` | Pre-submission go/no-go items | `mneme validate writing-style` + reviewer |
 | `trace_types` | Allowed relationship types for trace links | Documentation |
 | `tone`, `voice`, `citation_style` | Style hints | `mneme profile show` |
+
+**Important:** profiles do NOT enforce a list of required headings. Mechanical heading checks were removed in v0.4.0 because they don't reflect what regulatory reviewers actually care about. Instead, use `mneme validate writing-style <page>` to build a review packet that an LLM agent grades against the full style guide.
 
 See `EXAMPLES.md` Example 13 for a full walkthrough with a real Parkiwatch scenario, and copy a bundled profile (`eu-mdr.json`, `iso-13485.json`) from the installed package as a starting template.
 

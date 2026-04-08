@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed (BREAKING)
+- **Profile schema rewritten as pure style guidance.** The
+  `sections.<doc-type>.required` array (a list of mandatory heading slugs)
+  has been removed. Profiles now carry free-form `section_notes` (per-section
+  prose guidance) plus a top-level `writing_style` block (`principles`,
+  `general_rules`, `terminology_guidance`, `framing_examples`,
+  `placeholder_for_missing_refs`) and a `submission_checklist`. Bundled
+  `eu-mdr` and `iso-13485` profiles were rewritten under the new schema and
+  bumped to v2.0.
+- **Removed:** `mneme validate structure` and the underlying
+  `validate_structure()` function. Mechanical heading-list checks didn't
+  reflect what regulatory reviewers actually care about; the work belongs to
+  an LLM agent reading the full style guide.
+
+### Added
+- **`mneme validate writing-style <page>`** assembles a "review packet" for an
+  LLM agent: page content + active profile's writing-style block + matched
+  section notes + submission checklist + ready-to-paste review prompt.
+  Default output is human-readable markdown; `--json` gives raw structured
+  output; `--out <file>` writes to a file.
+- Document type is resolved from the page's frontmatter `type:` field. If the
+  type matches a profile section, that section's `section_notes` are pulled
+  in; otherwise the general writing_style block applies on its own.
+- 8 new tests in `tests/test_profile.py::TestValidateWritingStyle`.
+
 ## [0.4.0] - 2026-04-07
 
 ### Added

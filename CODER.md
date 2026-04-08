@@ -227,8 +227,8 @@ mneme profile show
 ```
 
 The profile is used by:
-- `mneme harmonize` -- checks vocabulary rules
-- `mneme validate structure` -- checks required sections
+- `mneme harmonize` -- mechanically enforces vocabulary rules
+- `mneme validate writing-style` -- assembles a writing-style review packet for an LLM agent
 - `mneme lint` -- can integrate with profile checks
 
 ---
@@ -305,7 +305,7 @@ Then add `'your_check_name': []` to the `issues` dict at the top of lint(), and 
 | `get_active_profile()` | Get currently active profile |
 | `set_active_profile()` | Set active profile name |
 | `harmonize()` | Check/fix vocabulary against profile |
-| `validate_structure()` | Check page sections against profile |
+| `validate_writing_style()` | Build an LLM review packet from active profile + page |
 | `validate_consistency()` | Cross-document consistency check |
 | `scan_repo()` | Code repo vs wiki coverage analysis |
 

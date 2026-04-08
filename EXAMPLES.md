@@ -320,9 +320,15 @@ mneme harmonize --client cardio-monitor
 mneme harmonize --client cardio-monitor --fix
 #   Pages fixed: 7
 
-# Validate document structure
-mneme validate structure cardio-monitor/risk-management-file
-#   Missing sections: residual-risk-evaluation, risk-management-review
+# Build a writing-style review packet for an LLM agent.
+# Mneme does not grade prose itself - it hands the agent the page, the
+# active profile's writing_style block, and the section_notes for the
+# document type matched from the page's frontmatter `type:` field.
+mneme validate writing-style cardio-monitor/dvr-tda > review.md
+# Then paste review.md into Claude Code (or any LLM) for a critique.
+
+# Or get raw structured output for SDK integration:
+mneme validate writing-style cardio-monitor/dvr-tda --json > review.json
 
 # Cross-document consistency
 mneme validate consistency --client cardio-monitor
@@ -622,7 +628,7 @@ The shadowing rule: when you ask for a profile by name, mneme checks the workspa
 
 ### Scenario
 
-You're building Parkiwatch -- an internal product line for parking enforcement. You don't need EU MDR or ISO 13485, but you do need your own QMS framework with parkiwatch-specific terminology and document structure rules. You want `mneme harmonize` to flag "parking ticket" and rewrite it to "parking violation", and `mneme validate structure` to enforce that every incident report has the right sections.
+You're building Parkiwatch -- an internal product line for parking enforcement. You don't need EU MDR or ISO 13485, but you do need your own QMS framework with parkiwatch-specific terminology and writing-style guidance. You want `mneme harmonize` to flag "parking ticket" and rewrite it to "parking violation", and `mneme validate writing-style` to hand a Claude agent the prose guidance for incident reports so it can critique a draft.
 
 ### Step 1 -- Scaffold a workspace (creates `profiles/` for you)
 
@@ -731,10 +737,11 @@ mneme harmonize parkiwatch
 mneme harmonize parkiwatch --fix
 #   Pages fixed: 3
 
-# Validate structure of a specific incident report
-mneme validate structure parkiwatch/incident-001
-#   OK -- all required sections present (incident-id, location, timestamp,
-#         vehicle-details, evidence, officer-signature)
+# Build a writing-style review packet for an LLM agent
+mneme validate writing-style parkiwatch/incident-001 > /tmp/review.md
+# Then paste /tmp/review.md into Claude or any LLM. The packet contains the
+# page, the active profile's writing-style block, and the section_notes for
+# the document type matched from the page's frontmatter `type:` field.
 
 # Cross-document consistency
 mneme validate consistency --client parkiwatch
