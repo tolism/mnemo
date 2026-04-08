@@ -69,7 +69,7 @@ ACTIVE_PROFILE_FILE = os.path.join(WORKSPACE_DIR, '.mneme-profile')
 # ---------------------------------------------------------------------------
 
 # Excluded from sync
-EXCLUDED_DIRS = ['_templates']
+EXCLUDED_DIRS = ['_templates', '.baselines']
 EXCLUDED_FILES = ['_meta.yaml']
 
 # Chunk settings for memvid

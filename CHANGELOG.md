@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-04-07
 
 ### Added
+- **`mneme resync <source-file> <client> [--dry-run]`** — diff-aware
+  re-ingest. Performs a 3-way merge between the last clean-ingest baseline
+  (ancestor), the current wiki page on disk (ours), and a fresh ingest of
+  the updated source (theirs) using `git merge-file -p` with marker size
+  7. Clean merges are written back, the baseline is advanced, and the
+  schema is re-derived; identical outcomes are a no-op; missing baselines
+  fall through to a standard ingest so resync is safe on never-ingested
+  files. `--dry-run` previews the merged content and shows
+  ancestor/ours/theirs/merged hashes without touching disk. For
+  `ingest-csv`-derived pages, per-row updates are merged row-by-row and
+  new rows become new pages.
+- **`mneme resync-resolve <client/page>`** — follow-up command for
+  conflicted resyncs. After the user edits out the
+  `<<<<<<< current (ours)` / `======= baseline (ancestor)` /
+  `>>>>>>> incoming (theirs)` markers in the wiki page, this command
+  re-derives the schema, advances the baseline, and logs the resolution.
+- **Automatic baseline snapshots** at `wiki/{client}/.baselines/{slug}.md`,
+  written by every clean ingest. These sidecar files are the ancestor
+  input for `mneme resync` and are hidden from `lint`, `drift`, `sync`,
+  `search`, and repo scans via `EXCLUDED_DIRS`.
+- New log operations: `RESYNC`, `RESYNC-CONFLICT`, `RESYNC-RESOLVED`.
 - **Engine / workspace split** — `mneme` is now an installable Python package
   whose data lives in independent workspace directories.
 - **`MNEME_HOME` environment variable** and **`--workspace` / `-w` global flag**
@@ -21,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `python -m mneme` entry point alongside the `mneme` console script.
 
 ### Changed
+- `ingest_source_to_both()` now also writes a baseline sidecar to
+  `wiki/{client}/.baselines/{slug}.md` on every successful ingest, so
+  future `mneme resync` calls have an ancestor to merge against.
 - Repository restructured into a real Python package (`mneme/` with
   `__init__.py`, `__main__.py`, `core.py`, `config.py`, `server.py`,
   `ui.html`, `profiles/`, `templates/`).

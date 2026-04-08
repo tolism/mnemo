@@ -5,15 +5,28 @@ __pycache__/
 *.pyc
 .DS_Store
 .pytest_cache/
-wiki/test-*/
-memvid/per-client/
-sources/conversations/
-sources/pdfs/
-sources/emails/
-memvid/.*.mv2.*
-snapshots/
-exports/
-inbox/
+
+# The repo root is also a default mneme workspace (cwd-based MNEME_HOME).
+# Anything mneme writes when invoked from here is local state, not source.
+/wiki/
+/sources/
+/schema/
+/memvid/
+/inbox/
+/exports/
+/snapshots/
+/index.md
+/log.md
+/.mneme-profile
+/.mneme-version
+
+# Build / packaging artifacts
+/dist/
+/build/
+*.egg-info/
 mneme.egg-info/
+mneme_cli.egg-info/
+
+# Virtualenvs
 .venv/
-.mneme-profile
+venv/

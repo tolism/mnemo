@@ -18,6 +18,8 @@
 | `mneme init` | Scaffold a workspace in cwd (legacy) |
 | `mneme --workspace <dir>` / `MNEME_HOME=<dir>` | Run any command against a specific workspace |
 | `mneme ingest` | Atomic ingest: source -> wiki + Memvid + schema |
+| `mneme resync` | Diff-aware re-ingest: 3-way merge (baseline / wiki / fresh ingest) via `git merge-file` |
+| `mneme resync-resolve` | Mark a conflicted resync page as resolved after editing out markers |
 | `mneme ingest-dir` | Batch ingest all files from a directory |
 | `mneme search` | Dual-layer search with `--client` scoping |
 | `mneme lint` | Health check: orphan pages, dead links, stale pages, citations, schema drift, coverage |

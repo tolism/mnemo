@@ -477,6 +477,57 @@ def _cleanup_test_client():
         except (json.JSONDecodeError, OSError):
             pass
 
+    # tags.json - drop tag pages referencing the test client
+    tags_file = os.path.join(_KE_BASE, 'schema', 'tags.json')
+    if os.path.exists(tags_file):
+        try:
+            with open(tags_file) as f:
+                data = json.load(f)
+            tags = data.get('tags', {})
+            cleaned = {}
+            for tag, info in tags.items():
+                pages = [p for p in info.get('pages', [])
+                         if _TEST_CLIENT not in p]
+                if pages:
+                    info['pages'] = pages
+                    info['count'] = len(pages)
+                    cleaned[tag] = info
+            data['tags'] = cleaned
+            with open(tags_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # index.md - strip the test client section and any wikilink entries
+    index_file = os.path.join(_KE_BASE, 'index.md')
+    if os.path.exists(index_file):
+        try:
+            with open(index_file, 'r') as f:
+                lines = f.readlines()
+            cleaned_lines = []
+            skip_section = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped == f'## {_TEST_CLIENT}':
+                    skip_section = True
+                    continue
+                if skip_section:
+                    if stripped.startswith('## ') or stripped.startswith('---'):
+                        skip_section = False
+                    else:
+                        if not stripped:
+                            continue
+                        if stripped.startswith('|') and _TEST_CLIENT in stripped:
+                            continue
+                # Drop any stray wikilink lines outside the section too
+                if f'[[{_TEST_CLIENT}/' in line:
+                    continue
+                cleaned_lines.append(line)
+            with open(index_file, 'w') as f:
+                f.writelines(cleaned_lines)
+        except OSError:
+            pass
+
     # Remove any log entries for the test source file so duplicate detection
     # doesn't block re-ingestion across test runs
     log_file = os.path.join(_KE_BASE, 'log.md')
@@ -496,6 +547,60 @@ def _cleanup_test_client():
                     cleaned_lines.append(line)
             with open(log_file, 'w') as f:
                 f.writelines(cleaned_lines)
+        except OSError:
+            pass
+
+    # Finally, if we left behind empty workspace files (created by ingest
+    # because the project root is the default workspace), remove them so the
+    # repo stays clean. Only remove if the file is empty/header-only after
+    # cleanup, never if real content remains.
+    for fname in ('index.md', 'log.md'):
+        fp = os.path.join(_KE_BASE, fname)
+        if not os.path.exists(fp):
+            continue
+        try:
+            with open(fp, 'r') as f:
+                content = f.read().strip()
+            # Header-only files are safe to remove
+            header_only_signatures = (
+                '# Mnemosyne Index',
+                '# Mnemosyne Log',
+                '# Index',
+                '# Log',
+            )
+            stripped_lines = [l for l in content.split('\n') if l.strip()]
+            if (len(stripped_lines) <= 2
+                    and (not stripped_lines or stripped_lines[0] in header_only_signatures
+                         or stripped_lines[0].startswith('Last updated'))):
+                os.remove(fp)
+        except OSError:
+            pass
+
+    # Empty schema files: remove the schema dir if it has no real content left
+    schema_dir = os.path.join(_KE_BASE, 'schema')
+    if os.path.isdir(schema_dir):
+        try:
+            entities_empty = True
+            tags_empty = True
+            ef = os.path.join(schema_dir, 'entities.json')
+            tf = os.path.join(schema_dir, 'tags.json')
+            if os.path.exists(ef):
+                with open(ef) as f:
+                    entities_empty = not json.load(f).get('entities')
+            if os.path.exists(tf):
+                with open(tf) as f:
+                    tags_empty = not json.load(f).get('tags')
+            if entities_empty and tags_empty:
+                shutil.rmtree(schema_dir, ignore_errors=True)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Empty wiki dir
+    wd = os.path.join(_KE_BASE, 'wiki')
+    if os.path.isdir(wd):
+        try:
+            if not os.listdir(wd):
+                os.rmdir(wd)
         except OSError:
             pass
 
@@ -554,7 +659,7 @@ class TestIngestIntegration:
         """Second ingest of same file should print a warning and exit 0."""
         # Ensure the file was previously ingested
         wiki_page = os.path.join(
-            _KE_BASE, 'wiki', _TEST_CLIENT, 'ke-pytest-source.md'
+            _KE_BASE, 'wiki', _TEST_CLIENT, f'{_TEST_SOURCE_SLUG}.md'
         )
         if not os.path.exists(wiki_page):
             _run_mnemo('ingest', _TEST_FILE, _TEST_CLIENT)
@@ -576,7 +681,7 @@ class TestIngestIntegration:
         assert os.path.exists(log_file)
         with open(log_file, 'r') as f:
             log_content = f.read()
-        assert 'ke-pytest-source.md' in log_content
+        assert f'{_TEST_SOURCE_SLUG}.md' in log_content
 
     def test_ingest_updates_index(self):
         """index.md should exist after ingest (core maintains it)."""
@@ -592,3 +697,342 @@ class TestIngestIntegration:
         assert len(index_content) > 0
         # Known pre-existing clients remain present - proves index is intact
         assert 'Mnemosyne' in index_content
+
+
+# ---------------------------------------------------------------------------
+# Category 8: Resync (3-way merge)
+# ---------------------------------------------------------------------------
+
+import tempfile
+import pytest
+
+from mneme.core import (
+    _baseline_path,
+    _write_baseline,
+    _read_baseline,
+    _git_merge_file,
+)
+
+_GIT_AVAILABLE = shutil.which('git') is not None
+_skip_no_git = pytest.mark.skipif(not _GIT_AVAILABLE, reason='git required')
+
+
+class TestResyncUnits:
+    def test_baseline_path_computation(self):
+        p = os.path.join('wiki', 'acme', 'overview.md')
+        bp = _baseline_path(p)
+        assert bp == os.path.join('wiki', 'acme', '.baselines', 'overview.md')
+
+    def test_write_read_baseline_roundtrip(self):
+        with tempfile.TemporaryDirectory() as td:
+            wiki_page = os.path.join(td, 'wiki', 'c1', 'page.md')
+            os.makedirs(os.path.dirname(wiki_page), exist_ok=True)
+            _write_baseline(wiki_page, 'hello baseline\n')
+            assert os.path.isdir(os.path.join(td, 'wiki', 'c1', '.baselines'))
+            assert _read_baseline(wiki_page) == 'hello baseline\n'
+
+    def test_read_baseline_missing_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            wiki_page = os.path.join(td, 'wiki', 'c1', 'nope.md')
+            assert _read_baseline(wiki_page) is None
+
+    @_skip_no_git
+    def test_merge_clean_ours_unchanged(self):
+        ancestor = "line1\nline2\nline3\n"
+        ours = ancestor
+        theirs = "line1\nlineTWO\nline3\n"
+        merged, conflicts = _git_merge_file(ours, ancestor, theirs)
+        assert conflicts is False
+        assert merged == theirs
+
+    @_skip_no_git
+    def test_merge_clean_non_overlapping_edits(self):
+        ancestor = "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\n"
+        ours = "A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nOURS-ADDED\n"
+        theirs = "THEIRS-ADDED\nA\nB\nC\nD\nE\nF\nG\nH\nI\nJ\n"
+        merged, conflicts = _git_merge_file(ours, ancestor, theirs)
+        assert conflicts is False
+        assert 'OURS-ADDED' in merged
+        assert 'THEIRS-ADDED' in merged
+
+    @_skip_no_git
+    def test_merge_conflict_same_line(self):
+        ancestor = "line1\nORIGINAL\nline3\n"
+        ours = "line1\nOURS-EDIT\nline3\n"
+        theirs = "line1\nTHEIRS-EDIT\nline3\n"
+        merged, conflicts = _git_merge_file(ours, ancestor, theirs)
+        assert conflicts is True
+        assert '<<<<<<<' in merged
+        assert '>>>>>>>' in merged
+
+    def test_git_merge_file_missing_git(self, monkeypatch):
+        monkeypatch.setenv('PATH', '')
+        # On Windows FileNotFoundError is raised when git can't be found.
+        with pytest.raises((FileNotFoundError, RuntimeError)):
+            _git_merge_file('a', 'a', 'a')
+
+
+# ---------------------------------------------------------------------------
+# Category 9: Resync integration (temp workspace)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def temp_workspace(monkeypatch):
+    """Build a clean temp workspace and rebind mneme path constants at it."""
+    td = tempfile.mkdtemp(prefix='mneme-resync-test-')
+    # Minimum skeleton
+    for sub in ('wiki', 'sources', 'schema', 'memvid', os.path.join('memvid', 'per-client')):
+        os.makedirs(os.path.join(td, sub), exist_ok=True)
+    with open(os.path.join(td, 'index.md'), 'w') as f:
+        f.write('# Index\n')
+    with open(os.path.join(td, 'log.md'), 'w') as f:
+        f.write('# Log\n')
+    with open(os.path.join(td, 'schema', 'entities.json'), 'w') as f:
+        json.dump({'version': 1, 'updated': '2026-01-01', 'entities': []}, f)
+    with open(os.path.join(td, 'schema', 'tags.json'), 'w') as f:
+        json.dump({'version': 1, 'updated': '2026-01-01', 'tags': {}}, f)
+    with open(os.path.join(td, 'schema', 'graph.json'), 'w') as f:
+        json.dump({'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []}, f)
+
+    # Save prior MNEME_HOME and swap in the temp workspace via the official helper
+    from mneme.core import _apply_workspace_override
+    prior = os.environ.get('MNEME_HOME')
+    _apply_workspace_override(td)
+    try:
+        yield td
+    finally:
+        if prior is not None:
+            _apply_workspace_override(prior)
+        else:
+            os.environ.pop('MNEME_HOME', None)
+            _apply_workspace_override(os.getcwd())
+        shutil.rmtree(td, ignore_errors=True)
+
+
+@_skip_no_git
+class TestResyncIntegration:
+    def _write_source(self, workspace, client, name, body):
+        src_dir = os.path.join(workspace, 'sources', client)
+        os.makedirs(src_dir, exist_ok=True)
+        path = os.path.join(src_dir, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(body)
+        return path
+
+    def test_baseline_created_by_ingest(self, temp_workspace):
+        from mneme.core import ingest_source_to_both, _baseline_path
+        client = 'c-baseline'
+        src = self._write_source(
+            temp_workspace, client, 'doc.md',
+            '# Doc\n\nSome content that is long enough to ingest.\n'
+        )
+        result = ingest_source_to_both(src, client, force=True)
+        wiki_page = os.path.join(temp_workspace, result['wiki_page'])
+        assert os.path.exists(wiki_page)
+        bp = _baseline_path(wiki_page)
+        assert os.path.exists(bp)
+        with open(wiki_page) as f:
+            wp = f.read()
+        with open(bp) as f:
+            bc = f.read()
+        assert wp == bc
+
+    def test_fresh_resync_no_baseline(self, temp_workspace):
+        from mneme.core import resync_source, _baseline_path
+        client = 'c-fresh'
+        src = self._write_source(
+            temp_workspace, client, 'brand-new.md',
+            '# Brand New\n\nFresh content body for ingest.\n'
+        )
+        result = resync_source(src, client)
+        assert result['action'].startswith('fresh-')
+        wiki_page = os.path.join(temp_workspace, 'wiki', client, 'brand-new.md')
+        assert os.path.exists(wiki_page)
+        assert os.path.exists(_baseline_path(wiki_page))
+
+    def test_clean_merge_preserves_human_edits(self, temp_workspace):
+        from mneme.core import ingest_source_to_both, resync_source, _read_baseline
+        client = 'c-clean'
+        src = self._write_source(
+            temp_workspace, client, 'doc.md',
+            '# Doc\n\n- item one\n- item two\n'
+        )
+        r = ingest_source_to_both(src, client, force=True)
+        wiki_page = os.path.join(temp_workspace, r['wiki_page'])
+        with open(wiki_page, 'r', encoding='utf-8') as f:
+            original = f.read()
+        human_edited = original + '\n## Open Questions\n\n- Human added question\n'
+        with open(wiki_page, 'w', encoding='utf-8') as f:
+            f.write(human_edited)
+
+        # New source with a new item
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('# Doc\n\n- item one\n- item two\n- item three NEW\n')
+
+        result = resync_source(src, client)
+        assert result['conflicts'] is False
+        assert result['action'] == 'merge-clean'
+        with open(wiki_page, 'r', encoding='utf-8') as f:
+            merged = f.read()
+        assert 'Human added question' in merged
+        assert 'item three NEW' in merged
+        # Baseline updated to theirs (should NOT contain the human section)
+        baseline = _read_baseline(wiki_page)
+        assert 'Human added question' not in baseline
+        assert 'item three NEW' in baseline
+
+    def test_conflict_path(self, temp_workspace):
+        from mneme.core import ingest_source_to_both, resync_source
+        client = 'c-conflict'
+        src = self._write_source(
+            temp_workspace, client, 'doc.md',
+            '# Doc\n\nRevenue: $1M\n\nNotes here filler content.\n'
+        )
+        r = ingest_source_to_both(src, client, force=True)
+        wiki_page = os.path.join(temp_workspace, r['wiki_page'])
+        with open(wiki_page, 'r', encoding='utf-8') as f:
+            content = f.read()
+        content = content.replace('Revenue: $1M', 'Revenue: $2M HUMAN')
+        with open(wiki_page, 'w', encoding='utf-8') as f:
+            f.write(content)
+        # New source edits same line differently
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('# Doc\n\nRevenue: $5M INCOMING\n\nNotes here filler content.\n')
+
+        result = resync_source(src, client)
+        assert result['conflicts'] is True
+        assert result['action'] == 'merge-conflict'
+        with open(wiki_page, 'r', encoding='utf-8') as f:
+            merged = f.read()
+        assert '<<<<<<<' in merged
+        # Log entry
+        with open(os.path.join(temp_workspace, 'log.md')) as f:
+            log_content = f.read()
+        assert 'RESYNC-CONFLICT' in log_content
+
+    def test_noop_fast_path(self, temp_workspace):
+        from mneme.core import ingest_source_to_both, resync_source
+        client = 'c-noop'
+        src = self._write_source(
+            temp_workspace, client, 'doc.md',
+            '# Doc\n\nStable body content that will not change.\n'
+        )
+        ingest_source_to_both(src, client, force=True)
+        result = resync_source(src, client)
+        assert result['action'] == 'noop'
+        assert result['conflicts'] is False
+
+    def test_dry_run_no_writes(self, temp_workspace):
+        from mneme.core import ingest_source_to_both, resync_source
+        client = 'c-dry'
+        src = self._write_source(
+            temp_workspace, client, 'doc.md',
+            '# Doc\n\n- item one\n- item two\n'
+        )
+        r = ingest_source_to_both(src, client, force=True)
+        wiki_page = os.path.join(temp_workspace, r['wiki_page'])
+        with open(wiki_page, 'r', encoding='utf-8') as f:
+            before = f.read()
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('# Doc\n\n- item one\n- item two\n- item three\n')
+        result = resync_source(src, client, dry_run=True)
+        assert result['action'] in ('would-merge-clean', 'would-merge-conflict')
+        assert 'merged_hash' in result
+        with open(wiki_page, 'r', encoding='utf-8') as f:
+            after = f.read()
+        assert before == after
+
+
+@_skip_no_git
+class TestResyncResolve:
+    def _seed_conflict(self, workspace, client='c-res'):
+        from mneme.core import ingest_source_to_both, resync_source
+        src_dir = os.path.join(workspace, 'sources', client)
+        os.makedirs(src_dir, exist_ok=True)
+        src = os.path.join(src_dir, 'doc.md')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('# Doc\n\nRevenue: $1M\n\nLong enough filler content here to ingest.\n')
+        r = ingest_source_to_both(src, client, force=True)
+        wiki_page = os.path.join(workspace, r['wiki_page'])
+        with open(wiki_page, 'r', encoding='utf-8') as f:
+            c = f.read().replace('Revenue: $1M', 'Revenue: $2M HUMAN')
+        with open(wiki_page, 'w', encoding='utf-8') as f:
+            f.write(c)
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('# Doc\n\nRevenue: $5M INCOMING\n\nLong enough filler content here to ingest.\n')
+        resync_source(src, client)
+        return wiki_page, client
+
+    def test_resolve_rejects_unresolved_markers(self, temp_workspace):
+        from mneme.core import resync_resolve
+        wiki_page, client = self._seed_conflict(temp_workspace)
+        with pytest.raises(ValueError):
+            resync_resolve(f'{client}/doc')
+
+    def test_resolve_happy_path(self, temp_workspace):
+        from mneme.core import resync_resolve, _read_baseline
+        wiki_page, client = self._seed_conflict(temp_workspace)
+        # User cleans the file
+        cleaned = (
+            '---\ntitle: Doc\ntype: source-summary\nclient: ' + client + '\n---\n\n'
+            '## Summary\n\nResolved content here that is long enough.\n\n'
+            'Revenue: $5M RESOLVED\n'
+        )
+        with open(wiki_page, 'w', encoding='utf-8') as f:
+            f.write(cleaned)
+        result = resync_resolve(f'{client}/doc')
+        assert result['action'] == 'resolved'
+        assert _read_baseline(wiki_page) == cleaned
+        with open(os.path.join(temp_workspace, 'log.md')) as f:
+            assert 'RESYNC-RESOLVED' in f.read()
+
+
+# ---------------------------------------------------------------------------
+# Category 10: Resync CLI smoke test
+# ---------------------------------------------------------------------------
+
+class TestResyncCLI:
+    def test_resync_help(self):
+        rc, out, err = _run_mnemo('resync', '--help')
+        assert rc == 0
+
+    @_skip_no_git
+    def test_resync_end_to_end(self):
+        td = tempfile.mkdtemp(prefix='mneme-resync-cli-')
+        try:
+            for sub in ('wiki', 'sources', 'schema', 'memvid',
+                        os.path.join('memvid', 'per-client')):
+                os.makedirs(os.path.join(td, sub), exist_ok=True)
+            with open(os.path.join(td, 'index.md'), 'w') as f:
+                f.write('# Index\n')
+            with open(os.path.join(td, 'log.md'), 'w') as f:
+                f.write('# Log\n')
+            for name, empty in (('entities.json', {'version': 1, 'updated': '2026-01-01', 'entities': []}),
+                                ('tags.json', {'version': 1, 'updated': '2026-01-01', 'tags': {}}),
+                                ('graph.json', {'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []})):
+                with open(os.path.join(td, 'schema', name), 'w') as f:
+                    json.dump(empty, f)
+
+            client = 'cli-client'
+            src_dir = os.path.join(td, 'sources', client)
+            os.makedirs(src_dir, exist_ok=True)
+            src = os.path.join(src_dir, 'doc.md')
+            with open(src, 'w', encoding='utf-8') as f:
+                f.write('# Doc\n\n- alpha\n- beta\n\nLong enough filler body content.\n')
+
+            # First ingest
+            rc, out, err = _run_mnemo('--workspace', td, 'ingest', src, client, '--force')
+            # Accept any rc; we just need a wiki page + baseline created
+            wiki_page = os.path.join(td, 'wiki', client, 'doc.md')
+            assert os.path.exists(wiki_page), f'wiki page missing. stderr={err}'
+
+            # Mutate source and resync
+            with open(src, 'w', encoding='utf-8') as f:
+                f.write('# Doc\n\n- alpha\n- beta\n- gamma\n\nLong enough filler body content.\n')
+            rc, out, err = _run_mnemo('--workspace', td, 'resync', src, client)
+            assert rc == 0, f'resync failed: {err}'
+            combined = out + err
+            assert ('merge-clean' in combined or 'Action' in combined
+                    or 'action' in combined.lower() or 'fresh' in combined.lower())
+        finally:
+            shutil.rmtree(td, ignore_errors=True)

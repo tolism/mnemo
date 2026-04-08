@@ -19,7 +19,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Healthcare Industry",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -45,11 +44,11 @@ release = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tolism/mneme-cli"
-Repository = "https://github.com/tolism/mneme-cli"
-Issues = "https://github.com/tolism/mneme-cli/issues"
-Documentation = "https://github.com/tolism/mneme-cli#readme"
-Changelog = "https://github.com/tolism/mneme-cli/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/tolism/mneme"
+Repository = "https://github.com/tolism/mneme"
+Issues = "https://github.com/tolism/mneme/issues"
+Documentation = "https://github.com/tolism/mneme#readme"
+Changelog = "https://github.com/tolism/mneme/blob/main/CHANGELOG.md"
 
 [project.scripts]
 mneme = "mneme.core:main"

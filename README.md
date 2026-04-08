@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/tolism/mneme-cli/main/assets/logo.png" alt="Mnemosyne" width="400">
+  <img src="https://raw.githubusercontent.com/tolism/mneme/main/assets/logo.png" alt="Mnemosyne" width="400">
 </p>
 
 <h1 align="center"></h1>
@@ -62,8 +62,8 @@ pip install mneme-cli
 Or from source:
 
 ```bash
-git clone https://github.com/tolism/mneme-cli.git
-cd mneme-cli
+git clone https://github.com/tolism/mneme.git
+cd mneme
 pip install -e .
 ```
 
@@ -117,6 +117,8 @@ One installed CLI serves many projects — each workspace is just a directory.
 | `mneme init` | Scaffold a workspace in cwd (legacy) |
 | `mneme --workspace <dir>` | Run any command against a specific workspace |
 | `mneme ingest <file> <client>` | Ingest a source document |
+| `mneme resync <file> <client>` | Re-ingest an updated source via 3-way merge, preserving hand edits |
+| `mneme resync-resolve <client/page>` | Finalize a conflicted resync after editing out markers |
 | `mneme search "<query>"` | Search across all layers |
 | `mneme sync` | Sync wiki to Memvid memory |
 | `mneme drift` | Detect layer desynchronization |

@@ -509,7 +509,7 @@ def dual_search(query: str, k: int = 10, client: str = None) -> list[dict]:
 
     # --- Layer 2: Memvid semantic search ---
     if not MEMVID_AVAILABLE:
-        return wiki_results + []
+        return results
 
     try:
         safe_query = _sanitize_memvid_query(query)
@@ -622,7 +622,11 @@ def _search_wiki_text(query: str, k: int = 10) -> list[dict]:
                 # Match was in frontmatter; show the raw content up to 300 chars
                 snippet = content.strip()[:300]
 
-        rel_page_path = os.path.relpath(page, BASE_DIR)
+        # Normalize to forward slashes so callers (dual_search client filter,
+        # downstream consumers) can compare against `client/page` style paths
+        # on any platform. Without this, dual_search's client filter rejects
+        # every result on Windows because the path is `wiki\client\page.md`.
+        rel_page_path = os.path.relpath(page, BASE_DIR).replace(os.sep, '/')
         scored.append((score, {
             'text': snippet,
             'title': title,
@@ -846,6 +850,10 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
     with open(wiki_page_path, 'w', encoding='utf-8') as f:
         f.write(new_page)
 
+    # Snapshot the just-written wiki page as the baseline for future resyncs.
+    # This is the "ancestor" for a 3-way merge in resync_source().
+    _write_baseline(wiki_page_path, new_page)
+
     rel_wiki_path = os.path.relpath(wiki_page_path, BASE_DIR)
 
     # Write INGEST_STARTED log immediately after wiki page write.
@@ -895,6 +903,338 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
         'entities_updated': entities_updated,
         'client': client_slug,
         'source': source_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Resync (3-way merge of an updated source against the wiki + baseline)
+# ---------------------------------------------------------------------------
+
+def _baseline_dir_for(client_wiki_dir: str) -> str:
+    """Return the .baselines/ directory for a client wiki directory."""
+    return os.path.join(client_wiki_dir, '.baselines')
+
+
+def _baseline_path(wiki_page_path: str) -> str:
+    """
+    Return the baseline sidecar path for a wiki page.
+
+    wiki/{client}/page.md  ->  wiki/{client}/.baselines/page.md
+    """
+    parent = os.path.dirname(wiki_page_path)
+    fname = os.path.basename(wiki_page_path)
+    return os.path.join(_baseline_dir_for(parent), fname)
+
+
+def _write_baseline(wiki_page_path: str, content: str) -> None:
+    """Save the baseline (ancestor) snapshot of a wiki page after a clean ingest."""
+    baseline_path = _baseline_path(wiki_page_path)
+    os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
+    with open(baseline_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+
+def _read_baseline(wiki_page_path: str) -> Optional[str]:
+    """Read the baseline content for a wiki page, or None if no baseline exists."""
+    baseline_path = _baseline_path(wiki_page_path)
+    if not os.path.exists(baseline_path):
+        return None
+    with open(baseline_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def _git_merge_file(ours: str, ancestor: str, theirs: str) -> tuple[str, bool]:
+    """
+    Run a 3-way merge using `git merge-file -p`.
+
+    `git merge-file` is part of git core; it operates on three files passed
+    by path and writes the merged result to stdout. It does not require the
+    files to be inside a git repo.
+
+    Args:
+        ours:     content of the current wiki page (possibly hand-edited)
+        ancestor: content of the wiki page right after the last clean ingest
+        theirs:   content of the wiki page that a fresh ingest of the new
+                  source would produce
+
+    Returns:
+        (merged_text, had_conflicts)
+        - merged_text contains <<<<<<< / ======= / >>>>>>> markers if conflicts
+        - had_conflicts is True iff git merge-file exited with status 1
+
+    Raises:
+        FileNotFoundError if `git` is not on PATH.
+        RuntimeError      if git merge-file exits with an unexpected error.
+    """
+    import subprocess
+    import tempfile
+
+    fds = []
+    try:
+        ours_fd, ours_path = tempfile.mkstemp(suffix='.ours.md', text=True)
+        ancestor_fd, ancestor_path = tempfile.mkstemp(suffix='.base.md', text=True)
+        theirs_fd, theirs_path = tempfile.mkstemp(suffix='.theirs.md', text=True)
+        fds = [(ours_fd, ours_path), (ancestor_fd, ancestor_path), (theirs_fd, theirs_path)]
+
+        for fd, _ in fds:
+            os.close(fd)
+        with open(ours_path, 'w', encoding='utf-8', newline='') as f:
+            f.write(ours)
+        with open(ancestor_path, 'w', encoding='utf-8', newline='') as f:
+            f.write(ancestor)
+        with open(theirs_path, 'w', encoding='utf-8', newline='') as f:
+            f.write(theirs)
+
+        result = subprocess.run(
+            ['git', 'merge-file', '-p',
+             '--marker-size=7',
+             '-L', 'current (ours)',
+             '-L', 'baseline (ancestor)',
+             '-L', 'incoming (theirs)',
+             ours_path, ancestor_path, theirs_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return result.stdout, False
+        if result.returncode == 1:
+            return result.stdout, True
+        raise RuntimeError(
+            f'git merge-file failed (exit {result.returncode}): {result.stderr.strip()}'
+        )
+    finally:
+        for _, path in fds:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _build_wiki_page_from_source(source_path: str, client_slug: str, today: str) -> tuple[str, str, str]:
+    """
+    Read a source file and produce the wiki page string a fresh ingest would
+    create. Used by resync_source() to compute "theirs" without touching disk.
+
+    Returns (page_slug, raw_content, wiki_page_text).
+    """
+    _, ext = os.path.splitext(source_path)
+    ext = ext.lower()
+    if ext in ('.md', '.txt'):
+        with open(source_path, 'r', encoding='utf-8') as f:
+            raw_content = f.read()
+    elif ext == '.pdf':
+        try:
+            import fitz
+            doc = fitz.open(source_path)
+            raw_content = '\n\n'.join(page.get_text() for page in doc)
+            doc.close()
+        except ImportError:
+            raise ValueError('PDF extraction requires pymupdf. Install: pip install pymupdf')
+    else:
+        with open(source_path, 'r', encoding='utf-8', errors='replace') as f:
+            raw_content = f.read()
+
+    source_filename = os.path.basename(source_path)
+    page_slug = re.sub(r'[^\w\-]', '-', os.path.splitext(source_filename)[0]).lower()
+    page_slug = re.sub(r'-+', '-', page_slug).strip('-')
+
+    rel_source = os.path.relpath(source_path, BASE_DIR)
+    wiki_page_text = _build_wiki_page(
+        title=_title_from_slug(page_slug),
+        client=client_slug,
+        sources=[rel_source],
+        tags=[client_slug],
+        created=today,
+        updated=today,
+        confidence='medium',
+        body=_build_default_body(raw_content),
+    )
+    return page_slug, raw_content, wiki_page_text
+
+
+def resync_source(source_path: str, client_slug: str, dry_run: bool = False) -> dict:
+    """
+    Diff-aware re-ingest. Treats the supplied file as an updated version of a
+    previously ingested source and merges it into the existing wiki page using
+    `git merge-file` (3-way merge: ours = current page, ancestor = baseline,
+    theirs = what a fresh ingest of the new file would produce).
+
+    If no baseline exists for the page, falls through to a fresh ingest.
+
+    Returns a dict describing what happened, including a 'conflicts' flag.
+    """
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f'Source not found: {source_path}')
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
+    page_slug, raw_content, theirs_text = _build_wiki_page_from_source(
+        source_path, client_slug, today
+    )
+    wiki_page_path = os.path.join(client_wiki_dir, f'{page_slug}.md')
+
+    # No prior page or baseline -> fall through to a regular ingest.
+    baseline = _read_baseline(wiki_page_path) if os.path.exists(wiki_page_path) else None
+    if baseline is None:
+        if dry_run:
+            return {
+                'action': 'would-ingest-fresh',
+                'wiki_page': os.path.relpath(wiki_page_path, BASE_DIR),
+                'reason': 'no baseline found - resync would perform a fresh ingest',
+                'conflicts': False,
+            }
+        result = ingest_source_to_both(source_path, client_slug, force=True)
+        result['action'] = f'fresh-{result.get("action", "created")}'
+        result['conflicts'] = False
+        return result
+
+    with open(wiki_page_path, 'r', encoding='utf-8') as f:
+        ours_text = f.read()
+
+    # Fast paths
+    if ours_text == theirs_text:
+        return {
+            'action': 'noop',
+            'wiki_page': os.path.relpath(wiki_page_path, BASE_DIR),
+            'reason': 'incoming source produces an identical wiki page',
+            'conflicts': False,
+        }
+
+    try:
+        merged_text, had_conflicts = _git_merge_file(ours_text, baseline, theirs_text)
+    except FileNotFoundError:
+        raise RuntimeError(
+            'git is not on PATH. `mneme resync` requires git for 3-way merge. '
+            'Install git or use `mneme ingest --force` to overwrite the page.'
+        )
+
+    rel_wiki_path = os.path.relpath(wiki_page_path, BASE_DIR)
+    rel_source = os.path.relpath(source_path, BASE_DIR)
+
+    if dry_run:
+        return {
+            'action': 'would-merge-conflict' if had_conflicts else 'would-merge-clean',
+            'wiki_page': rel_wiki_path,
+            'baseline_hash': _content_hash(baseline),
+            'ours_hash': _content_hash(ours_text),
+            'theirs_hash': _content_hash(theirs_text),
+            'merged_hash': _content_hash(merged_text),
+            'conflicts': had_conflicts,
+            'preview': merged_text[:1200],
+        }
+
+    # Persist merged content
+    with open(wiki_page_path, 'w', encoding='utf-8') as f:
+        f.write(merged_text)
+
+    # Update baseline to "theirs" so the next resync diffs against the new
+    # source, not the original. Conflict regions are part of the merged file
+    # but the baseline always reflects the latest clean source ingestion.
+    _write_baseline(wiki_page_path, theirs_text)
+
+    # Re-derive schema from the merged content (only if no conflicts; with
+    # conflicts the file contains markers and entity extraction would be noisy)
+    frames_added = 0
+    entities_updated = 0
+    if not had_conflicts:
+        frames_added = sync_page_to_memvid(wiki_page_path, client_slug=client_slug)
+        entities_updated = _update_entities_schema(client_slug, wiki_page_path, merged_text, today)
+        with open(wiki_page_path, 'r', encoding='utf-8') as _f:
+            _page_fm, _ = parse_frontmatter(_f.read())
+        _update_tags_schema(wiki_page_path, _page_fm)
+
+    _update_index(client_slug, page_slug, rel_wiki_path, today)
+
+    op = 'RESYNC-CONFLICT' if had_conflicts else 'RESYNC'
+    _append_log(
+        operation=op,
+        description=f'{os.path.basename(source_path)} -> {client_slug}/{page_slug}.md',
+        details=[
+            f'Source: {rel_source}',
+            f'Wiki page: merged at {rel_wiki_path}',
+            f'Conflicts: {"yes" if had_conflicts else "no"}',
+            f'Memvid frames added: {frames_added}',
+            f'Entities updated: {entities_updated}',
+        ],
+        date=today,
+    )
+
+    return {
+        'action': 'merge-conflict' if had_conflicts else 'merge-clean',
+        'wiki_page': rel_wiki_path,
+        'conflicts': had_conflicts,
+        'frames_added': frames_added,
+        'entities_updated': entities_updated,
+        'client': client_slug,
+        'source': source_path,
+    }
+
+
+def resync_resolve(page_ref: str) -> dict:
+    """
+    Mark a previously-conflicted resync as resolved.
+
+    The user has hand-edited the conflict markers out of the wiki page.
+    This function:
+      1. Verifies no merge markers remain.
+      2. Re-extracts schema (entities, tags) from the cleaned page.
+      3. Updates memvid.
+      4. Logs RESYNC-RESOLVED.
+
+    Args:
+        page_ref: a path like "cardio-monitor/risk-register" (no .md extension)
+                  or a full path to a wiki page file.
+    """
+    if os.path.isabs(page_ref) and os.path.exists(page_ref):
+        wiki_page_path = page_ref
+    else:
+        ref = page_ref
+        if not ref.endswith('.md'):
+            ref += '.md'
+        wiki_page_path = os.path.join(WIKI_DIR, ref)
+
+    if not os.path.exists(wiki_page_path):
+        raise FileNotFoundError(f'Wiki page not found: {wiki_page_path}')
+
+    with open(wiki_page_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    if '<<<<<<<' in content or '>>>>>>>' in content or '=======' in content:
+        raise ValueError(
+            'Wiki page still contains merge conflict markers. '
+            'Edit the file to remove all <<<<<<<, =======, and >>>>>>> lines first.'
+        )
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    parts = os.path.relpath(wiki_page_path, WIKI_DIR).replace('\\', '/').split('/')
+    client_slug = parts[0]
+    page_slug = os.path.splitext(parts[-1])[0]
+
+    frames_added = sync_page_to_memvid(wiki_page_path, client_slug=client_slug)
+    entities_updated = _update_entities_schema(client_slug, wiki_page_path, content, today)
+    fm, _ = parse_frontmatter(content)
+    _update_tags_schema(wiki_page_path, fm)
+    _update_index(client_slug, page_slug, os.path.relpath(wiki_page_path, BASE_DIR), today)
+
+    # Bless this state as the new baseline so the next resync starts fresh.
+    _write_baseline(wiki_page_path, content)
+
+    _append_log(
+        operation='RESYNC-RESOLVED',
+        description=f'{client_slug}/{page_slug}.md - merge conflicts resolved by user',
+        details=[
+            f'Wiki page: {os.path.relpath(wiki_page_path, BASE_DIR)}',
+            f'Memvid frames added: {frames_added}',
+            f'Entities updated: {entities_updated}',
+        ],
+        date=today,
+    )
+
+    return {
+        'action': 'resolved',
+        'wiki_page': os.path.relpath(wiki_page_path, BASE_DIR),
+        'frames_added': frames_added,
+        'entities_updated': entities_updated,
     }
 
 
@@ -1532,8 +1872,15 @@ def _print_drift_report(report: dict) -> None:
     if 'error' in report:
         print(f'Drift check error: {report["error"]}')
         return
-    s = report['summary']
+    s = report.get('summary')
     print('Drift report:')
+    # When memvid is unavailable, check_drift returns a plain-string summary.
+    if isinstance(s, str):
+        print(f'  {s}')
+        return
+    if not isinstance(s, dict):
+        print('  (no summary available)')
+        return
     print(f'  Wiki pages total:      {s["total_wiki_pages"]}')
     print(f'  Synced to memvid:      {s["synced"]} ({s["sync_pct"]}%)')
     print(f'  Missing from memvid:   {s["missing_from_memvid"]}')
@@ -1640,7 +1987,11 @@ def lint() -> dict:
             continue
         if rel.startswith('lint-report'):
             continue
-        slug = os.path.splitext(rel)[0]
+        # Normalize slugs to forward-slash form so they match wikilink targets
+        # like `[[client/page]]` even on Windows where os.path.relpath returns
+        # backslashes. Without this, dead-link / orphan / coverage checks
+        # silently misclassify every page on Windows.
+        slug = os.path.splitext(rel)[0].replace(os.sep, '/')
         page_map[slug] = page
         incoming_links[slug] = set()
         try:
@@ -2176,16 +2527,32 @@ def _load_csv_mapping(name: str) -> dict:
 def _detect_csv_mapping(headers: list[str]) -> str | None:
     """
     Auto-detect which mapping template matches a CSV's column headers.
-    Scores each mapping by how many detect_headers keywords appear in the columns.
+
+    Scoring (designed to avoid substring traps like "Linked Requirement"
+    spuriously matching the `requirements` mapping):
+
+      column_score: how many of the mapping's declared columns appear in
+                    the CSV headers, by exact (lowercased) header equality.
+      detect_score: how many of the mapping's `detect_headers` tokens appear
+                    in the CSV headers, also by exact equality (NOT substring
+                    of the joined header string - that produced false positives
+                    when one mapping's keyword was a substring of another
+                    mapping's column name).
+
+    The winner is chosen by the lexicographic tuple (column_score, detect_score),
+    so column matches dominate and detect_headers act as a tiebreaker.
+
+    Threshold: at least 2 total matches across columns + detect_headers.
+    Returns None if no mapping reaches the threshold (caller should fall back
+    to requiring an explicit --mapping argument).
     """
     if not os.path.exists(MAPPINGS_DIR):
         return None
 
-    headers_lower = [h.lower().strip() for h in headers]
-    headers_joined = ' '.join(headers_lower)
+    headers_lower = {h.lower().strip() for h in headers}
 
     best_name = None
-    best_score = 0
+    best_score = (-1, -1)
 
     for fname in os.listdir(MAPPINGS_DIR):
         if not fname.endswith('.json'):
@@ -2196,19 +2563,23 @@ def _detect_csv_mapping(headers: list[str]) -> str | None:
         except Exception:
             continue
 
+        column_score = sum(
+            1 for col_name in mapping.get('mapping', {}).keys()
+            if col_name.lower().strip() in headers_lower
+        )
         detect_keys = mapping.get('detect_headers', [])
-        score = sum(1 for dk in detect_keys if dk.lower() in headers_joined)
+        detect_score = sum(
+            1 for dk in detect_keys if dk.lower().strip() in headers_lower
+        )
 
-        # Also check if mapping column names match actual headers
-        for col_name in mapping.get('mapping', {}).keys():
-            if col_name.lower() in headers_lower:
-                score += 1
-
+        score = (column_score, detect_score)
         if score > best_score:
             best_score = score
             best_name = fname[:-5]  # strip .json
 
-    return best_name if best_score >= 2 else None
+    if best_score[0] + best_score[1] >= 2:
+        return best_name
+    return None
 
 
 def _csv_row_to_wiki_page(row: dict, mapping: dict, client_slug: str, today: str) -> tuple[str, str, dict]:
@@ -2429,21 +2800,23 @@ def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_ru
         else:
             pages_updated += 1
 
-        # Create trace links
+        # Create trace links.
+        #
+        # NOTE: trace_add returns {'error': ...} when either page doesn't exist
+        # yet (it does NOT raise), so we cannot rely on a try/except. CSV ingest
+        # frequently runs before the target pages exist (e.g. user-needs imported
+        # before requirements). We always go through _store_trace_link directly
+        # so the link is persisted regardless of target existence; trace_add's
+        # frontmatter side-effect is best-effort and only relevant when the
+        # source page is on disk (it always is by this point in ingest_csv).
         for rel_type, targets in traces.items():
             for target_id in targets:
                 target_slug = re.sub(r'[^\w\-]', '-', target_id).lower().strip('-')
                 target_slug = re.sub(r'-+', '-', target_slug)
                 target_page = f'{client_slug}/{target_slug}'
                 from_page = f'{client_slug}/{page_slug}'
-                try:
-                    trace_add(from_page, target_page, rel_type)
-                    trace_links_created += 1
-                except Exception:
-                    # Target page may not exist yet - that's ok, trace is stored
-                    # Try storing just in traceability.json without page validation
-                    _store_trace_link(from_page, target_page, rel_type, today)
-                    trace_links_created += 1
+                _store_trace_link(from_page, target_page, rel_type, today)
+                trace_links_created += 1
 
         # Update index
         _update_index(client_slug, page_slug, os.path.relpath(wiki_path, BASE_DIR), today)
@@ -3218,7 +3591,11 @@ def trace_gaps(client_slug: str) -> dict:
 
     for page_path in pages:
         rel = os.path.relpath(page_path, WIKI_DIR)
-        slug = os.path.splitext(rel)[0]
+        # Normalize to forward-slash slugs so they match the format used by
+        # trace_add / _store_trace_link (which always store "client/page").
+        # Without this, on Windows os.path.relpath returns backslashes and the
+        # `slug not in verified_pages` check below would always be true.
+        slug = os.path.splitext(rel)[0].replace(os.sep, '/')
         try:
             with open(page_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -3974,6 +4351,22 @@ def main() -> None:
     # repair
     subparsers.add_parser('repair', help='Repair corrupted archives and schema')
 
+    # resync
+    resync_parser = subparsers.add_parser(
+        'resync',
+        help='Diff-aware re-ingest: 3-way merge an updated source against the existing wiki page',
+    )
+    resync_parser.add_argument('source', help='Path to the updated source file')
+    resync_parser.add_argument('client_slug', help='Client slug')
+    resync_parser.add_argument('--dry-run', action='store_true', help='Preview the merge without writing')
+
+    # resync-resolve
+    resync_resolve_parser = subparsers.add_parser(
+        'resync-resolve',
+        help='Mark a conflicted resync as resolved (after editing the conflict markers out)',
+    )
+    resync_resolve_parser.add_argument('page', help='Wiki page reference (e.g. "client/page" or full path)')
+
     # new
     new_parser = subparsers.add_parser('new', help='Scaffold a new mneme workspace from the bundled template')
     new_parser.add_argument('target', help='Target directory for the new workspace')
@@ -4340,6 +4733,48 @@ def main() -> None:
         except (FileNotFoundError, ValueError) as e:
             print(f'Error: {e}', file=sys.stderr)
             sys.exit(1)
+
+    elif args.command == 'resync':
+        if not re.match(r'^[a-z0-9][a-z0-9\-]*$', args.client_slug):
+            print(f'Error: invalid client slug "{args.client_slug}".', file=sys.stderr)
+            sys.exit(1)
+        try:
+            result = resync_source(args.source, args.client_slug, dry_run=args.dry_run)
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
+        action = result.get('action', 'unknown')
+        print(f'mneme resync: {result.get("wiki_page", "?")}')
+        print(f'  Action:    {action}')
+        if 'reason' in result:
+            print(f'  Reason:    {result["reason"]}')
+        if result.get('conflicts'):
+            print()
+            print('  CONFLICTS detected. The wiki page now contains <<<<<<< / >>>>>>> markers.')
+            print('  To resolve:')
+            print('    1. Open the page and edit out the conflict markers.')
+            print(f'    2. Run: mneme resync-resolve {args.client_slug}/{os.path.splitext(os.path.basename(args.source))[0]}')
+        elif action.startswith('would-'):
+            print(f'  (dry-run; nothing was written)')
+            if 'baseline_hash' in result:
+                print(f'  Baseline hash: {result["baseline_hash"][:12]}')
+                print(f'  Ours hash:     {result["ours_hash"][:12]}')
+                print(f'  Theirs hash:   {result["theirs_hash"][:12]}')
+                print(f'  Merged hash:   {result["merged_hash"][:12]}')
+        else:
+            print(f'  Frames added:    {result.get("frames_added", 0)}')
+            print(f'  Entities updated:{result.get("entities_updated", 0)}')
+
+    elif args.command == 'resync-resolve':
+        try:
+            result = resync_resolve(args.page)
+        except (FileNotFoundError, ValueError) as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
+        print(f'mneme resync-resolve: {result["wiki_page"]}')
+        print(f'  Frames added:    {result["frames_added"]}')
+        print(f'  Entities updated:{result["entities_updated"]}')
+        print('  Baseline updated. Page is clean.')
 
     elif args.command == 'new':
         try:

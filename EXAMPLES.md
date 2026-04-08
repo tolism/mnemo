@@ -532,6 +532,88 @@ Settings → Files & Links
 
 ---
 
+## Example 12: Updating a Source File After External Edits
+
+A colleague on the firmware team edited `risk-register.md` in their own repo -- they added RMA-003 for a newly discovered electrical hazard. Meanwhile, you've been annotating the matching wiki page in Obsidian with open questions from the last design review. A plain re-ingest would wipe your notes. `mneme resync` does a 3-way merge instead.
+
+```bash
+# Starting state: the risk register was ingested last week
+mneme recent -n 1
+#   [2026-04-01 14:22] INGEST | risk-register.md -> cardio-monitor
+
+# Since then, you added an "## Open Questions" section by hand in Obsidian
+# to wiki/cardio-monitor/risk-register.md
+
+# Your colleague drops an updated copy in your inbox (new RMA-003 row added)
+cp ~/shared/firmware-team/risk-register.md incoming/
+
+# Preview the merge without touching disk
+mneme resync incoming/risk-register.md cardio-monitor --dry-run
+#   Baseline:  wiki/cardio-monitor/.baselines/risk-register.md  (a1b2c3d4)
+#   Ours:      wiki/cardio-monitor/risk-register.md             (9f8e7d6c)
+#   Theirs:    <fresh ingest of incoming/risk-register.md>      (4d5e6f70)
+#   Merged:                                                     (77aabb11)
+#   Result: clean merge (no conflicts)
+
+# Apply the merge
+mneme resync incoming/risk-register.md cardio-monitor
+#   Ingesting incoming/risk-register.md ...
+#   3-way merge: baseline <- ours / theirs
+#   Result: clean merge
+#     + added: "RMA-003 - Insulation barrier for secondary circuit"
+#     = kept:  "## Open Questions" section (your hand edit)
+#   wiki/cardio-monitor/risk-register.md updated
+#   Baseline advanced
+#   Schema re-derived
+
+mneme recent -n 1
+#   [2026-04-08 10:03] RESYNC | risk-register.md -> cardio-monitor (clean)
+```
+
+The new RMA is now in the wiki page, and your Open Questions section survived untouched.
+
+### Conflict variant
+
+Suppose you *also* edited the severity column for HAZ-002 locally, and your colleague edited the same cell to a different value. Both sides touched the same line, so git can't auto-merge:
+
+```bash
+mneme resync incoming/risk-register.md cardio-monitor
+#   3-way merge: baseline <- ours / theirs
+#   Result: CONFLICT (1 region)
+#   wiki/cardio-monitor/risk-register.md now contains merge markers.
+#   Edit the file, then run:
+#     mneme resync-resolve cardio-monitor/risk-register
+```
+
+Open the page and you'll see a block like:
+
+```
+<<<<<<< current (ours)
+| HAZ-002 | Battery overheat | Burn | High | ...
+||||||| baseline (ancestor)
+| HAZ-002 | Battery overheat | Burn | Medium | ...
+=======
+| HAZ-002 | Battery overheat | Burn | Critical | ...
+>>>>>>> incoming (theirs)
+```
+
+Pick the right value (or write a new one), delete the marker lines, save, then:
+
+```bash
+mneme resync-resolve cardio-monitor/risk-register
+#   Conflict markers cleared
+#   Baseline advanced
+#   Schema re-derived
+
+mneme recent -n 2
+#   [2026-04-08 10:11] RESYNC-RESOLVED | cardio-monitor/risk-register
+#   [2026-04-08 10:07] RESYNC-CONFLICT | risk-register.md -> cardio-monitor
+```
+
+`mneme resync` is safe to run on files that were never ingested before -- with no baseline available, it falls through to a regular `mneme ingest`. For CSV-derived workflows where each row is its own page, resync handles per-row updates the same way: added rows become new pages, modified rows trigger a per-page 3-way merge.
+
+---
+
 ## Bundled CSV Mapping Templates
 
 | Mapping | CSV columns it expects | Page type created |
