@@ -73,9 +73,9 @@ def _make_page(workspace, client, slug, body, title=None, page_type='source-summ
     return path
 
 
-EU_MDR_PATH = os.path.join(os.path.dirname(__file__), '..', 'mneme', 'profiles', 'eu-mdr.json')
-with open(EU_MDR_PATH) as _f:
-    EU_MDR = json.load(_f)
+# Profiles are now markdown files. Load via the public API so the tests
+# always exercise the .md parser path.
+EU_MDR = load_profile('eu-mdr')
 
 
 class TestLoadProfile:
@@ -304,40 +304,59 @@ class TestValidateConsistency:
 
 class TestWorkspaceProfiles:
     """
-    Profiles dropped at {workspace}/profiles/{name}.json should be loadable
+    Profiles dropped at {workspace}/profiles/{name}.md should be loadable
     by name AND should shadow bundled profiles with the same name.
     """
 
-    def _write_profile(self, workspace, name, data):
-        """Drop a JSON profile into the workspace's profiles/ directory."""
+    def _write_profile(self, workspace, name, content):
+        """Drop a markdown profile into the workspace's profiles/ directory."""
         d = os.path.join(workspace, 'profiles')
         os.makedirs(d, exist_ok=True)
-        path = os.path.join(d, f'{name}.json')
+        path = os.path.join(d, f'{name}.md')
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+            f.write(content)
         return path
+
+    _MINIMAL_PROFILE = """---
+name: {name}
+description: {description}
+version: {version}
+tone: formal
+voice: passive-for-procedures
+trace_types: [derived-from]
+requirement_levels:
+  shall: mandatory
+vocabulary: []
+---
+
+# Principles
+
+- Be precise.
+"""
 
     def test_load_workspace_only_profile(self, temp_workspace):
         # A profile that doesn't exist in the bundled set
-        self._write_profile(temp_workspace, 'parkiwatch', {
-            'name': 'ParkiWatch QMS',
-            'description': 'Internal parkiwatch QMS profile',
-            'version': '1.0',
-            'vocabulary': {'preferred': [], 'requirement_levels': {}},
-            'sections': {},
-        })
+        self._write_profile(
+            temp_workspace, 'parkiwatch',
+            self._MINIMAL_PROFILE.format(
+                name='ParkiWatch QMS',
+                description='Internal parkiwatch QMS profile',
+                version='1.0',
+            ),
+        )
         profile = load_profile('parkiwatch')
         assert profile['name'] == 'ParkiWatch QMS'
 
     def test_workspace_profile_shadows_bundled(self, temp_workspace):
         # Override the bundled eu-mdr profile with a workspace variant
-        self._write_profile(temp_workspace, 'eu-mdr', {
-            'name': 'CUSTOM EU MDR',
-            'description': 'workspace override for testing',
-            'version': '999',
-            'vocabulary': {'preferred': [], 'requirement_levels': {}},
-            'sections': {},
-        })
+        self._write_profile(
+            temp_workspace, 'eu-mdr',
+            self._MINIMAL_PROFILE.format(
+                name='CUSTOM EU MDR',
+                description='workspace override for testing',
+                version='999',
+            ),
+        )
         profile = load_profile('eu-mdr')
         assert profile['name'] == 'CUSTOM EU MDR'
         assert profile['version'] == '999'
@@ -349,13 +368,14 @@ class TestWorkspaceProfiles:
         assert 'EU MDR' in profile['name']
 
     def test_set_active_accepts_workspace_profile(self, temp_workspace):
-        self._write_profile(temp_workspace, 'parkiwatch', {
-            'name': 'ParkiWatch QMS',
-            'description': '',
-            'version': '1.0',
-            'vocabulary': {'preferred': [], 'requirement_levels': {}},
-            'sections': {},
-        })
+        self._write_profile(
+            temp_workspace, 'parkiwatch',
+            self._MINIMAL_PROFILE.format(
+                name='ParkiWatch QMS',
+                description='',
+                version='1.0',
+            ),
+        )
         # Should not raise
         set_active_profile('parkiwatch')
         active = get_active_profile()
@@ -438,3 +458,216 @@ class TestWorkspaceCsvMappings:
         })
         result = _detect_csv_mapping(['Ticket', 'Summary', 'Severity', 'Reporter'])
         assert result == 'parkiwatch-incidents'
+
+
+# ---------------------------------------------------------------------------
+# Markdown profile parser
+# ---------------------------------------------------------------------------
+
+class TestMarkdownProfileParser:
+    """
+    The .md profile parser is the source of truth for both bundled and
+    workspace profiles. These tests pin the parser's behavior on every
+    recognized field so we can iterate on profiles without breaking shape.
+    """
+
+    def _write(self, path, content):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+    def test_parse_minimal(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'tiny.md')
+        self._write(path, "---\nname: Tiny\nversion: 1.0\n---\n")
+        p = _load_profile_from_md(path)
+        assert p['name'] == 'Tiny'
+        assert p['version'] == '1.0'
+        assert p['vocabulary']['preferred'] == []
+        assert p['sections'] == {}
+
+    def test_parse_full_eu_mdr_round_trip(self):
+        # The bundled eu-mdr.md is the canonical exercise of every recognized
+        # heading and field type. If this test passes, the parser handles
+        # everything we need for the v0.4.0 release.
+        from mneme.core import load_profile
+        p = load_profile('eu-mdr')
+        assert p['name'] == 'EU MDR'
+        assert p['version'] == '2.0'
+        assert p['tone'] == 'formal'
+        assert len(p['vocabulary']['preferred']) == 15
+        # First vocab entry uses the in-memory `term:` shape, not the .md `use:`
+        assert p['vocabulary']['preferred'][0]['term'] == 'medical device'
+        assert 'product' in p['vocabulary']['preferred'][0]['reject']
+        assert p['vocabulary']['requirement_levels']['shall'].startswith('mandatory')
+        assert len(p['trace_types']) == 8
+        ws = p['writing_style']
+        assert len(ws['principles']) == 3
+        assert len(ws['general_rules']) == 8
+        assert len(ws['terminology_guidance']) == 7
+        assert ws['terminology_guidance'][0]['use'].startswith('Kinematic')
+        assert len(ws['framing_examples']) == 2
+        assert ws['framing_examples'][0]['context'] == 'Describing correlation results'
+        assert 'monotonic correlation' in ws['framing_examples'][0]['correct']
+        assert ws['placeholder_for_missing_refs'] == '[TO ADD REF]'
+        # Document types and their section_notes
+        assert 'design-validation-report' in p['sections']
+        dvr = p['sections']['design-validation-report']
+        assert dvr['description'].startswith('Design Validation Report')
+        notes = dvr['section_notes']
+        assert 'context' in notes
+        assert 'literature review' in notes['context'].lower()
+        assert 'dataset-descriptions' in notes
+        # Submission checklist
+        assert len(p['submission_checklist']) == 15
+        assert 'Conclusion' in p['submission_checklist'][-1]
+
+    def test_parse_terminology_table(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'term.md')
+        self._write(path, """---
+name: Term Test
+version: 1.0
+---
+
+# Terminology
+
+| Use | Instead of | Why |
+|---|---|---|
+| foo | bar, baz | because |
+| alpha | beta | rationale here |
+""")
+        p = _load_profile_from_md(path)
+        terms = p['writing_style']['terminology_guidance']
+        assert len(terms) == 2
+        assert terms[0]['use'] == 'foo'
+        assert terms[0]['instead_of'] == ['bar', 'baz']
+        assert terms[0]['rationale'] == 'because'
+        assert terms[1]['instead_of'] == ['beta']
+
+    def test_parse_framing_block(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'framing.md')
+        self._write(path, """---
+name: Framing Test
+version: 1.0
+---
+
+# Framing: Reporting numbers
+
+**Wrong:**
+
+> The result was excellent.
+
+**Correct:**
+
+> MCC = 0.91 against the reference standard.
+
+**Why:** the wrong version is editorial; the correct version reports the value.
+""")
+        p = _load_profile_from_md(path)
+        examples = p['writing_style']['framing_examples']
+        assert len(examples) == 1
+        ex = examples[0]
+        assert ex['context'] == 'Reporting numbers'
+        assert 'excellent' in ex['wrong']
+        assert 'MCC' in ex['correct']
+        assert 'editorial' in ex['why']
+
+    def test_parse_document_type_with_sections(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'doctype.md')
+        self._write(path, """---
+name: DocType Test
+version: 1.0
+---
+
+# Document Type: my-report
+
+A description of my-report goes here as plain prose.
+
+## Section: introduction
+
+Write the introduction first.
+
+## Section: methods
+
+Describe the methods used.
+""")
+        p = _load_profile_from_md(path)
+        assert 'my-report' in p['sections']
+        sec = p['sections']['my-report']
+        assert sec['description'].startswith('A description')
+        assert sec['section_notes']['introduction'].startswith('Write')
+        assert sec['section_notes']['methods'].startswith('Describe')
+
+    def test_parse_vocabulary_block(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'vocab.md')
+        self._write(path, """---
+name: Vocab Test
+version: 1.0
+vocabulary:
+  - use: medical device
+    reject: [product, unit]
+  - use: nonconformity
+    reject: [bug, defect, issue]
+---
+""")
+        p = _load_profile_from_md(path)
+        vocab = p['vocabulary']['preferred']
+        assert len(vocab) == 2
+        assert vocab[0]['term'] == 'medical device'
+        assert vocab[0]['reject'] == ['product', 'unit']
+        assert vocab[1]['term'] == 'nonconformity'
+        assert 'bug' in vocab[1]['reject']
+        assert 'defect' in vocab[1]['reject']
+        assert 'issue' in vocab[1]['reject']
+
+    def test_parse_submission_checklist(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'checklist.md')
+        self._write(path, """---
+name: Checklist Test
+version: 1.0
+---
+
+# Submission Checklist
+
+- All references include ID and version
+- No clinical claims
+- Conclusion is unambiguous
+""")
+        p = _load_profile_from_md(path)
+        assert p['submission_checklist'] == [
+            'All references include ID and version',
+            'No clinical claims',
+            'Conclusion is unambiguous',
+        ]
+
+    def test_unknown_h1_heading_silently_ignored(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'extra.md')
+        self._write(path, """---
+name: Extra Test
+version: 1.0
+---
+
+# Authoring Notes
+
+This is just a note for the author. Should not appear in the parsed output.
+
+# Principles
+
+- Be precise.
+""")
+        p = _load_profile_from_md(path)
+        assert p['writing_style']['principles'] == ['Be precise.']
+        # Authoring Notes is not a recognized heading - it just gets ignored
+
+    def test_missing_frontmatter_raises(self, temp_workspace):
+        from mneme.core import _load_profile_from_md
+        path = os.path.join(temp_workspace, 'profiles', 'broken.md')
+        self._write(path, "# Just a heading, no frontmatter\n")
+        with pytest.raises(ValueError, match='frontmatter'):
+            _load_profile_from_md(path)

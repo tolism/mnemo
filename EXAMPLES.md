@@ -622,13 +622,13 @@ mneme recent -n 2
 
 ## Example 13: Adding a Custom Profile (Workspace-Local)
 
-Mnemo ships two bundled profiles -- `eu-mdr` and `iso-13485` -- but those are just two examples. You're not stuck with what mneme ships. Any workspace can define its own profiles by dropping a JSON file into `<workspace>/profiles/`. **No reinstall, no rebuild, no PR upstream.**
+Mnemo ships two bundled profiles -- `eu-mdr` and `iso-13485` -- but those are just two examples. Any workspace can define its own profiles by dropping a markdown file into `<workspace>/profiles/`. **No reinstall, no rebuild, no PR upstream.**
 
 The shadowing rule: when you ask for a profile by name, mneme checks the workspace folder first, then the bundled set. Workspace files win.
 
 ### Scenario
 
-You're building Parkiwatch -- an internal product line for parking enforcement. You don't need EU MDR or ISO 13485, but you do need your own QMS framework with parkiwatch-specific terminology and writing-style guidance. You want `mneme harmonize` to flag "parking ticket" and rewrite it to "parking violation", and `mneme validate writing-style` to hand a Claude agent the prose guidance for incident reports so it can critique a draft.
+You're building Parkiwatch -- an internal product line for parking enforcement. You don't need EU MDR or ISO 13485, but you do need your own quality framework with parkiwatch-specific terminology and writing-style guidance. You want `mneme harmonize` to flag "parking ticket" and rewrite it to "parking violation", and `mneme validate writing-style` to hand a Claude agent the prose guidance for incident reports so it can critique a draft.
 
 ### Step 1 -- Scaffold a workspace (creates `profiles/` for you)
 
@@ -637,7 +637,7 @@ mneme new ~/projects/parkiwatch --name Parkiwatch --client parkiwatch
 cd ~/projects/parkiwatch
 
 ls profiles/
-#   README.md       <- explains the format
+#   README.md       <- explains the .md profile format
 #   mappings/       <- workspace-local CSV column mappings live here
 ```
 
@@ -645,60 +645,106 @@ The `profiles/` directory is part of the bundled workspace template, so every fr
 
 ### Step 2 -- Author your profile
 
-Create `profiles/parkiwatch-qms.json`. The schema matches the bundled `eu-mdr.json` exactly -- you can copy a bundled profile from the installed package as a starting point if you prefer.
+Profiles are markdown files with YAML frontmatter. The frontmatter carries the structured fields and the body carries the writing-style prose under recognized H1 headings. Create `profiles/parkiwatch-qms.md`:
 
 ```bash
-cat > profiles/parkiwatch-qms.json <<'EOF'
-{
-  "name": "Parkiwatch QMS",
-  "description": "Internal quality management framework for the Parkiwatch product line",
-  "version": "1.0",
-  "vocabulary": {
-    "preferred": [
-      { "term": "parking violation", "reject": ["parking ticket", "parking offence", "infraction"] },
-      { "term": "enforcement officer", "reject": ["meter maid", "warden", "ticket inspector"] },
-      { "term": "vehicle owner", "reject": ["driver", "car owner", "license holder"] }
-    ],
-    "requirement_levels": {
-      "shall": "mandatory",
-      "should": "recommended",
-      "may": "permitted"
-    }
-  },
-  "sections": {
-    "incident-report": {
-      "required": [
-        "incident-id",
-        "location",
-        "timestamp",
-        "vehicle-details",
-        "evidence",
-        "officer-signature"
-      ],
-      "description": "Standard parking incident structure"
-    },
-    "appeal-record": {
-      "required": [
-        "appeal-id",
-        "original-incident",
-        "submitted-date",
-        "grounds",
-        "decision",
-        "decision-rationale"
-      ],
-      "description": "Appeal handling per Parkiwatch policy 3.2"
-    }
-  },
-  "trace_types": [
-    "derived-from",
-    "implemented-by",
-    "verified-by",
-    "supersedes"
-  ],
-  "tone": "formal",
-  "voice": "passive-for-procedures",
-  "citation_style": "policy-section-reference"
-}
+cat > profiles/parkiwatch-qms.md <<'EOF'
+---
+name: Parkiwatch QMS
+description: Internal quality management framework for the Parkiwatch product line
+version: 1.0
+tone: formal
+voice: passive-for-procedures
+citation_style: policy-section-reference
+trace_types:
+  - derived-from
+  - implemented-by
+  - verified-by
+  - supersedes
+requirement_levels:
+  shall: mandatory
+  should: recommended
+  may: permitted
+vocabulary:
+  - use: parking violation
+    reject: [parking ticket, parking offence, infraction]
+  - use: enforcement officer
+    reject: [meter maid, warden, ticket inspector]
+  - use: vehicle owner
+    reject: [driver, car owner, license holder]
+---
+
+# Principles
+
+- Auditable: every claim about an incident must be backed by a controlled record (photo, witness statement, telemetry log).
+- Procedural, not narrative: incident reports describe what happened, when, and against which policy clause. They do not editorialise.
+
+# General Rules
+
+- Reference Parkiwatch policy clauses by ID (e.g. PWP-3.2.1), not by name.
+- Use the controlled vocabulary. The terminology table below is normative.
+- Never leave a section blank. Every section heading must contain content or be removed.
+- Use the placeholder [TO ADD REF] when a reference cannot be located at the time of writing.
+
+# Terminology
+
+| Use | Instead of | Why |
+|---|---|---|
+| parking violation | parking ticket, parking offence, infraction | Parkiwatch internal convention. |
+| enforcement officer | meter maid, warden, ticket inspector | Reflects the formal job title. |
+| vehicle owner | driver, car owner, license holder | The legal liability sits with the registered owner. |
+
+# Framing: Reporting an incident
+
+**Wrong:**
+
+> The car was illegally parked and the driver was rude to the warden.
+
+**Correct:**
+
+> Vehicle BD-1234-AA was observed in violation of Parkiwatch policy PWP-3.2.1 (no-parking zone, school hours). Enforcement officer ID-471 issued violation notice PV-2026-0182 at 08:42 local time. Photo evidence is attached as PV-2026-0182-photo-{1,2}.jpg.
+
+**Why:** the wrong version is narrative and editorial. The correct version cites the policy clause, names the controlled records, and uses the controlled vocabulary.
+
+# Document Type: incident-report
+
+Standard parking incident structure used by all enforcement officers.
+
+## Section: incident-id
+
+Format: `PV-YYYY-NNNN`. Auto-generated by the enforcement tablet.
+
+## Section: location
+
+GPS coordinates plus the nearest controlled-zone reference (e.g. PZ-CITY-CENTER-N3).
+
+## Section: evidence
+
+Photo evidence with timestamp and GPS metadata is mandatory. Reference the photo IDs by name.
+
+## Section: officer-signature
+
+Officer ID and digital signature timestamp. Manual signatures are not acceptable.
+
+# Document Type: appeal-record
+
+Appeal handling per Parkiwatch policy 3.2.
+
+## Section: grounds
+
+State the appellant's grounds verbatim where possible. Use a quote block.
+
+## Section: decision
+
+Pass / overturned / reduced. Reference the policy clause that supports the decision.
+
+# Submission Checklist
+
+- All references include policy clause ID (e.g. PWP-3.2.1)
+- Controlled vocabulary used throughout
+- Photo evidence attached and named consistently
+- Officer ID and digital signature present
+- No editorial language about the vehicle owner
 EOF
 ```
 
@@ -728,20 +774,20 @@ mneme ingest incidents/incident-001.md parkiwatch
 mneme ingest incidents/incident-002.md parkiwatch
 
 # Vocabulary check: flags pages using "parking ticket" instead of "parking violation"
-mneme harmonize parkiwatch
+mneme harmonize --client parkiwatch
 #   Found 3 vocabulary issues:
 #     "parking ticket" (2 pages)  -> should be "parking violation"
 #     "meter maid" (1 page)        -> should be "enforcement officer"
 
 # Auto-fix vocabulary
-mneme harmonize parkiwatch --fix
+mneme harmonize --client parkiwatch --fix
 #   Pages fixed: 3
 
-# Build a writing-style review packet for an LLM agent
+# Build a writing-style review packet for an LLM agent.
+# The packet contains the page, the writing-style block, and the
+# section_notes resolved from the page's frontmatter `type:` field.
 mneme validate writing-style parkiwatch/incident-001 > /tmp/review.md
-# Then paste /tmp/review.md into Claude or any LLM. The packet contains the
-# page, the active profile's writing-style block, and the section_notes for
-# the document type matched from the page's frontmatter `type:` field.
+# Then paste /tmp/review.md into Claude or any LLM.
 
 # Cross-document consistency
 mneme validate consistency --client parkiwatch
@@ -751,25 +797,25 @@ mneme validate consistency --client parkiwatch
 
 When you run `mneme profile set parkiwatch-qms`, mneme resolves the name in this order:
 
-1. **First:** `~/projects/parkiwatch/profiles/parkiwatch-qms.json` -- your local profile
-2. **Then:** `<wherever pip installed mneme>/mneme/profiles/parkiwatch-qms.json` -- the bundled set (only `eu-mdr` and `iso-13485` ship)
+1. **First:** `~/projects/parkiwatch/profiles/parkiwatch-qms.md` -- your local profile
+2. **Then:** `<wherever pip installed mneme>/mneme/profiles/parkiwatch-qms.md` -- the bundled set (only `eu-mdr` and `iso-13485` ship)
 
 The first one wins. If neither exists, you get a clear error listing both paths it checked.
 
 ### Overriding a bundled profile
 
-The same shadowing rule lets you override `eu-mdr` for one specific project. Suppose you're doing an EU MDR submission but your company has stricter internal vocabulary rules. Drop your stricter version at `~/projects/cardio-monitor/profiles/eu-mdr.json` and that project gets your stricter profile. Other projects that also use `eu-mdr` still get the bundled one.
+The same shadowing rule lets you override `eu-mdr` for one specific project. Suppose you're doing an EU MDR submission but your company has stricter internal vocabulary rules. Drop your stricter version at `~/projects/cardio-monitor/profiles/eu-mdr.md` and that project gets your stricter profile. Other projects that also use `eu-mdr` still get the bundled one.
 
 ```bash
 cd ~/projects/cardio-monitor
-cp ~/qms-templates/strict-eu-mdr.json profiles/eu-mdr.json
+cp ~/qms-templates/strict-eu-mdr.md profiles/eu-mdr.md
 mneme profile show
 #   Active profile: EU MDR (strict company variant)
 ```
 
 ### CSV column mappings work the same way
 
-If you have a parkiwatch-specific CSV format (e.g. an incidents export from your ticketing system), drop a mapping at `profiles/mappings/parkiwatch-incidents.json`:
+CSV mappings (used by `mneme ingest-csv`) are still JSON because they are programmatic, not prose. Drop a mapping at `profiles/mappings/parkiwatch-incidents.json`:
 
 ```bash
 cat > profiles/mappings/parkiwatch-incidents.json <<'EOF'
@@ -802,17 +848,18 @@ mneme ingest-csv incidents-export.csv parkiwatch --mapping parkiwatch-incidents
 
 | Gotcha | Why | Fix |
 |---|---|---|
-| `Profile not found` after activate | The JSON file isn't in `<workspace>/profiles/` | `ls profiles/` to verify the filename matches |
-| `mneme profile set` works but `harmonize` does nothing | Profile loaded but `vocabulary.preferred` is empty | Add at least one entry under `preferred` |
-| Edits to the JSON don't take effect | Wrong workspace, or cached `MNEME_HOME` env var | `mneme profile show` re-reads on every call; verify `MNEME_HOME` is unset |
+| `Profile not found` after activate | The .md file isn't in `<workspace>/profiles/` | `ls profiles/` to verify the filename matches |
+| `mneme profile set` works but `harmonize` does nothing | Profile loaded but the `vocabulary:` block in frontmatter is empty | Add at least one `- use: ...` entry |
+| Edits to the .md don't take effect | Wrong workspace, or cached `MNEME_HOME` env var | `mneme profile show` re-reads on every call; verify `MNEME_HOME` is unset |
 | Profile from one project leaks into another | You exported `MNEME_HOME` and forgot to unset it | `unset MNEME_HOME` (POSIX) / `Remove-Item Env:MNEME_HOME` (PowerShell) |
+| Unrecognised H1 heading silently ignored | Mneme only parses the documented set of H1 headings | Use the recognised headings, or keep prose under one of them. Authoring notes under unknown headings are intentionally dropped. |
 
 ### What you do NOT have to do
 
 - You **do not** edit the installed mneme package
 - You **do not** rebuild the wheel
 - You **do not** open a PR against the mneme repo
-- You **do not** restart anything -- mneme reads the JSON on every command
+- You **do not** restart anything -- mneme reads the .md on every command
 
 The profile is just a file in your project. Treat it like any other project asset: commit it to git, version it alongside your wiki, and ship it as part of your workspace.
 

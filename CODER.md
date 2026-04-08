@@ -20,8 +20,8 @@ mneme/
   core.py             <- ALL business logic (4200+ lines, needs splitting -- see Architecture Debt)
   config.py           <- Constants: paths, chunk sizes, stopwords
   server.py           <- Web UI server (localhost:3141)
-  profiles/           <- Writing style profiles (eu-mdr.json, iso-13485.json)
-    mappings/         <- CSV column-to-frontmatter mapping templates
+  profiles/           <- Writing style profiles as markdown (eu-mdr.md, iso-13485.md)
+    mappings/         <- CSV column-to-frontmatter mapping templates (still JSON)
   wiki/               <- Generated markdown pages (Obsidian-compatible)
   schema/             <- Machine-readable JSON (entities, graph, tags, traceability)
   sources/            <- Archived source files (IMMUTABLE after ingest)
@@ -189,40 +189,78 @@ mneme ingest-csv my-data.csv my-client --mapping my-mapping --dry-run
 
 ## How to Add a New Profile
 
-Create `profiles/{name}.json`:
+Profiles are markdown files with YAML frontmatter. Create `profiles/{name}.md`
+either bundled in the package (`mneme/profiles/`) or workspace-local
+(`<workspace>/profiles/`). Workspace profiles shadow bundled ones with the
+same name.
 
-```json
-{
-  "name": "Display Name",
-  "description": "What regulatory framework this covers",
-  "version": "1.0",
-  "vocabulary": {
-    "preferred": [
-      {"term": "correct term", "reject": ["wrong1", "wrong2"]}
-    ],
-    "requirement_levels": {
-      "shall": "mandatory",
-      "should": "recommended",
-      "may": "permitted"
-    }
-  },
-  "sections": {
-    "document-type": {
-      "required": ["section-1", "section-2"],
-      "description": "What this document type is"
-    }
-  },
-  "trace_types": ["derived-from", "mitigated-by", "verified-by"],
-  "tone": "formal",
-  "voice": "passive-for-procedures",
-  "citation_style": "section-reference"
-}
+```markdown
+---
+name: Display Name
+description: What regulatory framework this covers
+version: 1.0
+tone: formal
+voice: passive-for-procedures
+citation_style: section-reference
+trace_types: [derived-from, mitigated-by, verified-by]
+requirement_levels:
+  shall: mandatory
+  should: recommended
+  may: permitted
+vocabulary:
+  - use: correct term
+    reject: [wrong1, wrong2]
+---
+
+# Principles
+
+- One bullet per top-level principle.
+
+# General Rules
+
+- Cross-cutting writing rules.
+
+# Terminology
+
+| Use | Instead of | Why |
+|---|---|---|
+| correct term | wrong1, wrong2 | rationale |
+
+# Framing: Some context label
+
+**Wrong:**
+
+> editorial example
+
+**Correct:**
+
+> rewritten example
+
+**Why:** explanation
+
+# Document Type: my-doc-type
+
+A free-form description of this document type.
+
+## Section: introduction
+
+Per-section guidance for the introduction. Pulled into the writing-style
+review packet when a page's frontmatter has `type: my-doc-type`.
+
+# Submission Checklist
+
+- Pre-submission go/no-go items
 ```
+
+Recognised H1 headings (case-insensitive): `Principles`, `General Rules`,
+`Terminology`, `Framing: <context>`, `Document Type: <slug>`,
+`Submission Checklist`. Anything else is silently ignored - use unrecognised
+headings for authoring notes.
 
 Then activate it:
 
 ```bash
-mneme profile set my-profile
+mneme profile set my-profile     # name without the .md extension
 mneme profile show
 ```
 
@@ -230,6 +268,10 @@ The profile is used by:
 - `mneme harmonize` -- mechanically enforces vocabulary rules
 - `mneme validate writing-style` -- assembles a writing-style review packet for an LLM agent
 - `mneme lint` -- can integrate with profile checks
+
+CSV column mappings (used by `mneme ingest-csv`) live in
+`profiles/mappings/{name}.json` and remain JSON because they are
+programmatic, not prose. See "How to Add a New CSV Mapping" above.
 
 ---
 

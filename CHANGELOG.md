@@ -7,14 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed (BREAKING)
+- **Profiles are now markdown files.** The previous `.json` profile format
+  has been removed entirely. Profiles live in `<workspace>/profiles/<name>.md`
+  (workspace-local) or `<package>/mneme/profiles/<name>.md` (bundled). The
+  YAML frontmatter carries the structured fields (`vocabulary`, `trace_types`,
+  `requirement_levels`, `tone`, `voice`, `citation_style`,
+  `placeholder_for_missing_refs`) and the body carries the writing-style
+  prose under recognised H1 headings: `# Principles`, `# General Rules`,
+  `# Terminology` (3-column markdown table), `# Framing: <context>` (parses
+  `**Wrong:**` / `**Correct:**` / `**Why:**` blocks), `# Document Type:
+  <slug>` (with nested `## Section: <slug>` blocks for per-section
+  guidance), and `# Submission Checklist`. Unrecognised H1 headings are
+  silently ignored (use them for authoring notes).
+- **Bundled `eu-mdr.md` and `iso-13485.md` rewritten** under the new format,
+  v2.0. The eu-mdr profile now ships a full `design-validation-report` style
+  guide derived from real reviewer comments on a Tremor Detection Algorithm
+  DVR (technical-not-clinical framing, terminology mapping, framing examples,
+  submission checklist, per-section notes for context, datasets, methodology,
+  equipment, sample-size justification, acceptance criteria, results,
+  conclusion).
 - **Profile schema rewritten as pure style guidance.** The
   `sections.<doc-type>.required` array (a list of mandatory heading slugs)
-  has been removed. Profiles now carry free-form `section_notes` (per-section
-  prose guidance) plus a top-level `writing_style` block (`principles`,
-  `general_rules`, `terminology_guidance`, `framing_examples`,
-  `placeholder_for_missing_refs`) and a `submission_checklist`. Bundled
-  `eu-mdr` and `iso-13485` profiles were rewritten under the new schema and
-  bumped to v2.0.
+  has been removed from the in-memory profile shape. Profiles now carry
+  free-form `section_notes` (per-section prose guidance) plus a top-level
+  `writing_style` block (`principles`, `general_rules`, `terminology_guidance`,
+  `framing_examples`, `placeholder_for_missing_refs`) and a
+  `submission_checklist`.
 - **Removed:** `mneme validate structure` and the underlying
   `validate_structure()` function. Mechanical heading-list checks didn't
   reflect what regulatory reviewers actually care about; the work belongs to

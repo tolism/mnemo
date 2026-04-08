@@ -3325,38 +3325,451 @@ def export_client(client_slug: str, format: str = 'json') -> str:
 
 def _resolve_profile_path(name: str) -> Optional[str]:
     """
-    Resolve a profile name to a JSON path.
+    Resolve a profile name to a `.md` path.
 
-    Lookup order (workspace shadows bundled, so a project can override an
-    industry profile with a project-specific tweak):
+    Profiles are markdown files. The lookup order is:
+      1. {WORKSPACE_DIR}/profiles/{name}.md   (per-project, not packaged)
+      2. {PACKAGE_DIR}/profiles/{name}.md     (bundled with mneme)
 
-      1. {WORKSPACE_DIR}/profiles/{name}.json   (per-project, not packaged)
-      2. {PACKAGE_DIR}/profiles/{name}.json     (bundled with mneme)
+    Workspace profiles shadow bundled profiles with the same name, so a
+    project can override an industry profile with a project-specific tweak.
 
-    Returns the absolute path to the JSON file, or None if neither exists.
+    Returns the absolute path to the .md file, or None if neither exists.
     """
-    workspace_path = os.path.join(WORKSPACE_PROFILES_DIR, f'{name}.json')
+    workspace_path = os.path.join(WORKSPACE_PROFILES_DIR, f'{name}.md')
     if os.path.exists(workspace_path):
         return workspace_path
-    bundled_path = os.path.join(PROFILES_DIR, f'{name}.json')
+    bundled_path = os.path.join(PROFILES_DIR, f'{name}.md')
     if os.path.exists(bundled_path):
         return bundled_path
     return None
 
 
+# ---------------------------------------------------------------------------
+# Markdown profile parser
+# ---------------------------------------------------------------------------
+#
+# A profile is a markdown file with YAML frontmatter. The frontmatter carries
+# the structured fields (vocabulary, trace_types, tone, ...) and the body
+# carries the writing-style prose under recognized H1 headings.
+#
+# Recognized H1 headings (case-insensitive on the prefix):
+#   # Principles                       -> writing_style.principles (- bullets)
+#   # General Rules                    -> writing_style.general_rules (- bullets)
+#   # Terminology                      -> writing_style.terminology_guidance
+#                                         (parsed from a 3-column markdown table:
+#                                          Use | Instead of | Why)
+#   # Framing: <context label>         -> one entry in writing_style.framing_examples
+#                                         body parses **Wrong:** **Correct:** **Why:**
+#   # Document Type: <slug>            -> sections[<slug>]
+#                                         body before any "## Section: ..." -> description
+#   ## Section: <slug>                 -> sections[<doc-type>].section_notes[<section-slug>]
+#                                         (must appear under a # Document Type heading)
+#   # Submission Checklist             -> submission_checklist (- bullets)
+#
+# Frontmatter conventions (note these differ slightly from the in-memory dict
+# shape so the .md format reads naturally):
+#   vocabulary:                          -> profile['vocabulary']['preferred']
+#     - use: medical device                (each `use:` becomes the in-memory `term:`)
+#       reject: [product, unit]
+#   requirement_levels:                  -> profile['vocabulary']['requirement_levels']
+#     shall: mandatory
+
+
+def _parse_md_profile_frontmatter_value(text: str):
+    """
+    Parse a YAML-ish value from a profile frontmatter line.
+    Handles plain strings, [a, b, c] inline lists, quoted strings, and
+    `${"true", "false", null}`. Multi-line nested structures are handled
+    by the block parser, not here.
+    """
+    text = text.strip()
+    if not text:
+        return ''
+    if text.startswith('[') and text.endswith(']'):
+        inner = text[1:-1].strip()
+        if not inner:
+            return []
+        items = []
+        for raw in re.split(r',\s*', inner):
+            s = raw.strip()
+            if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                s = s[1:-1]
+            items.append(s)
+        return items
+    if text.lower() in ('true', 'false'):
+        return text.lower() == 'true'
+    if text.lower() in ('null', 'none', '~'):
+        return None
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        return text[1:-1]
+    return text
+
+
+def _parse_md_profile_frontmatter(fm_text: str) -> dict:
+    """
+    Parse YAML frontmatter for an .md profile. Supports:
+      - scalar key: value
+      - inline list `key: [a, b]`
+      - block list:
+            key:
+              - item1
+              - item2
+      - nested mapping under a key:
+            requirement_levels:
+              shall: mandatory
+              should: recommended
+      - list of inline mappings (the vocabulary case):
+            vocabulary:
+              - use: medical device
+                reject: [product, unit]
+              - use: intended purpose
+                reject: [intended use]
+
+    Returns a plain dict. This is intentionally tiny - we don't pull in
+    PyYAML because mneme's existing parse_frontmatter is already a hand-
+    rolled mini-YAML and we want to stay dependency-free.
+    """
+    lines = fm_text.split('\n')
+    result: dict = {}
+    i = 0
+    n = len(lines)
+
+    def line_indent(s: str) -> int:
+        return len(s) - len(s.lstrip(' '))
+
+    while i < n:
+        line = lines[i]
+        if not line.strip() or line.lstrip().startswith('#'):
+            i += 1
+            continue
+        if ':' not in line:
+            i += 1
+            continue
+        indent = line_indent(line)
+        if indent != 0:
+            i += 1
+            continue
+        key, _, rest = line.strip().partition(':')
+        key = key.strip()
+        rest = rest.strip()
+
+        if rest:
+            # Scalar or inline list on the same line
+            result[key] = _parse_md_profile_frontmatter_value(rest)
+            i += 1
+            continue
+
+        # Block follow: peek ahead to decide list-of-dicts vs list-of-scalars vs nested map
+        i += 1
+        block_lines = []
+        while i < n and (not lines[i].strip() or line_indent(lines[i]) > 0):
+            block_lines.append(lines[i])
+            i += 1
+
+        if not block_lines:
+            result[key] = ''
+            continue
+
+        # Strip leading common indent
+        nonblank = [l for l in block_lines if l.strip()]
+        if not nonblank:
+            result[key] = ''
+            continue
+
+        first = nonblank[0]
+        if first.lstrip().startswith('-'):
+            # List under this key. Each "- foo" or "- key: value" starts a new item.
+            items = []
+            current_item = None
+            for bl in block_lines:
+                if not bl.strip():
+                    continue
+                stripped = bl.lstrip()
+                if stripped.startswith('-'):
+                    if current_item is not None:
+                        items.append(current_item)
+                    after_dash = stripped[1:].strip()
+                    if ':' in after_dash and not after_dash.startswith('['):
+                        # First field of a mapping item
+                        sub_k, _, sub_v = after_dash.partition(':')
+                        current_item = {sub_k.strip(): _parse_md_profile_frontmatter_value(sub_v)}
+                    else:
+                        # Plain scalar item like "- foo"
+                        items.append(_parse_md_profile_frontmatter_value(after_dash))
+                        current_item = None
+                else:
+                    # Continuation of the previous mapping item
+                    if current_item is None:
+                        continue
+                    if ':' in stripped:
+                        sub_k, _, sub_v = stripped.partition(':')
+                        current_item[sub_k.strip()] = _parse_md_profile_frontmatter_value(sub_v)
+            if current_item is not None:
+                items.append(current_item)
+            result[key] = items
+        else:
+            # Nested mapping. Each "key: value" indented under the parent.
+            nested: dict = {}
+            for bl in block_lines:
+                if not bl.strip():
+                    continue
+                stripped = bl.strip()
+                if ':' in stripped:
+                    sub_k, _, sub_v = stripped.partition(':')
+                    nested[sub_k.strip()] = _parse_md_profile_frontmatter_value(sub_v)
+            result[key] = nested
+
+    return result
+
+
+def _split_md_profile_body_by_h1(body: str) -> list[tuple[str, str]]:
+    """
+    Split a markdown body into a list of (heading_text, section_body) pairs,
+    one per top-level (#) heading. Lines before the first H1 are dropped.
+    """
+    sections = []
+    current_heading = None
+    current_lines: list[str] = []
+    for line in body.split('\n'):
+        m = re.match(r'^#\s+(.+?)\s*$', line)
+        if m:
+            if current_heading is not None:
+                sections.append((current_heading, '\n'.join(current_lines).strip('\n')))
+            current_heading = m.group(1).strip()
+            current_lines = []
+        else:
+            if current_heading is not None:
+                current_lines.append(line)
+    if current_heading is not None:
+        sections.append((current_heading, '\n'.join(current_lines).strip('\n')))
+    return sections
+
+
+def _parse_md_profile_bullets(text: str) -> list[str]:
+    """Extract `- foo` bullets from a block of text."""
+    items = []
+    for line in text.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('- '):
+            items.append(stripped[2:].strip())
+    return items
+
+
+def _parse_md_profile_terminology_table(text: str) -> list[dict]:
+    """
+    Parse a 3-column markdown table:
+        | Use | Instead of | Why |
+        |---|---|---|
+        | foo | bar, baz | rationale |
+    Returns a list of {use, instead_of: [...], rationale} dicts.
+    """
+    rows = []
+    in_table = False
+    for line in text.split('\n'):
+        s = line.strip()
+        if not s.startswith('|'):
+            continue
+        cells = [c.strip() for c in s.strip('|').split('|')]
+        if all(set(c) <= {'-', ':', ' '} for c in cells):
+            in_table = True
+            continue
+        if not in_table and any('use' in c.lower() and 'instead' not in c.lower() for c in cells):
+            # The header row (Use | Instead of | Why) - skip it
+            continue
+        if in_table and len(cells) >= 3:
+            use = cells[0]
+            instead = [s.strip() for s in cells[1].split(',') if s.strip()]
+            rationale = cells[2]
+            rows.append({'use': use, 'instead_of': instead, 'rationale': rationale})
+    return rows
+
+
+def _parse_md_profile_framing_block(text: str) -> dict:
+    """
+    Parse a Framing block. The body looks like:
+
+        **Wrong:**
+
+        > offending text...
+
+        **Correct:**
+
+        > replacement text...
+
+        **Why:** rationale...
+
+    Returns {wrong, correct, why}.
+    """
+    out = {'wrong': '', 'correct': '', 'why': ''}
+    # Find the three labeled blocks. Each label may be followed by a paragraph
+    # or a blockquote. We capture everything until the next label or EOF.
+    labels = [('wrong', r'\*\*Wrong:\*\*'),
+              ('correct', r'\*\*Correct:\*\*'),
+              ('why', r'\*\*Why:\*\*')]
+    label_pattern = '|'.join(p for _, p in labels)
+    parts = re.split(f'({label_pattern})', text)
+    # parts is alternating: [pre, label1, body1, label2, body2, ...]
+    current_key = None
+    for chunk in parts:
+        if not chunk:
+            continue
+        matched_key = None
+        for key, pat in labels:
+            if re.fullmatch(pat, chunk.strip()):
+                matched_key = key
+                break
+        if matched_key:
+            current_key = matched_key
+            continue
+        if current_key is not None:
+            # Strip blockquote markers and collapse whitespace
+            cleaned_lines = []
+            for line in chunk.split('\n'):
+                line = line.lstrip()
+                if line.startswith('>'):
+                    line = line[1:].lstrip()
+                cleaned_lines.append(line)
+            text_value = ' '.join(l for l in cleaned_lines if l).strip()
+            if text_value:
+                out[current_key] = (out[current_key] + ' ' + text_value).strip() if out[current_key] else text_value
+    return out
+
+
+def _parse_md_profile_doctype_body(body: str) -> tuple[str, dict]:
+    """
+    For a `# Document Type: <slug>` body, separate the description (everything
+    before the first `## Section:` heading) from the section_notes (everything
+    after, keyed by section slug).
+    """
+    description_lines = []
+    section_notes: dict = {}
+    current_section = None
+    current_lines: list[str] = []
+
+    for line in body.split('\n'):
+        m = re.match(r'^##\s+Section:\s*(.+?)\s*$', line, re.IGNORECASE)
+        if m:
+            if current_section is not None:
+                section_notes[current_section] = '\n'.join(current_lines).strip()
+            current_section = m.group(1).strip()
+            current_lines = []
+        elif current_section is not None:
+            current_lines.append(line)
+        else:
+            description_lines.append(line)
+
+    if current_section is not None:
+        section_notes[current_section] = '\n'.join(current_lines).strip()
+
+    description = '\n'.join(description_lines).strip()
+    return description, section_notes
+
+
+def _load_profile_from_md(path: str) -> dict:
+    """
+    Parse an .md profile file into the in-memory dict shape that the rest of
+    mneme already consumes (the same shape `harmonize`, `validate_writing_style`
+    etc. expect).
+
+    The .md format is documented above _parse_md_profile_frontmatter.
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # Use the existing simple parser to split frontmatter from body
+    fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n?(.*)$', content, re.DOTALL)
+    if not fm_match:
+        raise ValueError(
+            f'Profile {path} is missing a YAML frontmatter block (--- ... ---).'
+        )
+    fm_text = fm_match.group(1)
+    body = fm_match.group(2)
+
+    fm = _parse_md_profile_frontmatter(fm_text)
+
+    # Build the in-memory profile dict
+    profile: dict = {
+        'name': fm.get('name', ''),
+        'description': fm.get('description', ''),
+        'version': fm.get('version', ''),
+        'tone': fm.get('tone', ''),
+        'voice': fm.get('voice', ''),
+        'citation_style': fm.get('citation_style', ''),
+        'trace_types': fm.get('trace_types', []) or [],
+        'vocabulary': {
+            'preferred': [],
+            'requirement_levels': fm.get('requirement_levels', {}) or {},
+        },
+        'sections': {},
+        'writing_style': {},
+        'submission_checklist': [],
+    }
+
+    # Vocabulary: rename `use` -> `term` so harmonize sees the existing shape
+    raw_vocab = fm.get('vocabulary', []) or []
+    for entry in raw_vocab:
+        if not isinstance(entry, dict):
+            continue
+        term = entry.get('use') or entry.get('term') or ''
+        reject = entry.get('reject') or []
+        if isinstance(reject, str):
+            reject = [r.strip() for r in reject.split(',') if r.strip()]
+        if term:
+            profile['vocabulary']['preferred'].append({'term': term, 'reject': reject})
+
+    if 'placeholder_for_missing_refs' in fm:
+        profile.setdefault('writing_style', {})
+        profile['writing_style']['placeholder_for_missing_refs'] = fm['placeholder_for_missing_refs']
+
+    # Body sections
+    h1_sections = _split_md_profile_body_by_h1(body)
+    framing_examples: list[dict] = []
+
+    for heading, section_body in h1_sections:
+        h_lower = heading.lower().strip()
+
+        if h_lower == 'principles':
+            profile['writing_style']['principles'] = _parse_md_profile_bullets(section_body)
+        elif h_lower in ('general rules', 'general writing rules'):
+            profile['writing_style']['general_rules'] = _parse_md_profile_bullets(section_body)
+        elif h_lower in ('terminology', 'terminology guidance'):
+            profile['writing_style']['terminology_guidance'] = _parse_md_profile_terminology_table(section_body)
+        elif h_lower.startswith('framing:') or h_lower.startswith('framing -'):
+            context_label = heading.split(':', 1)[1].strip() if ':' in heading else heading.split('-', 1)[1].strip()
+            block = _parse_md_profile_framing_block(section_body)
+            entry = {'context': context_label}
+            entry.update(block)
+            framing_examples.append(entry)
+        elif h_lower.startswith('document type:') or h_lower.startswith('document type -'):
+            doc_type = heading.split(':', 1)[1].strip() if ':' in heading else heading.split('-', 1)[1].strip()
+            description, section_notes = _parse_md_profile_doctype_body(section_body)
+            profile['sections'][doc_type] = {
+                'description': description,
+                'section_notes': section_notes,
+            }
+        elif h_lower in ('submission checklist', 'checklist'):
+            profile['submission_checklist'] = _parse_md_profile_bullets(section_body)
+        # Unknown headings are silently ignored - they may be authoring notes
+
+    if framing_examples:
+        profile['writing_style']['framing_examples'] = framing_examples
+
+    return profile
+
+
 def load_profile(name: str) -> dict:
     """
-    Load a profile by name. Workspace profiles shadow bundled profiles
-    with the same name. See `_resolve_profile_path` for lookup order.
+    Load a profile by name. Workspace profiles shadow bundled profiles.
+    Profiles are markdown files; see `_load_profile_from_md` for the format.
     """
     path = _resolve_profile_path(name)
     if path is None:
         raise FileNotFoundError(
-            f'Profile not found: "{name}". Looked in '
+            f'Profile not found: "{name}.md". Looked in '
             f'{WORKSPACE_PROFILES_DIR} (workspace) and {PROFILES_DIR} (bundled).'
         )
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    return _load_profile_from_md(path)
 
 
 def get_active_profile() -> Optional[dict]:

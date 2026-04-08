@@ -219,34 +219,50 @@ Profiles are just JSON files in `<workspace>/profiles/`. **No reinstall, no rebu
 mneme new ~/projects/parkiwatch --name Parkiwatch --client parkiwatch
 cd ~/projects/parkiwatch
 
-# 2. Drop your profile in (use any text editor or this heredoc)
-cat > profiles/parkiwatch-qms.json <<'EOF'
-{
-  "name": "Parkiwatch QMS",
-  "description": "Internal quality framework for the Parkiwatch product line",
-  "version": "1.0",
-  "vocabulary": {
-    "preferred": [
-      { "term": "parking violation", "reject": ["parking ticket", "infraction"] },
-      { "term": "enforcement officer", "reject": ["meter maid", "warden"] }
-    ],
-    "requirement_levels": { "shall": "mandatory", "should": "recommended" }
-  },
-  "sections": {
-    "incident-report": {
-      "required": ["incident-id", "location", "timestamp", "evidence"],
-      "description": "Standard parking incident structure"
-    }
-  }
-}
+# 2. Drop your profile in (use any text editor or this heredoc).
+#    Profiles are markdown with YAML frontmatter.
+cat > profiles/parkiwatch-qms.md <<'EOF'
+---
+name: Parkiwatch QMS
+description: Internal quality framework for the Parkiwatch product line
+version: 1.0
+tone: formal
+voice: passive-for-procedures
+trace_types: [derived-from, implemented-by, verified-by]
+requirement_levels:
+  shall: mandatory
+  should: recommended
+vocabulary:
+  - use: parking violation
+    reject: [parking ticket, infraction]
+  - use: enforcement officer
+    reject: [meter maid, warden]
+---
+
+# Principles
+
+- Be specific. Cite the policy clause.
+- Auditable: every claim must trace to a controlled record.
+
+# Terminology
+
+| Use | Instead of | Why |
+|---|---|---|
+| parking violation | parking ticket, infraction | Internal Parkiwatch convention. |
+
+# Document Type: incident-report
+
+Standard parking incident structure used by all enforcement officers.
+
+## Section: evidence
+
+Photo evidence with timestamp and GPS coordinates is mandatory.
 EOF
 
 # 3. Activate and verify
 mneme profile set parkiwatch-qms
 mneme profile show
 #   Active profile: Parkiwatch QMS
-#     Vocabulary rules: 2
-#     Section templates: 1
 
 # 4. Use it
 mneme harmonize parkiwatch          # flag "parking ticket" -> should be "parking violation"
@@ -258,40 +274,43 @@ mneme validate writing-style parkiwatch/incident-001 > review.md  # paste into C
 
 When you run `mneme profile set <name>`, mneme looks in two places, in order:
 
-1. **First:** `<workspace>/profiles/<name>.json` (your local profile)
-2. **Then:** `<installed-mneme>/profiles/<name>.json` (the bundled `eu-mdr` / `iso-13485`)
+1. **First:** `<workspace>/profiles/<name>.md` (your local profile)
+2. **Then:** `<installed-mneme>/profiles/<name>.md` (the bundled `eu-mdr` / `iso-13485`)
 
 The first one wins. So you can:
 
-- **Add a brand-new framework** mneme doesn't ship -- just give it a unique name (e.g. `parkiwatch-qms.json`, `acme-internal.json`)
-- **Override a bundled framework** with project-specific tweaks -- create your own `eu-mdr.json` in the workspace and it shadows the bundled one for that project only
+- **Add a brand-new framework** mneme doesn't ship -- just give it a unique name (e.g. `parkiwatch-qms.md`, `acme-internal.md`)
+- **Override a bundled framework** with project-specific tweaks -- create your own `eu-mdr.md` in the workspace and it shadows the bundled one for that project only
 
-The same shadowing rule applies to CSV column mappings under `<workspace>/profiles/mappings/`, used by `mneme ingest-csv`.
+The same shadowing rule applies to CSV column mappings under `<workspace>/profiles/mappings/`, used by `mneme ingest-csv`. Mappings are still JSON because they are programmatic, not prose.
 
 If neither file exists, you get a clear error listing both paths it checked.
 
 ### What goes into a profile
 
-A profile is a JSON file. It carries **vocabulary rules** (mechanically enforced by `mneme harmonize`) and **writing-style guidance** (free-form prose consumed by an LLM agent via `mneme validate writing-style`).
+A profile is a markdown file with YAML frontmatter. The frontmatter carries the structured fields (`vocabulary`, `trace_types`, `tone`, etc.) and the body carries the writing-style prose under recognized H1 headings.
 
-| Field | What it does | Used by |
+| Frontmatter field | What it does | Used by |
 |---|---|---|
 | `name`, `description`, `version` | Display metadata | `mneme profile show` |
-| `vocabulary.preferred[].term` / `.reject[]` | Terminology swaps | `mneme harmonize` (mechanical) |
-| `vocabulary.requirement_levels` | Reserved words like `shall`, `should`, `may` | Documentation |
-| `sections.<doc-type>.description` | Per-document-type description | `mneme profile show` |
-| `sections.<doc-type>.section_notes` | Per-section prose guidance for an LLM agent | `mneme validate writing-style` |
-| `writing_style.principles` | High-level principles (e.g. "reproducibility", "technical not clinical") | `mneme validate writing-style` |
-| `writing_style.general_rules` | Cross-cutting writing rules | `mneme validate writing-style` |
-| `writing_style.terminology_guidance` | Phrase-level use-this/instead-of/why | `mneme validate writing-style` |
-| `writing_style.framing_examples` | Worked correct/incorrect pairs with rationale | `mneme validate writing-style` |
-| `submission_checklist` | Pre-submission go/no-go items | `mneme validate writing-style` + reviewer |
+| `vocabulary[].use` / `.reject[]` | Terminology swaps | `mneme harmonize` (mechanical) |
+| `requirement_levels` | Reserved words (`shall`, `should`, `may`) | Documentation |
 | `trace_types` | Allowed relationship types for trace links | Documentation |
 | `tone`, `voice`, `citation_style` | Style hints | `mneme profile show` |
+| `placeholder_for_missing_refs` | Marker token (e.g. `[TO ADD REF]`) | LLM agent |
 
-**Important:** profiles do NOT enforce a list of required headings. Mechanical heading checks were removed in v0.4.0 because they don't reflect what regulatory reviewers actually care about. Instead, use `mneme validate writing-style <page>` to build a review packet that an LLM agent grades against the full style guide.
+| Body H1 heading | What it becomes |
+|---|---|
+| `# Principles` | Top-level principles (bullets) |
+| `# General Rules` | Cross-cutting writing rules (bullets) |
+| `# Terminology` | A 3-column markdown table: Use / Instead of / Why |
+| `# Framing: <context>` | One worked example: **Wrong:** / **Correct:** / **Why:** blocks |
+| `# Document Type: <slug>` | A document type description; nested `## Section: <slug>` blocks become per-section guidance |
+| `# Submission Checklist` | Pre-submission go/no-go items (bullets) |
 
-See `EXAMPLES.md` Example 13 for a full walkthrough with a real Parkiwatch scenario, and copy a bundled profile (`eu-mdr.json`, `iso-13485.json`) from the installed package as a starting template.
+**Important:** profiles do NOT enforce a list of required headings. Mechanical heading checks were removed because they don't reflect what regulatory reviewers actually care about. Instead, use `mneme validate writing-style <page>` to build a review packet that an LLM agent grades against the full style guide.
+
+See `EXAMPLES.md` Example 13 for a full walkthrough with a real Parkiwatch scenario. The bundled `eu-mdr.md` and `iso-13485.md` profiles inside the installed package are good starting templates -- copy one and edit it.
 
 ---
 

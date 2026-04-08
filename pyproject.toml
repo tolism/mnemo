@@ -62,7 +62,7 @@ version = { attr = "mneme.__version__" }
 [tool.setuptools.package-data]
 mneme = [
     "ui.html",
-    "profiles/*.json",
+    "profiles/*.md",
     "profiles/mappings/*.json",
     "templates/workspace/**/*",
     "templates/workspace/**/.gitignore",
