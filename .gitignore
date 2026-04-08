@@ -30,3 +30,6 @@ mneme_cli.egg-info/
 # Virtualenvs
 .venv/
 venv/
+
+# Claude Code per-user state (not source)
+.claude/
