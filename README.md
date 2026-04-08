@@ -199,6 +199,92 @@ Sync the workspace via Dropbox, iCloud, or git and you have multi-device Obsidia
 
 ---
 
+## Profiles (and custom profiles)
+
+A profile defines the vocabulary and document structure rules for a regulatory framework. mneme ships two bundled profiles:
+
+| Profile | Use when |
+|---|---|
+| `eu-mdr` | EU Medical Device Regulation (2017/745) -- 15 vocabulary rules, 6 section templates |
+| `iso-13485` | ISO 13485:2016 QMS -- 13 vocabulary rules, 6 section templates |
+
+Activate one in any workspace with `mneme profile set eu-mdr`. From then on, `mneme harmonize`, `mneme validate structure`, and `mneme validate consistency` enforce its rules.
+
+### Adding your own profile
+
+Profiles are just JSON files in `<workspace>/profiles/`. **No reinstall, no rebuild, no PR to mneme.** Drop a file in, activate it, you're done.
+
+```bash
+# 1. mneme new already creates the profiles/ folder for you
+mneme new ~/projects/parkiwatch --name Parkiwatch --client parkiwatch
+cd ~/projects/parkiwatch
+
+# 2. Drop your profile in (use any text editor or this heredoc)
+cat > profiles/parkiwatch-qms.json <<'EOF'
+{
+  "name": "Parkiwatch QMS",
+  "description": "Internal quality framework for the Parkiwatch product line",
+  "version": "1.0",
+  "vocabulary": {
+    "preferred": [
+      { "term": "parking violation", "reject": ["parking ticket", "infraction"] },
+      { "term": "enforcement officer", "reject": ["meter maid", "warden"] }
+    ],
+    "requirement_levels": { "shall": "mandatory", "should": "recommended" }
+  },
+  "sections": {
+    "incident-report": {
+      "required": ["incident-id", "location", "timestamp", "evidence"],
+      "description": "Standard parking incident structure"
+    }
+  }
+}
+EOF
+
+# 3. Activate and verify
+mneme profile set parkiwatch-qms
+mneme profile show
+#   Active profile: Parkiwatch QMS
+#     Vocabulary rules: 2
+#     Section templates: 1
+
+# 4. Use it
+mneme harmonize parkiwatch          # flag "parking ticket" -> should be "parking violation"
+mneme harmonize parkiwatch --fix    # auto-fix vocabulary
+mneme validate structure parkiwatch/incident-001
+```
+
+### How resolution works
+
+When you run `mneme profile set <name>`, mneme looks in two places, in order:
+
+1. **First:** `<workspace>/profiles/<name>.json` (your local profile)
+2. **Then:** `<installed-mneme>/profiles/<name>.json` (the bundled `eu-mdr` / `iso-13485`)
+
+The first one wins. So you can:
+
+- **Add a brand-new framework** mneme doesn't ship -- just give it a unique name (e.g. `parkiwatch-qms.json`, `acme-internal.json`)
+- **Override a bundled framework** with project-specific tweaks -- create your own `eu-mdr.json` in the workspace and it shadows the bundled one for that project only
+
+The same shadowing rule applies to CSV column mappings under `<workspace>/profiles/mappings/`, used by `mneme ingest-csv`.
+
+If neither file exists, you get a clear error listing both paths it checked.
+
+### What goes into a profile
+
+| Field | What it does | Used by |
+|---|---|---|
+| `name`, `description`, `version` | Display metadata | `mneme profile show` |
+| `vocabulary.preferred[].term` / `.reject[]` | Terminology rules | `mneme harmonize` |
+| `vocabulary.requirement_levels` | Reserved words like `shall`, `should`, `may` | Documentation |
+| `sections.<doc-type>.required` | Required section names per document type | `mneme validate structure` |
+| `trace_types` | Allowed relationship types for trace links | Documentation |
+| `tone`, `voice`, `citation_style` | Style hints | `mneme profile show` |
+
+See `EXAMPLES.md` Example 13 for a full walkthrough with a real Parkiwatch scenario, and copy a bundled profile (`eu-mdr.json`, `iso-13485.json`) from the installed package as a starting template.
+
+---
+
 ## Web Dashboard
 
 `python -m mneme.server` -- opens at `http://localhost:3141`
