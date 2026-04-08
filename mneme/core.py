@@ -93,6 +93,8 @@ from .config import (
     TEMPLATES_DIR,
     TRACEABILITY_FILE,
     WIKI_DIR,
+    WORKSPACE_MAPPINGS_DIR,
+    WORKSPACE_PROFILES_DIR,
 )
 
 
@@ -2515,11 +2517,31 @@ def tornado(client_slug: str = None, dry_run: bool = False, apply_profile: bool 
 MAPPINGS_DIR = os.path.join(PROFILES_DIR, 'mappings')
 
 
+def _resolve_mapping_path(name: str) -> Optional[str]:
+    """
+    Resolve a CSV mapping name to a JSON path.
+
+    Workspace mappings (WORKSPACE_DIR/profiles/mappings/) shadow bundled
+    mappings (PACKAGE_DIR/profiles/mappings/) with the same name, mirroring
+    profile resolution.
+    """
+    workspace_path = os.path.join(WORKSPACE_MAPPINGS_DIR, f'{name}.json')
+    if os.path.exists(workspace_path):
+        return workspace_path
+    bundled_path = os.path.join(MAPPINGS_DIR, f'{name}.json')
+    if os.path.exists(bundled_path):
+        return bundled_path
+    return None
+
+
 def _load_csv_mapping(name: str) -> dict:
-    """Load a CSV mapping template from profiles/mappings/{name}.json."""
-    path = os.path.join(MAPPINGS_DIR, f'{name}.json')
-    if not os.path.exists(path):
-        raise FileNotFoundError(f'Mapping not found: {path}')
+    """Load a CSV mapping template, workspace shadows bundled."""
+    path = _resolve_mapping_path(name)
+    if path is None:
+        raise FileNotFoundError(
+            f'Mapping not found: "{name}". Looked in '
+            f'{WORKSPACE_MAPPINGS_DIR} (workspace) and {MAPPINGS_DIR} (bundled).'
+        )
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
@@ -2546,19 +2568,29 @@ def _detect_csv_mapping(headers: list[str]) -> str | None:
     Returns None if no mapping reaches the threshold (caller should fall back
     to requiring an explicit --mapping argument).
     """
-    if not os.path.exists(MAPPINGS_DIR):
-        return None
-
     headers_lower = {h.lower().strip() for h in headers}
+
+    # Build a name -> path map. Workspace mappings take precedence over
+    # bundled mappings with the same name.
+    candidates: dict[str, str] = {}
+    if os.path.exists(MAPPINGS_DIR):
+        for fname in os.listdir(MAPPINGS_DIR):
+            if fname.endswith('.json'):
+                candidates[fname[:-5]] = os.path.join(MAPPINGS_DIR, fname)
+    if os.path.exists(WORKSPACE_MAPPINGS_DIR):
+        for fname in os.listdir(WORKSPACE_MAPPINGS_DIR):
+            if fname.endswith('.json'):
+                candidates[fname[:-5]] = os.path.join(WORKSPACE_MAPPINGS_DIR, fname)
+
+    if not candidates:
+        return None
 
     best_name = None
     best_score = (-1, -1)
 
-    for fname in os.listdir(MAPPINGS_DIR):
-        if not fname.endswith('.json'):
-            continue
+    for name, path in candidates.items():
         try:
-            with open(os.path.join(MAPPINGS_DIR, fname), 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 mapping = json.load(f)
         except Exception:
             continue
@@ -2575,7 +2607,7 @@ def _detect_csv_mapping(headers: list[str]) -> str | None:
         score = (column_score, detect_score)
         if score > best_score:
             best_score = score
-            best_name = fname[:-5]  # strip .json
+            best_name = name
 
     if best_score[0] + best_score[1] >= 2:
         return best_name
@@ -3291,15 +3323,39 @@ def export_client(client_slug: str, format: str = 'json') -> str:
     return out_file
 
 
+def _resolve_profile_path(name: str) -> Optional[str]:
+    """
+    Resolve a profile name to a JSON path.
+
+    Lookup order (workspace shadows bundled, so a project can override an
+    industry profile with a project-specific tweak):
+
+      1. {WORKSPACE_DIR}/profiles/{name}.json   (per-project, not packaged)
+      2. {PACKAGE_DIR}/profiles/{name}.json     (bundled with mneme)
+
+    Returns the absolute path to the JSON file, or None if neither exists.
+    """
+    workspace_path = os.path.join(WORKSPACE_PROFILES_DIR, f'{name}.json')
+    if os.path.exists(workspace_path):
+        return workspace_path
+    bundled_path = os.path.join(PROFILES_DIR, f'{name}.json')
+    if os.path.exists(bundled_path):
+        return bundled_path
+    return None
+
+
 def load_profile(name: str) -> dict:
     """
-    Load a profile from profiles/{name}.json and return the parsed dict.
+    Load a profile by name. Workspace profiles shadow bundled profiles
+    with the same name. See `_resolve_profile_path` for lookup order.
     """
-    profile_path = os.path.join(PROFILES_DIR, f'{name}.json')
-    if not os.path.exists(profile_path):
-        raise FileNotFoundError(f'Profile not found: {profile_path}')
-
-    with open(profile_path, 'r') as f:
+    path = _resolve_profile_path(name)
+    if path is None:
+        raise FileNotFoundError(
+            f'Profile not found: "{name}". Looked in '
+            f'{WORKSPACE_PROFILES_DIR} (workspace) and {PROFILES_DIR} (bundled).'
+        )
+    with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
@@ -3328,13 +3384,18 @@ def get_active_profile() -> Optional[dict]:
 
 def set_active_profile(name: str) -> None:
     """
-    Write the profile name to .mneme-profile to set it as active.
-    """
-    profile_path = os.path.join(PROFILES_DIR, f'{name}.json')
-    if not os.path.exists(profile_path):
-        raise FileNotFoundError(f'Profile not found: {profile_path}')
+    Set the active profile for this workspace.
 
-    with open(ACTIVE_PROFILE_FILE, 'w') as f:
+    Accepts either a workspace-local profile (in {workspace}/profiles/)
+    or a bundled profile (in the package). The profile must exist before
+    it can be activated.
+    """
+    if _resolve_profile_path(name) is None:
+        raise FileNotFoundError(
+            f'Profile not found: "{name}". Looked in '
+            f'{WORKSPACE_PROFILES_DIR} (workspace) and {PROFILES_DIR} (bundled).'
+        )
+    with open(ACTIVE_PROFILE_FILE, 'w', encoding='utf-8') as f:
         f.write(name + '\n')
 
 
@@ -4200,7 +4261,7 @@ def _apply_workspace_override(workspace: str) -> None:
         'ACTIVE_PROFILE_FILE', 'BASE_DIR', 'INDEX_FILE', 'LOG_FILE',
         'MASTER_MV2', 'MEMVID_DIR', 'PER_CLIENT_DIR', 'PROFILES_DIR',
         'SCHEMA_DIR', 'SOURCES_DIR', 'TEMPLATES_DIR', 'TRACEABILITY_FILE',
-        'WIKI_DIR',
+        'WIKI_DIR', 'WORKSPACE_PROFILES_DIR', 'WORKSPACE_MAPPINGS_DIR',
     ):
         if hasattr(_cfg, name):
             g[name] = getattr(_cfg, name)

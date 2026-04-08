@@ -237,3 +237,145 @@ class TestValidateConsistency:
         result = validate_consistency('demo')
         assert result['total_issues'] == 0
         assert result['standard_inconsistencies'] == []
+
+
+# ---------------------------------------------------------------------------
+# Workspace-local profiles (added in v0.4.0+)
+# ---------------------------------------------------------------------------
+
+class TestWorkspaceProfiles:
+    """
+    Profiles dropped at {workspace}/profiles/{name}.json should be loadable
+    by name AND should shadow bundled profiles with the same name.
+    """
+
+    def _write_profile(self, workspace, name, data):
+        """Drop a JSON profile into the workspace's profiles/ directory."""
+        d = os.path.join(workspace, 'profiles')
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f'{name}.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        return path
+
+    def test_load_workspace_only_profile(self, temp_workspace):
+        # A profile that doesn't exist in the bundled set
+        self._write_profile(temp_workspace, 'parkiwatch', {
+            'name': 'ParkiWatch QMS',
+            'description': 'Internal parkiwatch QMS profile',
+            'version': '1.0',
+            'vocabulary': {'preferred': [], 'requirement_levels': {}},
+            'sections': {},
+        })
+        profile = load_profile('parkiwatch')
+        assert profile['name'] == 'ParkiWatch QMS'
+
+    def test_workspace_profile_shadows_bundled(self, temp_workspace):
+        # Override the bundled eu-mdr profile with a workspace variant
+        self._write_profile(temp_workspace, 'eu-mdr', {
+            'name': 'CUSTOM EU MDR',
+            'description': 'workspace override for testing',
+            'version': '999',
+            'vocabulary': {'preferred': [], 'requirement_levels': {}},
+            'sections': {},
+        })
+        profile = load_profile('eu-mdr')
+        assert profile['name'] == 'CUSTOM EU MDR'
+        assert profile['version'] == '999'
+
+    def test_bundled_still_loads_when_no_workspace_override(self, temp_workspace):
+        # No workspace profile -> bundled is returned
+        profile = load_profile('eu-mdr')
+        assert profile['name'] != 'CUSTOM EU MDR'
+        assert 'EU MDR' in profile['name']
+
+    def test_set_active_accepts_workspace_profile(self, temp_workspace):
+        self._write_profile(temp_workspace, 'parkiwatch', {
+            'name': 'ParkiWatch QMS',
+            'description': '',
+            'version': '1.0',
+            'vocabulary': {'preferred': [], 'requirement_levels': {}},
+            'sections': {},
+        })
+        # Should not raise
+        set_active_profile('parkiwatch')
+        active = get_active_profile()
+        assert active is not None
+        assert active['name'] == 'ParkiWatch QMS'
+
+    def test_set_active_rejects_truly_unknown(self, temp_workspace):
+        with pytest.raises(FileNotFoundError):
+            set_active_profile('does-not-exist-anywhere')
+
+    def test_load_unknown_profile_error_lists_both_paths(self, temp_workspace):
+        # The error should mention both lookup locations so users can debug
+        with pytest.raises(FileNotFoundError) as exc_info:
+            load_profile('totally-bogus-profile')
+        msg = str(exc_info.value)
+        assert 'workspace' in msg
+        assert 'bundled' in msg
+
+
+class TestWorkspaceCsvMappings:
+    """
+    Workspace-local CSV mappings should also resolve from
+    {workspace}/profiles/mappings/{name}.json and shadow bundled ones.
+    """
+
+    def _write_mapping(self, workspace, name, data):
+        d = os.path.join(workspace, 'profiles', 'mappings')
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f'{name}.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        return path
+
+    def test_load_workspace_only_mapping(self, temp_workspace):
+        from mneme.core import _load_csv_mapping
+        self._write_mapping(temp_workspace, 'parkiwatch-incidents', {
+            'name': 'Parkiwatch Incidents Import',
+            'description': 'Maps incident-tracker CSVs',
+            'page_type': 'incident',
+            'id_column': 'Ticket',
+            'title_column': 'Summary',
+            'detect_headers': ['parkiwatch incident'],
+            'mapping': {
+                'Ticket': 'frontmatter.id',
+                'Summary': 'frontmatter.title',
+            },
+        })
+        mapping = _load_csv_mapping('parkiwatch-incidents')
+        assert mapping['name'] == 'Parkiwatch Incidents Import'
+
+    def test_workspace_mapping_shadows_bundled(self, temp_workspace):
+        from mneme.core import _load_csv_mapping
+        self._write_mapping(temp_workspace, 'user-needs', {
+            'name': 'CUSTOM user-needs',
+            'description': '',
+            'page_type': 'user-need',
+            'id_column': 'ID',
+            'title_column': 'Title',
+            'detect_headers': [],
+            'mapping': {},
+        })
+        mapping = _load_csv_mapping('user-needs')
+        assert mapping['name'] == 'CUSTOM user-needs'
+
+    def test_detect_csv_mapping_finds_workspace_mapping(self, temp_workspace):
+        from mneme.core import _detect_csv_mapping
+        self._write_mapping(temp_workspace, 'parkiwatch-incidents', {
+            'name': 'Parkiwatch Incidents',
+            'description': '',
+            'page_type': 'incident',
+            'id_column': 'Ticket',
+            'title_column': 'Summary',
+            'detect_headers': ['parkiwatch incident', 'incident-id'],
+            'mapping': {
+                'Ticket': 'frontmatter.id',
+                'Summary': 'frontmatter.title',
+                'Severity': 'body.severity',
+                'Reporter': 'body.reporter',
+            },
+        })
+        result = _detect_csv_mapping(['Ticket', 'Summary', 'Severity', 'Reporter'])
+        assert result == 'parkiwatch-incidents'

@@ -65,6 +65,15 @@
 | `eu-mdr` | EU Medical Device Regulation (2017/745) -- 15 vocabulary rules, 6 section templates |
 | `iso-13485` | ISO 13485:2016 QMS for Medical Devices -- 13 vocabulary rules, 6 section templates |
 
+### Workspace-local Profiles (v0.4.0+)
+
+Drop a `<name>.json` file into `{workspace}/profiles/` and it becomes available
+to `mneme profile set`, `harmonize`, and `validate structure`. Workspace profiles
+**shadow** any bundled profile with the same name, so a project can override
+an industry profile with project-specific tweaks. The same applies to CSV
+column mappings under `{workspace}/profiles/mappings/`. `mneme new` scaffolds
+the directory automatically.
+
 ### Traceability Chains Supported
 
 ```

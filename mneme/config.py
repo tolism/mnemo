@@ -63,6 +63,12 @@ TEMPLATES_DIR = os.path.join(WIKI_DIR, '_templates')
 TRACEABILITY_FILE = os.path.join(SCHEMA_DIR, 'traceability.json')
 ACTIVE_PROFILE_FILE = os.path.join(WORKSPACE_DIR, '.mneme-profile')
 
+# Workspace-local profile overrides. Profiles dropped here shadow the bundled
+# ones with the same name. Per-project frameworks (e.g. an internal QMS variant)
+# go here so they don't need to be packaged with mneme.
+WORKSPACE_PROFILES_DIR = os.path.join(WORKSPACE_DIR, 'profiles')
+WORKSPACE_MAPPINGS_DIR = os.path.join(WORKSPACE_PROFILES_DIR, 'mappings')
+
 
 # ---------------------------------------------------------------------------
 # Tunables
