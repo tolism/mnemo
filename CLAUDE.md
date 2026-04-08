@@ -12,7 +12,7 @@ Every question answered here stays answered. Every source ingested compounds int
 
 ### Layer 1: Sources (Read-Only)
 
-Location: `mnemo/sources/`
+Location: `mneme/sources/`
 
 Rule: IMMUTABLE. Never modify source files. They are evidence.
 
@@ -30,7 +30,7 @@ sources/
 
 ### Layer 2: Wiki (LLM-Owned)
 
-Location: `mnemo/wiki/`
+Location: `mneme/wiki/`
 
 Rule: LLM agents create and maintain all content. Humans browse and curate.
 
@@ -44,7 +44,7 @@ wiki/
 
 ### Layer 3: Schema (Machine-Readable)
 
-Location: `mnemo/schema/`
+Location: `mneme/schema/`
 
 Files:
 - `entities.json` - All named entities (companies, people, products, technologies)
@@ -53,7 +53,7 @@ Files:
 
 Rule: Updated by wiki agent after every ingest operation. Schema must stay in sync with wiki content at all times.
 
-Note: `graph.json` and `tags.json` are populated by mnemo's entity extraction during ingest. They start as empty structures and grow with each ingested source. Do not expect them to be pre-populated.
+Note: `graph.json` and `tags.json` are populated by mneme's entity extraction during ingest. They start as empty structures and grow with each ingested source. Do not expect them to be pre-populated.
 
 ---
 
@@ -117,7 +117,7 @@ confidence: [high|medium|low]
 Frontmatter field rules:
 - `type`: Must match one of the six defined page types
 - `client`: Use the slug from Client Directories section below. Use `_shared` for cross-client pages
-- `sources`: Relative paths from `mnemo/` root
+- `sources`: Relative paths from `mneme/` root
 - `confidence`: Set to `low` if based on a single source or unverified claim. Explain why in the page body.
 - `updated`: Agents must update this field on every edit
 
@@ -147,7 +147,7 @@ Each directory under `wiki/` represents one engagement.
 | `example-client` | Your Client Name | Your domain | Active |
 | `_shared` | Shared cross-client knowledge | - | Always active |
 
-Add your own clients by creating directories under wiki/ and running `mnemo init --clients your-client-name`
+Add your own clients by creating directories under wiki/ and running `mneme init --clients your-client-name`
 
 Adding a new client manually:
 1. Create directory `wiki/[slug]/`

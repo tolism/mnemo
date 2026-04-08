@@ -1,12 +1,12 @@
 # CODER.md - Developer Guide for Mnemosyne
 
-This is the engineering reference for anyone building on or extending mnemo. Read this before writing code.
+This is the engineering reference for anyone building on or extending mneme. Read this before writing code.
 
 ---
 
 ## Architecture Overview
 
-Mnemo is a CLI tool that creates a dual-layer knowledge base from source documents:
+Mneme is a CLI tool that creates a dual-layer knowledge base from source documents:
 - **Wiki layer** -- human-readable markdown pages in `wiki/`
 - **Memvid layer** -- machine-searchable `.mv2` archive in `memvid/`
 - **Schema layer** -- structured JSON in `schema/` (entities, graph, tags, traceability)
@@ -16,7 +16,7 @@ The downstream consumer is a QMS (Quality Management System) application for med
 ### File Map
 
 ```
-mnemo/
+mneme/
   core.py             <- ALL business logic (4200+ lines, needs splitting -- see Architecture Debt)
   config.py           <- Constants: paths, chunk sizes, stopwords
   server.py           <- Web UI server (localhost:3141)
@@ -177,12 +177,12 @@ Create `profiles/mappings/{name}.json`:
 
 ### Auto-detection
 
-`detect_headers` is a list of keywords. When `mnemo ingest-csv` is called without `--mapping`, it scores each mapping by how many `detect_headers` keywords appear in the CSV column names. The mapping with the highest score (minimum 2 matches) wins.
+`detect_headers` is a list of keywords. When `mneme ingest-csv` is called without `--mapping`, it scores each mapping by how many `detect_headers` keywords appear in the CSV column names. The mapping with the highest score (minimum 2 matches) wins.
 
 ### Step 2: Test it
 
 ```bash
-mnemo ingest-csv my-data.csv my-client --mapping my-mapping --dry-run
+mneme ingest-csv my-data.csv my-client --mapping my-mapping --dry-run
 ```
 
 ---
@@ -222,14 +222,14 @@ Create `profiles/{name}.json`:
 Then activate it:
 
 ```bash
-mnemo profile set my-profile
-mnemo profile show
+mneme profile set my-profile
+mneme profile show
 ```
 
 The profile is used by:
-- `mnemo harmonize` -- checks vocabulary rules
-- `mnemo validate structure` -- checks required sections
-- `mnemo lint` -- can integrate with profile checks
+- `mneme harmonize` -- checks vocabulary rules
+- `mneme validate structure` -- checks required sections
+- `mneme lint` -- can integrate with profile checks
 
 ---
 
@@ -357,7 +357,7 @@ try:
     with _memvid_locked(MASTER_MV2, mode='open') as master:
         result = master.find(query, k=k)
 except Exception as e:
-    print(f'[mnemo] memvid error: {e}', file=sys.stderr)
+    print(f'[mneme] memvid error: {e}', file=sys.stderr)
 ```
 
 Never assume memvid is installed. Always check `MEMVID_AVAILABLE` first.
@@ -403,7 +403,7 @@ These are absolute:
 When core.py is split, the target structure is:
 
 ```
-mnemo/
+mneme/
   __init__.py
   cli.py          <- main(), argparse, print functions
   ingest.py       <- ingest_source_to_both, ingest_dir, ingest_csv, tornado
@@ -442,5 +442,5 @@ When adding tests for new functions, follow the existing pattern in `tests/test_
 - **Python:** 3.9+
 - **Dependencies:** memvid-sdk (optional), portalocker, pymupdf (optional for PDF)
 - **Install:** `uv venv && source .venv/bin/activate && uv pip install -e .`
-- **CLI entry point:** `mnemo` (via pyproject.toml `[project.scripts]`)
+- **CLI entry point:** `mneme` (via pyproject.toml `[project.scripts]`)
 - **Web UI:** `python3 server.py` on port 3141

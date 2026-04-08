@@ -1,0 +1,8 @@
+memvid/*.mv2
+memvid/per-client/
+memvid/.sync-manifest.json
+exports/
+snapshots/
+__pycache__/
+*.pyc
+.DS_Store

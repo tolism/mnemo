@@ -1,7 +1,24 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python core.py demo clean --dry-run)"
+      "Bash(python core.py demo clean --dry-run)",
+      "Bash(ls -d */)",
+      "Read(//c/tmp/**)",
+      "Bash(rm -rf mnemo_test)",
+      "Bash(mkdir mnemo_test)",
+      "Bash(python -m mnemo --workspace /tmp/mnemo_test --help)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import mnemo; print\\(mnemo.__version__\\); from mnemo import core; print\\('core ok'\\)\")",
+      "Bash(PYTHONPATH=. python -m mnemo --help)",
+      "Bash(rm -rf /tmp/mnemo_test)",
+      "Bash(mkdir -p /tmp/mnemo_test)",
+      "Bash(PYTHONPATH=. python -m mnemo --workspace /tmp/mnemo_test stats)",
+      "Bash(rm -rf /tmp/parkiwatch)",
+      "Bash(PYTHONPATH=. python -m mnemo new /tmp/parkiwatch --name \"ParkiWatch\" --client parkiwatch --profile iso-13485 --description \"Parking monitoring backend\")",
+      "Bash(chmod +x scripts/release.sh)",
+      "Bash(PYTHONPATH=. python -m mnemo --version)",
+      "Bash(PYTHONPATH=. python -c \"import sys; sys.path.insert\\(0, '.'\\); import mnemo; print\\('pkg:', mnemo.__version__\\)\")",
+      "Bash(git mv:*)",
+      "Bash(PYTHONPATH=. python -m mneme --version)"
     ]
   }
 }

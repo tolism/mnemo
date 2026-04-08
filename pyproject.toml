@@ -3,27 +3,32 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mnemo"
-version = "0.3.3"
+name = "mneme-cli"
+dynamic = ["version"]
 description = "Mnemosyne - CLI tool that turns documents into a searchable second brain. Ingest once, query forever."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
-    { name = "Tashi" },
+    { name = "Tolis Moustaklis", email = "apostolos.moustaklis@gmail.com" },
 ]
-keywords = ["knowledge-management", "second-brain", "cli", "wiki", "memvid", "llm", "qms"]
+keywords = ["knowledge-management", "second-brain", "cli", "wiki", "memvid", "llm", "qms", "obsidian", "traceability"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Documentation",
+    "Topic :: Office/Business",
+    "Topic :: Scientific/Engineering :: Information Analysis",
     "Topic :: Text Processing :: Markup :: Markdown",
 ]
 dependencies = [
@@ -34,17 +39,35 @@ dependencies = [
 [project.optional-dependencies]
 pdf = ["pymupdf>=1.23.0"]
 all = ["pymupdf>=1.23.0"]
+release = [
+    "build>=1.0.0",
+    "twine>=5.0.0",
+]
 
 [project.urls]
-Homepage = "https://github.com/tolism/mnemo"
-Repository = "https://github.com/tolism/mnemo"
-Issues = "https://github.com/tolism/mnemo/issues"
+Homepage = "https://github.com/tolism/mneme-cli"
+Repository = "https://github.com/tolism/mneme-cli"
+Issues = "https://github.com/tolism/mneme-cli/issues"
+Documentation = "https://github.com/tolism/mneme-cli#readme"
+Changelog = "https://github.com/tolism/mneme-cli/blob/main/CHANGELOG.md"
 
 [project.scripts]
-mnemo = "core:main"
+mneme = "mneme.core:main"
 
 [tool.setuptools]
-py-modules = ["core", "config", "server"]
+packages = ["mneme"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mneme.__version__" }
+
+[tool.setuptools.package-data]
+mneme = [
+    "ui.html",
+    "profiles/*.json",
+    "profiles/mappings/*.json",
+    "templates/workspace/**/*",
+    "templates/workspace/**/.gitignore",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

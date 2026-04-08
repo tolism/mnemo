@@ -17,17 +17,17 @@ import shutil
 import subprocess
 import sys
 
-# Ensure core module is importable from the tests/ directory
+# Ensure the package is importable from the tests/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core import (
+from mneme.core import (
     _content_hash,
     _sanitize_memvid_query,
     _title_from_slug,
     chunk_body,
     parse_frontmatter,
 )
-from config import MAX_CHUNK_SIZE, MIN_CHUNK_SIZE
+from mneme.config import MAX_CHUNK_SIZE, MIN_CHUNK_SIZE
 
 # ---------------------------------------------------------------------------
 # Category 1: Parsing (pure functions, no I/O)
@@ -326,8 +326,8 @@ BRIDGE_DIR = os.path.join(os.path.dirname(__file__), '..')
 
 
 def _run_mnemo(*args):
-    """Run core.py with args from the mnemo directory."""
-    cmd = [sys.executable, 'core.py'] + list(args)
+    """Run the mneme CLI via `python -m mneme` from the project root."""
+    cmd = [sys.executable, '-m', 'mneme'] + list(args)
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -448,7 +448,7 @@ class TestCLI:
 _KE_BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 _TEST_CLIENT = 'pytest-int-test'
 # Use a fixed unique filename unlikely to clash with any real source
-_TEST_SOURCE_SLUG = 'pytest-mnemo-ingest-test-fixture'
+_TEST_SOURCE_SLUG = 'pytest-mneme-ingest-test-fixture'
 _TEST_FILE = f'/tmp/{_TEST_SOURCE_SLUG}.md'
 
 

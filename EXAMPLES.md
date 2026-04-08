@@ -1,6 +1,6 @@
 # EXAMPLES.md - Mnemosyne Usage Guide
 
-Real-world workflows, core concepts, and entity types used in mnemo.
+Real-world workflows, core concepts, and entity types used in mneme.
 
 ---
 
@@ -10,7 +10,7 @@ Real-world workflows, core concepts, and entity types used in mnemo.
 
 A second brain is a persistent, searchable knowledge layer that sits between you and your documents. You feed it raw information once. From that point, you query it instead of re-reading source files. Knowledge compounds instead of decaying.
 
-Mnemo is the CLI tool that builds and maintains this second brain.
+Mneme is the CLI tool that builds and maintains this second brain.
 
 ### The Three Layers
 
@@ -103,20 +103,37 @@ Example vocabulary enforcement:
 You're building a medical device. You need to set up documentation that satisfies EU MDR.
 
 ```bash
-# Step 1: Initialize
-mnemo init --project "CardioMonitor" --clients "cardio-monitor"
+# Step 1: Scaffold a fresh workspace with the profile baked in
+mneme new ~/projects/cardio-monitor \
+  --name "CardioMonitor" \
+  --client cardio-monitor \
+  --profile eu-mdr \
+  --description "Implantable cardiac monitor - EU MDR technical file"
 
-# Step 2: Activate the EU MDR profile
-mnemo profile set eu-mdr
-mnemo profile show
+cd ~/projects/cardio-monitor
+
+# Step 2: Verify the profile is active
+mneme profile show
 #   Active profile: EU MDR
 #   Vocabulary rules: 15
 #   Section templates: 6
 
 # Step 3: Check what you have
-mnemo status
+mneme status
 #   Sources: 0
 #   Wiki pages: 0
+
+# Step 4 (optional): put it under version control
+git init && git add -A && git commit -m "scaffold cardio-monitor workspace"
+```
+
+One installed `mneme` CLI can serve any number of workspaces like this. To switch:
+
+```bash
+mneme --workspace ~/projects/parkiwatch stats
+# or
+export MNEME_HOME=~/projects/parkiwatch
+mneme stats
 ```
 
 ---
@@ -127,15 +144,15 @@ You have meeting notes, a risk analysis, and a product specification.
 
 ```bash
 # Ingest one at a time
-mnemo ingest meeting-notes-2026-03-15.md cardio-monitor
-mnemo ingest risk-analysis-v1.pdf cardio-monitor
-mnemo ingest product-spec.md cardio-monitor
+mneme ingest meeting-notes-2026-03-15.md cardio-monitor
+mneme ingest risk-analysis-v1.pdf cardio-monitor
+mneme ingest product-spec.md cardio-monitor
 
 # Or batch ingest a folder
-mnemo ingest-dir documents/ cardio-monitor
+mneme ingest-dir documents/ cardio-monitor
 
 # Check results
-mnemo stats
+mneme stats
 #   Wiki pages: 3
 #   Entities: 12
 #   Tags: 4
@@ -164,7 +181,7 @@ UN-002,Battery Life for Full Shift,Device shall operate 8+ hours on single charg
 
 ```bash
 # Ingest with explicit mapping
-mnemo ingest-csv user-needs.csv cardio-monitor --mapping user-needs
+mneme ingest-csv user-needs.csv cardio-monitor --mapping user-needs
 
 #   File: user-needs.csv (47 rows, 6 columns)
 #   Mapping: user-needs
@@ -177,8 +194,8 @@ mnemo ingest-csv user-needs.csv cardio-monitor --mapping user-needs
 #   Pages created: 47
 #   Trace links: 34
 
-# Or let mnemo auto-detect the mapping from column headers
-mnemo ingest-csv user-needs.csv cardio-monitor
+# Or let mneme auto-detect the mapping from column headers
+mneme ingest-csv user-needs.csv cardio-monitor
 ```
 
 This creates 47 wiki pages, each with:
@@ -194,34 +211,34 @@ Import your requirements, design specs, and test cases from separate CSVs:
 
 ```bash
 # Import each layer of the V-model
-mnemo ingest-csv user-needs.csv cardio-monitor --mapping user-needs
-mnemo ingest-csv requirements.csv cardio-monitor --mapping requirements
-mnemo ingest-csv design-specs.csv cardio-monitor --mapping dds
-mnemo ingest-csv test-cases.csv cardio-monitor --mapping test-cases
-mnemo ingest-csv risk-register.csv cardio-monitor --mapping risk-register
+mneme ingest-csv user-needs.csv cardio-monitor --mapping user-needs
+mneme ingest-csv requirements.csv cardio-monitor --mapping requirements
+mneme ingest-csv design-specs.csv cardio-monitor --mapping dds
+mneme ingest-csv test-cases.csv cardio-monitor --mapping test-cases
+mneme ingest-csv risk-register.csv cardio-monitor --mapping risk-register
 
 # Check the trace chain from a user need to its test
-mnemo trace show cardio-monitor/un-001 --direction forward
+mneme trace show cardio-monitor/un-001 --direction forward
 #   Root: cardio-monitor/un-001
 #     implemented-by -> cardio-monitor/req-003
 #       detailed-in -> cardio-monitor/dds-015
 #         verified-by -> cardio-monitor/test-042
 
 # Check backward from a test to its origin
-mnemo trace show cardio-monitor/test-042 --direction backward
+mneme trace show cardio-monitor/test-042 --direction backward
 #   Root: cardio-monitor/test-042
 #     verifies -> cardio-monitor/dds-015
 #       details -> cardio-monitor/req-003
 #         implements -> cardio-monitor/un-001
 
 # Find gaps: requirements with no tests, hazards with no mitigations
-mnemo trace gaps cardio-monitor
+mneme trace gaps cardio-monitor
 #   Requirements with no verification: req-011, req-023
 #   Hazards with no mitigation: haz-009
 #   User needs with no requirements: un-005
 
 # Generate full traceability matrix
-mnemo trace matrix cardio-monitor
+mneme trace matrix cardio-monitor
 ```
 
 ---
@@ -237,7 +254,7 @@ cp ~/old-qms/*.csv inbox/
 cp ~/old-qms/*.pdf inbox/
 
 # Let tornado figure it out
-mnemo tornado --client cardio-monitor
+mneme tornado --client cardio-monitor
 
 #   === Mnemosyne Tornado ===
 #
@@ -263,10 +280,10 @@ mnemo tornado --client cardio-monitor
 #     Inbox: empty
 
 # Dry run first to preview
-mnemo tornado --client cardio-monitor --dry-run
+mneme tornado --client cardio-monitor --dry-run
 
 # Apply vocabulary harmonization during ingest
-mnemo tornado --client cardio-monitor --profile
+mneme tornado --client cardio-monitor --profile
 ```
 
 Tornado:
@@ -285,7 +302,7 @@ After ingesting everything, run quality checks:
 
 ```bash
 # Full lint: orphan pages, dead links, stale content, missing citations
-mnemo lint
+mneme lint
 #   Found 14 issues:
 #     Dead links: 3
 #     Orphan pages: 5
@@ -293,22 +310,22 @@ mnemo lint
 #   Report: wiki/lint-report-2026-04-06.md
 
 # Check vocabulary against EU MDR profile
-mnemo harmonize --client cardio-monitor
+mneme harmonize --client cardio-monitor
 #   Found 8 vocabulary issues:
 #     "product" (3 pages) -> should be "medical device"
 #     "intended use" (2 pages) -> should be "intended purpose"
 #     "vendor" (3 pages) -> should be "manufacturer"
 
 # Auto-fix vocabulary
-mnemo harmonize --client cardio-monitor --fix
+mneme harmonize --client cardio-monitor --fix
 #   Pages fixed: 7
 
 # Validate document structure
-mnemo validate structure cardio-monitor/risk-management-file
+mneme validate structure cardio-monitor/risk-management-file
 #   Missing sections: residual-risk-evaluation, risk-management-review
 
 # Cross-document consistency
-mnemo validate consistency --client cardio-monitor
+mneme validate consistency --client cardio-monitor
 #   WARNING: "ISO 14971:2019" cited in 3 pages, "ISO 14971:2007" in 2 pages
 ```
 
@@ -318,21 +335,21 @@ mnemo validate consistency --client cardio-monitor
 
 ```bash
 # Search across everything
-mnemo search "electrical safety"
+mneme search "electrical safety"
 
 # Search within one client only
-mnemo search "battery life" --client cardio-monitor
+mneme search "battery life" --client cardio-monitor
 
 # Export a client's knowledge base as JSON (for QMS app)
-mnemo export cardio-monitor --format json
+mneme export cardio-monitor --format json
 #   Exported to: exports/cardio-monitor-2026-04-06.json
 
 # Export as combined markdown (for review)
-mnemo export cardio-monitor --format md
+mneme export cardio-monitor --format md
 #   Exported to: exports/cardio-monitor-2026-04-06.md
 
 # Create a versioned snapshot for audit
-mnemo snapshot cardio-monitor
+mneme snapshot cardio-monitor
 #   Path: snapshots/cardio-monitor-2026-04-06.zip
 #   Pages: 127
 #   Git tag: snapshot/cardio-monitor/2026-04-06
@@ -345,7 +362,7 @@ mnemo snapshot cardio-monitor
 Your firmware team has a repo. You need to check if QMS docs cover the codebase:
 
 ```bash
-mnemo scan-repo /path/to/cardio-firmware cardio-monitor
+mneme scan-repo /path/to/cardio-firmware cardio-monitor
 
 #   Dependencies found:      12
 #   Dependencies documented:  4
@@ -367,55 +384,55 @@ mnemo scan-repo /path/to/cardio-firmware cardio-monitor
 
 ```bash
 # Start of day: what's pending?
-mnemo status
+mneme status
 #   Sources: 5
 #   Un-ingested: 2
 #   Wiki pages: 127
 #   Orphan pages: 3
 
 # What happened recently?
-mnemo recent -n 5
+mneme recent -n 5
 #   [2026-04-06 09:15] INGEST | firmware-spec.pdf -> cardio-monitor
 #   [2026-04-06 09:10] LINT | 3 issues found
 #   ...
 
 # Check for drift between wiki and memvid
-mnemo drift
+mneme drift
 #   Sync: 95% (120/127 pages)
 #   Missing from memvid: 7
 
 # Fix it
-mnemo sync
+mneme sync
 
 # Check for duplicates
-mnemo dedupe
+mneme dedupe
 
 # See what changed in a specific page
-mnemo diff cardio-monitor/risk-analysis
+mneme diff cardio-monitor/risk-analysis
 
 # View all tags
-mnemo tags list
+mneme tags list
 #   cardio-monitor: 127 pages
 #   critical: 12 pages
 #   electrical-safety: 8 pages
 
 # Merge tags
-mnemo tags merge electrical electrical-safety
+mneme tags merge electrical electrical-safety
 ```
 
 ---
 
 ## Example 10: QMS Integration Pattern
 
-The QMS application consumes mnemo's output:
+The QMS application consumes mneme's output:
 
 ```python
 import json
 import subprocess
 
-# Call mnemo from your app
+# Call mneme from your app
 result = subprocess.run(
-    ['mnemo', 'search', 'electrical safety', '--client', 'cardio-monitor'],
+    ['mneme', 'search', 'electrical safety', '--client', 'cardio-monitor'],
     capture_output=True, text=True
 )
 
@@ -443,12 +460,75 @@ for page in glob.glob('wiki/cardio-monitor/*.md'):
     # Parse frontmatter, extract what you need
 ```
 
-The QMS app doesn't need to understand how mnemo works internally. It just reads:
+The QMS app doesn't need to understand how mneme works internally. It just reads:
 - `wiki/{client}/*.md` -- structured markdown pages
 - `schema/entities.json` -- all known entities
 - `schema/tags.json` -- tag taxonomy
 - `schema/traceability.json` -- trace links between pages
 - `exports/{client}.json` -- pre-parsed JSON export
+
+---
+
+## Example 11: Using the Workspace as an Obsidian Vault
+
+Mneme wiki pages are already Obsidian-compatible. Every workspace doubles as a vault.
+
+```bash
+# 1. Scaffold a workspace
+mneme new ~/vaults/cardio-monitor --name "CardioMonitor" --client cardio-monitor --profile eu-mdr
+
+# 2. Ingest some docs via the CLI
+cd ~/vaults/cardio-monitor
+mneme ingest design-input.pdf cardio-monitor
+mneme ingest-csv risk-register.csv cardio-monitor --mapping risk-register
+```
+
+**Open in Obsidian:**
+
+1. Launch Obsidian → **Open folder as vault** → select `~/vaults/cardio-monitor`
+2. Obsidian creates `.obsidian/` inside the workspace (ignored by mneme)
+3. You instantly see:
+   - `wiki/cardio-monitor/*.md` as browseable notes
+   - `[[wikilinks]]` between pages as clickable links
+   - `index.md` as your catalog
+   - Tag pane populated from page frontmatter
+   - Graph view of entity relationships
+
+**Recommended vault settings:**
+
+```
+Settings → Files & Links
+  Default location for new notes: wiki/cardio-monitor
+  New link format: Relative path to file
+  Use [[Wikilinks]]: ON
+  Detect all file extensions: OFF
+```
+
+**Community plugins that pair well:**
+
+- **Dataview** — query frontmatter like a database:
+  ```dataview
+  TABLE confidence, updated FROM "wiki/cardio-monitor"
+  WHERE type = "hazard" AND confidence = "low"
+  ```
+- **Templater** — paste mneme page skeletons from snippets
+- **Tag Wrangler** — rename tags across the vault and `schema/tags.json` stays in sync after `mneme repair`
+- **Graph Analysis** — compare against `schema/graph.json`
+
+**Two-way workflow:**
+
+| You do this... | Mneme sees... | Obsidian sees... |
+|---|---|---|
+| `mneme ingest report.pdf client` | New wiki page written | Auto-detected, linked, tagged |
+| Edit a page in Obsidian | `mneme lint` flags citation / link issues on next run | Your edits persist |
+| `mneme tornado` on an inbox | Batch-ingested | Live updates in the file tree |
+| Sync the workspace via git | History preserved | Conflicts surface in Obsidian's sync plugin if used |
+
+**Gotchas:**
+
+- Keep `memvid/` and `snapshots/` in `.gitignore` (scaffolder does this already)
+- Turn OFF Obsidian's "Detect all file extensions" so `sources/*.pdf` stays out of the graph view
+- Don't rename mneme-generated files inside Obsidian — it breaks the `[[wikilinks]]` and `index.md` entries. Rename via `mneme` commands instead.
 
 ---
 

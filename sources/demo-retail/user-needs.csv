@@ -1,6 +1,0 @@
-ID,Title,Description,Priority,Acceptance Criteria,Linked Requirement
-UN-001,Patient Safety from Electrical Shock,The device shall not expose the patient to harmful electrical currents during normal use or single fault condition,Critical,No current exceeding 10uA reaches patient during normal operation,REQ-003
-UN-002,Battery Life for Full Shift,The device shall operate continuously for at least 8 hours on a single battery charge,High,Device operates for 8+ hours under typical clinical load,REQ-007
-UN-003,Accurate Temperature Reading,The device shall measure body temperature within ±0.1°C accuracy,Critical,Temperature readings within ±0.1°C verified against calibrated reference,REQ-012
-UN-004,Ease of Cleaning,The device housing shall withstand standard hospital disinfection protocols,Medium,Housing survives 1000 cycles of 70% isopropanol wipe-down without degradation,REQ-015
-UN-005,Audible Alarm for Critical Values,The device shall emit an audible alarm when measured values exceed clinically defined thresholds,High,Alarm triggers within 2 seconds of threshold breach at minimum 65dB at 1m,REQ-020

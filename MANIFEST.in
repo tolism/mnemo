@@ -1,0 +1,47 @@
+# Files to include in the source distribution (sdist).
+# Wheel contents are controlled by [tool.setuptools.package-data] in pyproject.toml.
+
+include README.md
+include LICENSE
+include CLAUDE.md
+include CODER.md
+include EXAMPLES.md
+include FEATURES.md
+include pyproject.toml
+include MANIFEST.in
+
+# Bundled package assets
+recursive-include mneme/profiles *.json
+recursive-include mneme/templates *
+include mneme/ui.html
+
+# Tests (sdist only)
+recursive-include tests *.py
+
+# Exclude development cruft
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.swp
+prune .git
+prune .github
+prune .venv
+prune .obsidian
+prune .claude
+prune dist
+prune build
+prune *.egg-info
+prune wiki
+prune sources
+prune schema
+prune memvid
+prune demo
+prune demo-retail
+prune exports
+prune snapshots
+prune inbox
+exclude index.md
+exclude log.md
+exclude .mneme-profile
+exclude .mneme-version

@@ -1,4 +1,0 @@
-ID,Hazard,Harm,Severity,Probability,Risk Level,Risk Control,RMA,Verification
-HAZ-001,Electrical Shock,Patient injury from current leakage,5,2,10,Double insulation barrier,RMA-001,TEST-001
-HAZ-002,Battery Overheating,Thermal burn to patient or operator,4,3,12,Thermal cutoff at 45C,RMA-002,TEST-002
-HAZ-003,Software Malfunction,Incorrect reading leading to misdiagnosis,3,4,12,Watchdog timer with safe-state fallback,RMA-003,TEST-003
