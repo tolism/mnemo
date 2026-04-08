@@ -7,7 +7,7 @@ name: Release to PyPI
 #        https://pypi.org/manage/account/publishing/
 #      Project name:    mneme-cli
 #      Owner:           tolism
-#      Repository:      mneme-cli
+#      Repository:      mneme           (the GitHub repo, not the PyPI dist name)
 #      Workflow name:   release.yml
 #      Environment:     pypi
 #   2. Repeat for TestPyPI if you want test releases:
