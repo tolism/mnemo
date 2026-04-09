@@ -5,4 +5,4 @@ Public API:
     from mneme.core import ingest_source_to_both, dual_search, ...
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.0rc2"
