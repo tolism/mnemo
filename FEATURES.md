@@ -1,4 +1,4 @@
-# Mnemosyne - Feature Roadmap
+# mneme - Feature Roadmap
 
 ## Current Features (v0.4.0)
 
@@ -34,6 +34,13 @@
 | `mneme tags merge` | Merge one tag into another across all pages |
 | `mneme tags suggest <page>` | Build a *tag packet* for an LLM agent (page content + taxonomy + prompt) |
 | `mneme tags apply <page> --add t1,t2 --remove t3` | Atomic tag update: rewrites frontmatter, updates schema/tags.json, re-syncs FTS5 index |
+| `mneme tags bulk-suggest --client X --filter req- --limit 50` | Bulk tag packet for many pages in one round-trip |
+| `mneme tags bulk-apply response.json` | Apply tag changes from an agent JSON response (per-page error tolerance) |
+| `mneme entity suggest --client X` | Agent-driven entity-classification packet (entities + taxonomy + example pages) |
+| `mneme entity apply --id <id> --type <type>` | Set one entity's type atomically |
+| `mneme entity bulk-apply classifications.json` | Bulk classify entities from a JSON file |
+| `mneme home --client X` / `--all-clients` | Generate a `HOME.md` navigation hub with Dataview queries and plain-markdown fallback |
+| `mneme ingest-dir --preserve-structure` | Mirror source directory hierarchy into wiki subdirectories (resync auto-detects matching subpath) |
 | `mneme diff` | Git-aware diff for a wiki page |
 | `mneme snapshot` | Versioned zip archive of a client + git tag |
 | `mneme dedupe` | Detect near-duplicate wiki pages |

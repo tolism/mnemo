@@ -213,6 +213,10 @@ out manually, then run `resync-resolve`.
 mneme tags suggest <client>/<page>                     # build tag packet
 mneme tags suggest <client>/<page> --json              # raw dict
 mneme tags apply <client>/<page> --add t1,t2 --remove t3
+
+# Bulk variants -- packet up to N pages in one round-trip
+mneme tags bulk-suggest --client <c> --filter req- --limit 50 --out packet.md
+mneme tags bulk-apply response.json     # response: {"pages": [{wiki_path, add, remove}, ...]}
 ```
 
 `mneme tags suggest` builds a **tag packet**: the page content, current
@@ -244,6 +248,37 @@ Existing taxonomy ops:
 mneme tags list                                        # all tags + counts
 mneme tags merge <old> <new>                           # rename across all pages
 ```
+
+### 3.7 ENTITY — agent-driven classification
+
+```bash
+mneme entity suggest --client <c> --limit 50          # classification packet
+mneme entity apply --id iso-13485 --type standard     # one at a time
+mneme entity bulk-apply classifications.json          # batch
+```
+
+`mneme entity suggest` builds an **entity packet**: every `unknown`-typed
+entity, the workspace's current type distribution, the valid type
+vocabulary, an example wiki page per entity, and a prompt. The agent
+returns a JSON array of `{id, type}` objects which `bulk-apply` writes
+back atomically. Same philosophy as tags: mneme stays deterministic, the
+LLM does the classification.
+
+Valid types: `standard`, `company`, `person`, `product`, `technology`,
+`concept`, `brand`, `unknown`.
+
+### 3.8 HOME — generated landing page
+
+```bash
+mneme home --client <c>          # wiki/<c>/HOME.md
+mneme home --all-clients         # wiki/HOME.md (cross-client)
+```
+
+Generates an Obsidian-friendly navigation hub with Dataview queries
+(group by type, by ID prefix like `REQ-*` / `DDS-*`, top tags) and a
+plain-markdown `<details>` fallback so the page is useful outside
+Obsidian. Run after a large ingest, or whenever the wiki's shape
+changes meaningfully.
 
 ---
 

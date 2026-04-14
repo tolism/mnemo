@@ -1,5 +1,5 @@
 """
-Mnemosyne configuration and path resolution.
+mneme configuration and path resolution.
 
 Two distinct roots:
 
@@ -83,7 +83,7 @@ LOG_MAX_ENTRIES = 500  # archive after this many entries
 ENTITY_STOPWORDS = {
     'key facts', 'open questions', 'page title', 'page types', 'special files',
     'client directories', 'cross references', 'source summary', 'detail section',
-    'wiki page', 'wiki pages', 'wiki protocol', 'knowledge engine', 'mnemosyne', 'mneme', 'summary section',
+    'wiki page', 'wiki pages', 'wiki protocol', 'knowledge engine', 'mneme', 'summary section',
     'how to', 'last updated', 'activity log', 'health report', 'action plan',
     'executive summary', 'final verdict', 'risk scorecard', 'prior art',
     'patent strategy', 'filing strategy', 'negotiation strategy',

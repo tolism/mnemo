@@ -58,6 +58,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Chunking logic (`chunk_body`, `MAX_CHUNK_SIZE`, frame management).
 - Tantivy-reserved-word query sanitizer (FTS5 has different syntax).
 
+## [0.5.1] - 2026-04-14
+
+### Added
+- **`mneme entity suggest` / `entity apply` / `entity bulk-apply`** — agent-driven
+  entity classification (same packet pattern as `tags suggest`). Mneme builds a
+  packet of unclassified entities + the workspace type taxonomy + example pages;
+  the LLM agent classifies; mneme writes the types back atomically.
+- **`mneme tags bulk-suggest` / `tags bulk-apply`** — operate on many pages at
+  once. `bulk-suggest --client X --filter req- --limit 50` packets up to 50
+  matching pages; agent returns one JSON file; `bulk-apply` runs all the changes
+  with per-page error tolerance. Critical for tagging workspaces of hundreds of
+  pages.
+- **`mneme home --client <slug>` / `--all-clients`** — generates a `HOME.md`
+  navigation hub with Obsidian Dataview queries (group by type, by ID prefix
+  like REQ-*/DDS-*, top tags) plus a plain-markdown `<details>` fallback for
+  non-Obsidian viewers.
+- **`mneme ingest-dir --preserve-structure`** — mirrors source directory
+  hierarchy into wiki subdirectories. `sources/client/REQUIREMENTS/req-001.md`
+  becomes `wiki/client/requirements/req-001.md` instead of flattening. Also
+  resolves same-basename-different-directory collisions naturally.
+- **`mneme resync` auto-detects subpath** from a source's location under
+  `sources/<client>/`, so resyncs of preserve-structure ingests target the
+  correct nested wiki page instead of creating a duplicate flat one.
+- **Progress bar** for `ingest-dir` and `ingest-csv` long loops. TTY-aware
+  (in-place updates) with non-TTY fallback (periodic line output) so CI logs
+  stay readable.
+
+### Fixed
+- `mneme status` crashed with `UnboundLocalError` because a local `status` in
+  the `agent show` branch shadowed the function name throughout `main()`.
+- `wiki/HOME.md` and `wiki/<client>/HOME.md` are now skipped during HOME
+  generation so re-running is idempotent.
+
 ## [Unreleased]
 
 ### Added

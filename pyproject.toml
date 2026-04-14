@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mneme-cli"
 dynamic = ["version"]
-description = "Mnemosyne - CLI tool that turns documents into a searchable second brain. Ingest once, query forever."
+description = "mneme - CLI tool that turns documents into a searchable second brain. Ingest once, query forever."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"

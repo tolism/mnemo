@@ -1,4 +1,4 @@
-# CODER.md - Developer Guide for Mnemosyne
+# CODER.md - Developer Guide for mneme
 
 This is the engineering reference for anyone building on or extending mneme. Read this before writing code.
 

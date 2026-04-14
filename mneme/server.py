@@ -1,5 +1,5 @@
 """
-server.py - Mnemosyne local web UI server.
+server.py - mneme local web UI server.
 
 Usage:
     cd mneme && python3 server.py
@@ -296,7 +296,7 @@ class MnemeHandler(BaseHTTPRequestHandler):
 
 def main():
     server = HTTPServer(('localhost', PORT), MnemeHandler)
-    print(f'Mnemosyne UI running at http://localhost:{PORT}')
+    print(f'mneme UI running at http://localhost:{PORT}')
     print('Press Ctrl+C to stop')
     if not CORE_OK:
         print(f'[WARNING] core import failed: {CORE_ERROR}')

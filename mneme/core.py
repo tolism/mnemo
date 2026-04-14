@@ -1,5 +1,5 @@
 """
-core.py - Mnemosyne core engine.
+core.py - mneme core engine.
 
 Structured markdown wiki with SQLite FTS5 search index.
 Wiki pages are the source of truth; the search DB is a rebuildable index.
@@ -93,6 +93,111 @@ def _get_search_db():
     if _search_conn is None:
         _search_conn = _search.open_db(SEARCH_DB)
     return _search_conn
+
+
+# ---------------------------------------------------------------------------
+# Progress indicator (zero-dep, TTY-aware)
+# ---------------------------------------------------------------------------
+
+
+class _ProgressBar:
+    """
+    Lightweight progress bar for long loops.
+
+    TTY mode: single-line in-place update with percentage, count, ETA, and
+    the current item label.
+
+    Non-TTY mode: emits one line every max(1, total // 50) steps, preserving
+    the pre-existing `[N/M] filename` log format so anything parsing stdout
+    in CI keeps working.
+    """
+
+    def __init__(self, total: int, label: str = '',
+                 stream=None, enabled: 'bool | None' = None,
+                 width: int = 30):
+        self.total = max(total, 0)
+        self.done = 0
+        self.label = label
+        self.start = time.monotonic()
+        self.stream = stream or sys.stdout
+        if enabled is None:
+            self.is_tty = bool(getattr(self.stream, 'isatty', lambda: False)())
+        else:
+            self.is_tty = enabled
+        self.width = width
+        self._last_tty_draw = 0.0
+        # Step cadence for non-TTY mode.
+        self._step = max(1, self.total // 50) if self.total else 1
+
+    @staticmethod
+    def _fmt_eta(seconds: float) -> str:
+        if seconds < 0 or seconds == float('inf'):
+            return '--:--'
+        m, s = divmod(int(seconds), 60)
+        return f'{m:02d}:{s:02d}'
+
+    def _render_tty(self, current: str) -> None:
+        pct = (self.done / self.total * 100) if self.total else 100.0
+        filled = int(self.width * self.done / self.total) if self.total else self.width
+        bar = '=' * filled + ('>' if filled < self.width else '') + ' ' * max(0, self.width - filled - 1)
+        elapsed = time.monotonic() - self.start
+        eta = (elapsed / self.done * (self.total - self.done)) if self.done else float('inf')
+        line = f'\r[{bar}] {pct:5.1f}% ({self.done}/{self.total}) ETA {self._fmt_eta(eta)}'
+        if current:
+            # Truncate current-item label to fit terminal width
+            try:
+                term_cols = shutil.get_terminal_size((80, 20)).columns
+            except Exception:
+                term_cols = 80
+            remaining = max(10, term_cols - len(line) - 3)
+            cur = current
+            if len(cur) > remaining:
+                cur = '...' + cur[-(remaining - 3):]
+            line += f' | {cur}'
+        # Pad to avoid leftover chars from prior longer lines
+        try:
+            term_cols = shutil.get_terminal_size((80, 20)).columns
+            if len(line) < term_cols:
+                line += ' ' * (term_cols - len(line))
+        except Exception:
+            pass
+        self.stream.write(line)
+        self.stream.flush()
+
+    def update(self, n: int = 1, current: str = '') -> None:
+        self.done += n
+        if self.is_tty:
+            now = time.monotonic()
+            # Rate-limit redraws to ~10 Hz for cheap loops
+            if now - self._last_tty_draw >= 0.1 or self.done >= self.total:
+                self._render_tty(current)
+                self._last_tty_draw = now
+        else:
+            # Periodic line-mode output
+            if self.total == 0 or self.done % self._step == 0 or self.done >= self.total:
+                label = f' {self.label}' if self.label else ''
+                if current:
+                    print(f'  [{self.done}/{self.total}]{label} {current}', file=self.stream)
+                else:
+                    print(f'  [{self.done}/{self.total}]{label}', file=self.stream)
+
+    def log(self, msg: str) -> None:
+        """Print a message without corrupting the bar."""
+        if self.is_tty:
+            # Clear current line, print, redraw on next update
+            self.stream.write('\r' + ' ' * 100 + '\r')
+            self.stream.flush()
+            print(msg, file=self.stream)
+            # Redraw bar below
+            self._render_tty('')
+        else:
+            print(msg, file=self.stream)
+
+    def finish(self) -> None:
+        if self.is_tty:
+            self._render_tty('')
+            self.stream.write('\n')
+            self.stream.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -356,13 +461,48 @@ def check_drift() -> dict:
     }
 
 
-def ingest_source_to_both(source_path: str, client_slug: str, force: bool = False) -> dict:
+def _slugify_subpath_segment(seg: str) -> str:
+    """Normalise a directory name into a wiki-safe segment."""
+    seg = re.sub(r'[^\w\-]', '-', seg).lower().strip('-')
+    seg = re.sub(r'-+', '-', seg)
+    return seg
+
+
+def _auto_detect_subpath(source_path: str, client_slug: str) -> str:
+    """
+    Derive a wiki subpath automatically from a source file's location under
+    sources/<client>/. Used by resync so nested pages can be located without
+    the caller passing --preserve-structure again.
+
+    Returns '' if the source is not under sources/<client>/, or directly in it.
+    """
+    src_client_root = os.path.join(SOURCES_DIR, client_slug)
+    try:
+        abs_src = os.path.abspath(source_path)
+        abs_root = os.path.abspath(src_client_root)
+        if not abs_src.startswith(abs_root + os.sep):
+            return ''
+        rel = os.path.relpath(os.path.dirname(abs_src), abs_root)
+        if rel in ('', '.'):
+            return ''
+        segs = [_slugify_subpath_segment(s) for s in rel.split(os.sep) if s]
+        return os.path.join(*segs) if segs else ''
+    except ValueError:
+        return ''
+
+
+def ingest_source_to_both(source_path: str, client_slug: str, force: bool = False,
+                          subpath: str = '') -> dict:
     """
     Atomic ingest operation. Takes a raw source file, writes it to the wiki,
     syncs to search index, updates schema/entities.json and index.md, appends to log.md.
 
     Handles .md and .txt. PDF requires pymupdf.
     Returns a summary of what was created.
+
+    ``subpath`` (optional): wiki subdirectory under ``wiki/<client>/`` for the
+    new page. Used by ``ingest-dir --preserve-structure`` and by ``resync``
+    (auto-detected from the source's location under ``sources/<client>/``).
     """
     if not os.path.exists(source_path):
         raise FileNotFoundError(f'Source not found: {source_path}')
@@ -440,8 +580,13 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
     page_slug = re.sub(r'[^\w\-]', '-', os.path.splitext(source_filename)[0]).lower()
     page_slug = re.sub(r'-+', '-', page_slug).strip('-')
 
-    # Target wiki directory
-    client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
+    # Target wiki directory (optionally mirroring source sub-structure)
+    if subpath:
+        safe_segs = [_slugify_subpath_segment(s) for s in subpath.split(os.sep) if s]
+        safe_subpath = os.path.join(*safe_segs) if safe_segs else ''
+    else:
+        safe_subpath = ''
+    client_wiki_dir = os.path.join(WIKI_DIR, client_slug, safe_subpath) if safe_subpath else os.path.join(WIKI_DIR, client_slug)
     os.makedirs(client_wiki_dir, exist_ok=True)
 
     wiki_page_path = os.path.join(client_wiki_dir, f'{page_slug}.md')
@@ -711,7 +856,15 @@ def resync_source(source_path: str, client_slug: str, dry_run: bool = False) -> 
         raise FileNotFoundError(f'Source not found: {source_path}')
 
     today = datetime.now().strftime('%Y-%m-%d')
-    client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
+
+    # Auto-detect subpath from the source's location under sources/<client>/
+    # so a source ingested with --preserve-structure resyncs to the correct
+    # nested wiki page rather than creating a duplicate flat page.
+    subpath = _auto_detect_subpath(source_path, client_slug)
+    if subpath:
+        client_wiki_dir = os.path.join(WIKI_DIR, client_slug, subpath)
+    else:
+        client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
     page_slug, raw_content, theirs_text = _build_wiki_page_from_source(
         source_path, client_slug, today
     )
@@ -727,7 +880,7 @@ def resync_source(source_path: str, client_slug: str, dry_run: bool = False) -> 
                 'reason': 'no baseline found - resync would perform a fresh ingest',
                 'conflicts': False,
             }
-        result = ingest_source_to_both(source_path, client_slug, force=True)
+        result = ingest_source_to_both(source_path, client_slug, force=True, subpath=subpath)
         result['action'] = f'fresh-{result.get("action", "created")}'
         result['conflicts'] = False
         return result
@@ -1285,13 +1438,25 @@ def _update_index(client_slug: str, page_slug: str, rel_wiki_path: str, today: s
     """
     Add or update an entry in index.md for the given wiki page.
     Entry format: | [[client/page-slug]] | type | description | date | confidence |
+
+    When the wiki page lives in a subdirectory (preserve-structure), derive
+    the full wikilink path from ``rel_wiki_path`` so nested pages resolve.
     """
     # Ensure file exists with header before locking
     if not os.path.exists(INDEX_FILE):
         with open(INDEX_FILE, 'w') as f:
-            f.write(f'# Mnemosyne Index\nLast updated: {today}\n\n')
+            f.write(f'# mneme Index\nLast updated: {today}\n\n')
 
-    wikilink = f'[[{client_slug}/{page_slug}]]'
+    # Build the wikilink from the page's actual location under wiki/
+    # rel_wiki_path is relative to BASE_DIR, e.g. "wiki/demo/sub/page.md"
+    link_path = rel_wiki_path
+    wiki_prefix = 'wiki' + os.sep
+    if link_path.startswith(wiki_prefix):
+        link_path = link_path[len(wiki_prefix):]
+    link_path = link_path.replace(os.sep, '/')
+    if link_path.endswith('.md'):
+        link_path = link_path[:-3]
+    wikilink = f'[[{link_path}]]'
     new_entry = f'| {wikilink} | source-summary | Ingested via mneme on {today} | {today} | medium |\n'
 
     def modifier(index_content: str) -> str:
@@ -1374,11 +1539,11 @@ def _append_log(operation: str, description: str, details: list[str], date: str)
     # Ensure file exists with header before locking
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w') as f:
-            f.write('# Mnemosyne Log\n\n')
+            f.write('# mneme Log\n\n')
 
     def modifier(existing: str) -> str:
         if not existing:
-            existing = '# Mnemosyne Log\n\n'
+            existing = '# mneme Log\n\n'
         # Insert after the header (first blank line after the first heading)
         header_end = existing.find('\n\n')
         if header_end == -1:
@@ -1395,7 +1560,7 @@ def _append_log(operation: str, description: str, details: list[str], date: str)
 
 def init_workspace(project_name=None, clients=None):
     """
-    Create a clean Mnemosyne workspace in the current directory.
+    Create a clean mneme workspace in the current directory.
 
     Creates the full directory structure, empty schema files, index.md, log.md,
     and CLAUDE.md protocol. Client directories are created under wiki/.
@@ -1454,7 +1619,7 @@ def init_workspace(project_name=None, clients=None):
         client_sections = ''.join('\n## ' + c + '\n\n' for c in clients)
         with open(index_path, 'w', encoding='utf-8') as f:
             lines = [
-                '# ' + project_name + ' - Mnemosyne Index',
+                '# ' + project_name + ' - mneme Index',
                 '',
                 'Last updated: ' + today,
                 '',
@@ -1468,7 +1633,7 @@ def init_workspace(project_name=None, clients=None):
     if not os.path.exists(log_path):
         with open(log_path, 'w', encoding='utf-8') as f:
             f.write(
-                '# Mnemosyne Log\n\n'
+                '# mneme Log\n\n'
                 '## [' + today + '] INIT | ' + project_name + ' workspace created\n'
                 '- Clients: ' + ', '.join(clients) + '\n'
                 '- Structure: sources/, wiki/, schema/\n\n'
@@ -1481,7 +1646,7 @@ def init_workspace(project_name=None, clients=None):
             for c in clients
         )
         claude_content = '\n'.join([
-            '# Mnemosyne - Wiki Protocol',
+            '# mneme - Wiki Protocol',
             '',
             '## Purpose',
             '',
@@ -1571,7 +1736,7 @@ def init_workspace(project_name=None, clients=None):
         with open(claude_md_path, 'w', encoding='utf-8') as f:
             f.write(claude_content)
 
-    print('Mnemosyne initialized.')
+    print('mneme initialized.')
     print('  Project:  ' + project_name)
     print('  Clients:  ' + ', '.join(clients))
     print('')
@@ -1657,7 +1822,7 @@ def _print_stats(stats: dict) -> None:
     sc = stats['schema']
     d = stats['drift']
 
-    print('=== Mnemosyne Stats ===\n')
+    print('=== mneme Stats ===\n')
     print('WIKI')
     print(f'  Total pages:       {w["total_pages"]}')
     print(f'  Cross-references:  {w["total_cross_references"]}')
@@ -1938,7 +2103,7 @@ def lint() -> dict:
 
 
 def ingest_dir(directory: str, client_slug: str, force: bool = False,
-               recursive: bool = False) -> dict:
+               recursive: bool = False, preserve_structure: bool = False) -> dict:
     """
     Batch ingest all supported files from a directory.
 
@@ -1946,6 +2111,10 @@ def ingest_dir(directory: str, client_slug: str, force: bool = False,
     supported file (.md, .txt, .pdf) into the given client.
 
     When recursive=True, walks subdirectories as well.
+
+    When preserve_structure=True, each file's directory position relative to
+    ``directory`` becomes a wiki subdirectory under ``wiki/<client>/``. Also
+    naturally resolves same-basename collisions (suggestion #15).
 
     Returns a summary of all ingestions.
     """
@@ -1976,28 +2145,35 @@ def ingest_dir(directory: str, client_slug: str, force: bool = False,
         return {'ingested': 0, 'skipped': 0, 'errors': 0, 'results': []}
 
     print(f'Found {len(files)} files to ingest into client "{client_slug}"')
-    print()
 
     ingested = 0
     skipped = 0
     errors = 0
     results = []
+    bar = _ProgressBar(len(files), label='ingest')
 
-    for i, fpath in enumerate(files, 1):
+    for fpath in files:
         fname = os.path.basename(fpath)
-        print(f'[{i}/{len(files)}] {fname}...', end=' ')
+        # Compute subpath relative to the input directory when preserving structure
+        if preserve_structure:
+            sub_rel = os.path.relpath(os.path.dirname(fpath), directory)
+            subpath = '' if sub_rel in ('', '.') else sub_rel
+        else:
+            subpath = ''
         try:
-            result = ingest_source_to_both(fpath, client_slug, force=force)
+            result = ingest_source_to_both(fpath, client_slug, force=force, subpath=subpath)
             if not result:
-                print('skipped (already ingested)')
                 skipped += 1
             else:
-                print(f'{result["action"]} -> {result["wiki_page"]}')
                 ingested += 1
                 results.append(result)
         except Exception as e:
-            print(f'ERROR: {e}')
+            bar.log(f'ERROR: {fname}: {e}')
             errors += 1
+        bar.update(1, current=fname)
+    bar.finish()
+
+    print(f'\nIngested: {ingested}  Skipped: {skipped}  Errors: {errors}')
 
     today = datetime.now().strftime('%Y-%m-%d')
     _append_log(
@@ -2121,7 +2297,7 @@ def tornado(client_slug: str = None, dry_run: bool = False, apply_profile: bool 
         print('Inbox is empty. Drop files into inbox/ and run again.')
         return {'processed': 0, 'created': 0, 'updated': 0, 'archived': 0, 'skipped': 0, 'errors': 0}
 
-    print(f'=== Mnemosyne Tornado ===\n')
+    print(f'=== mneme Tornado ===\n')
     print(f'Scanning inbox/... found {len(files)} files\n')
 
     today = datetime.now().strftime('%Y-%m-%d')
@@ -2554,6 +2730,9 @@ def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_ru
     client_wiki_dir = os.path.join(WIKI_DIR, client_slug)
     os.makedirs(client_wiki_dir, exist_ok=True)
 
+    # Progress bar for long CSV ingests. dry_run keeps the verbose per-row output.
+    bar = None if dry_run else _ProgressBar(len(rows), label='csv')
+
     for i, row in enumerate(rows, 1):
         # Skip empty rows
         if not any(v.strip() for v in row.values() if v):
@@ -2621,12 +2800,15 @@ def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_ru
         except Exception:
             pass
 
-        print(f'[{i}/{len(rows)}]  {display}')
-        print(f'        -> wiki/{client_slug}/{page_slug}.md ({action}d)')
-        if traces:
-            for rel, targets in traces.items():
-                for t in targets:
-                    print(f'        -> trace: {rel} -> {t}')
+        if bar:
+            bar.update(1, current=f'{page_slug} ({action})')
+        else:
+            print(f'[{i}/{len(rows)}]  {display}')
+            print(f'        -> wiki/{client_slug}/{page_slug}.md ({action}d)')
+            if traces:
+                for rel, targets in traces.items():
+                    for t in targets:
+                        print(f'        -> trace: {rel} -> {t}')
 
     # Update entities schema for all new pages
     if not dry_run:
@@ -2657,6 +2839,8 @@ def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_ru
             date=today,
         )
 
+    if bar:
+        bar.finish()
     print(f'\nCSV ingest {"(dry run) " if dry_run else ""}complete.')
     print(f'  Pages created:  {pages_created}')
     print(f'  Pages updated:  {pages_updated}')
@@ -3130,6 +3314,601 @@ def tags_apply(page_slug: str, add: list = None,
         'tags_after': new_tags,
         'added': actually_added,
         'removed': actually_removed,
+    }
+
+
+def tags_bulk_suggest(client: str = None, filter_substr: str = None,
+                      limit: int = 20, include_tagged: bool = False,
+                      body_preview: int = 2000) -> dict:
+    """
+    Build a *bulk tag packet* covering up to N pages at once.
+
+    By default, only pages whose tag list is empty or only contains the
+    client slug are included. Pass ``include_tagged=True`` to re-tag pages
+    that already have non-auto tags.
+
+    ``body_preview`` caps each page's body in the packet to keep the packet
+    small enough for agent context windows.
+    """
+    pattern = os.path.join(WIKI_DIR, '**', '*.md')
+    all_pages = sorted(glob.glob(pattern, recursive=True))
+    candidates: list[dict] = []
+
+    for page_path in all_pages:
+        rel = os.path.relpath(page_path, WIKI_DIR)
+        parts = Path(rel).parts
+        if any(p in EXCLUDED_DIRS for p in parts[:-1]):
+            continue
+        if os.path.basename(page_path) in EXCLUDED_FILES:
+            continue
+        wiki_path = rel.replace(os.sep, '/')
+        if filter_substr and filter_substr not in wiki_path:
+            continue
+        page_client = parts[0] if len(parts) > 1 else '_root'
+        if client and page_client != client:
+            continue
+
+        try:
+            with open(page_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+        frontmatter, body = parse_frontmatter(content)
+
+        current_tags = frontmatter.get('tags', [])
+        if isinstance(current_tags, str):
+            # Inline "[]" is common when frontmatter is written as `tags: []`
+            stripped = current_tags.strip().strip('[]').strip()
+            current_tags = [t.strip() for t in stripped.split(',') if t.strip()] if stripped else []
+        non_auto = [t for t in current_tags if t != page_client]
+
+        if not include_tagged and non_auto:
+            continue
+
+        candidates.append({
+            'wiki_path': wiki_path,
+            'title': frontmatter.get('title', os.path.basename(page_path)),
+            'client': page_client,
+            'current_tags': current_tags,
+            'body': body.strip()[:body_preview],
+        })
+        if len(candidates) >= limit:
+            break
+
+    # Shared taxonomy across all pages in the packet.
+    taxonomy = []
+    tags_data = tags_list()
+    for tag_name, info in sorted(tags_data.items(), key=lambda kv: -kv[1].get('count', 0)):
+        taxonomy.append({
+            'name': tag_name,
+            'count': info.get('count', 0),
+            'description': info.get('description', ''),
+        })
+
+    profile_guidance = ''
+    try:
+        profile = get_active_profile()
+        if profile:
+            profile_guidance = (
+                f"Active profile: {profile.get('name', 'unknown')}. "
+                "Prefer profile vocabulary terms when they describe the topic."
+            )
+    except Exception:
+        pass
+
+    tag_prompt = (
+        "You are bulk-tagging a batch of wiki pages.\n\n"
+        "For each page below, propose 3-7 tags that describe its topic, "
+        "domain, and any standards/regulations mentioned.\n\n"
+        "Rules:\n"
+        "1. PREFER existing taxonomy tags over inventing new ones.\n"
+        "2. Tag format: lowercase, hyphenated (e.g. `iso-13485`).\n"
+        "3. Do NOT add the client slug -- it is auto-applied.\n"
+        "4. Skip generic tags (`summary`, `overview`, `report`).\n\n"
+        "Output a single JSON object with a `pages` array:\n"
+        '  {"pages": [\n'
+        '    {"wiki_path": "client/page.md", "add": ["tag1"], "remove": []},\n'
+        '    ...\n'
+        '  ]}\n\n'
+        "Then run: mneme tags bulk-apply response.json"
+    )
+
+    return {
+        'pages': candidates,
+        'tag_taxonomy': taxonomy,
+        'profile_guidance': profile_guidance,
+        'tag_prompt': tag_prompt,
+    }
+
+
+def _format_bulk_tag_packet(packet: dict) -> str:
+    """Render a bulk tag packet as markdown for an LLM agent."""
+    lines: list[str] = []
+    lines.append('# Bulk tag packet')
+    lines.append('')
+    lines.append(f'**Pages in this batch:** {len(packet["pages"])}')
+    if packet.get('profile_guidance'):
+        lines.append(f'**Profile:** {packet["profile_guidance"]}')
+    lines.append('')
+
+    taxonomy = packet.get('tag_taxonomy') or []
+    lines.append('## Existing tag taxonomy (sorted by usage)')
+    lines.append('')
+    if not taxonomy:
+        lines.append('_(no tags exist yet in this workspace)_')
+    else:
+        lines.append('| Tag | Pages |')
+        lines.append('|---|---:|')
+        for t in taxonomy[:50]:
+            lines.append(f'| `{t["name"]}` | {t["count"]} |')
+    lines.append('')
+
+    for i, page in enumerate(packet['pages'], 1):
+        lines.append(f'## Page {i}/{len(packet["pages"])}: `{page["wiki_path"]}`')
+        lines.append('')
+        lines.append(f'**Title:** {page["title"]}')
+        current = page.get('current_tags') or []
+        lines.append(f'**Current tags:** {", ".join(current) if current else "(none)"}')
+        lines.append('')
+        lines.append('```markdown')
+        lines.append(page['body'])
+        lines.append('```')
+        lines.append('')
+
+    lines.append('## Instruction')
+    lines.append('')
+    lines.append(packet['tag_prompt'])
+    return '\n'.join(lines)
+
+
+def tags_bulk_apply(response) -> dict:
+    """
+    Apply tag changes from an agent's bulk response.
+
+    ``response`` may be a path to a JSON file OR a dict.
+    Expected shape: ``{"pages": [{"wiki_path": "client/page.md",
+    "add": [...], "remove": [...]}, ...]}``.
+
+    Tolerates per-page failures; continues on error.
+    """
+    if isinstance(response, str):
+        with open(response, 'r', encoding='utf-8') as f:
+            response = json.load(f)
+    if not isinstance(response, dict) or 'pages' not in response:
+        raise ValueError('Expected {"pages": [...]} structure')
+    entries = response.get('pages', [])
+    if not isinstance(entries, list):
+        raise ValueError('"pages" must be a list')
+
+    applied = 0
+    failed: list[dict] = []
+    total_added = 0
+    total_removed = 0
+
+    for entry in entries:
+        wiki_path = entry.get('wiki_path') if isinstance(entry, dict) else None
+        if not wiki_path:
+            failed.append({'entry': entry, 'error': 'missing wiki_path'})
+            continue
+        add_list = entry.get('add') or []
+        remove_list = entry.get('remove') or []
+        # Strip .md if present for tags_apply
+        slug = wiki_path[:-3] if wiki_path.endswith('.md') else wiki_path
+        try:
+            result = tags_apply(slug, add=add_list, remove=remove_list)
+            applied += 1
+            total_added += len(result['added'])
+            total_removed += len(result['removed'])
+        except (FileNotFoundError, ValueError) as e:
+            failed.append({'wiki_path': wiki_path, 'error': str(e)})
+
+    return {
+        'applied': applied,
+        'failed': failed,
+        'total_tags_added': total_added,
+        'total_tags_removed': total_removed,
+    }
+
+
+VALID_ENTITY_TYPES = {
+    'standard', 'company', 'person', 'product',
+    'technology', 'concept', 'brand', 'unknown',
+}
+
+
+def _load_entities() -> dict:
+    """Load schema/entities.json (nested form). Returns a fresh skeleton on error."""
+    path = os.path.join(SCHEMA_DIR, 'entities.json')
+    if not os.path.exists(path):
+        return {'version': 1, 'updated': '', 'entities': []}
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+    except Exception:
+        return {'version': 1, 'updated': '', 'entities': []}
+    if isinstance(data, list):
+        data = {'version': 1, 'updated': '', 'entities': data}
+    if 'entities' not in data or not isinstance(data['entities'], list):
+        data['entities'] = []
+    return data
+
+
+def _format_entity_packet(packet: dict) -> str:
+    """Render an entity-classification packet as markdown for an LLM agent."""
+    lines: list[str] = []
+    lines.append('# Entity classification packet')
+    lines.append('')
+    lines.append(f'**Entities needing classification:** {len(packet["entities"])}')
+    types_summary = ', '.join(f'{t}={c}' for t, c in sorted(packet["existing_types"].items()))
+    lines.append(f'**Current type distribution:** {types_summary or "(none)"}')
+    lines.append(f'**Valid types:** {", ".join(packet["valid_types"])}')
+    lines.append('')
+
+    lines.append('## Entities')
+    lines.append('')
+    lines.append('| ID | Name | Client | Current type | Example page |')
+    lines.append('|---|---|---|---|---|')
+    for e in packet['entities']:
+        example = (e.get('example_pages') or [''])[0]
+        lines.append(f'| `{e["id"]}` | {e["name"]} | {e.get("client", "")} | {e.get("current_type", "unknown")} | {example} |')
+    lines.append('')
+
+    lines.append('## Instruction')
+    lines.append('')
+    lines.append(packet['entity_prompt'])
+    return '\n'.join(lines)
+
+
+def entity_suggest(client: str = None, limit: int = 50,
+                   only_unknown: bool = True) -> dict:
+    """
+    Build a packet of entities for an LLM agent to classify.
+
+    By default, only entities typed `unknown` are included. Pass
+    only_unknown=False to review all entities.
+    """
+    data = _load_entities()
+    entities = data.get('entities', [])
+
+    candidates = []
+    for e in entities:
+        if not isinstance(e, dict):
+            continue
+        if client and e.get('client') != client:
+            continue
+        if only_unknown and e.get('type') != 'unknown':
+            continue
+        candidates.append(e)
+        if len(candidates) >= limit:
+            break
+
+    # Build a reverse index: entity name -> list of wiki paths that mention it.
+    # One pass over the wiki to keep O(N) for large workspaces.
+    example_pages: dict[str, list[str]] = {}
+    if candidates:
+        names = [e['name'] for e in candidates if e.get('name')]
+        if names:
+            pattern = os.path.join(WIKI_DIR, '**', '*.md')
+            for page_path in glob.glob(pattern, recursive=True):
+                rel = os.path.relpath(page_path, WIKI_DIR)
+                parts = Path(rel).parts
+                if any(p in EXCLUDED_DIRS for p in parts[:-1]):
+                    continue
+                try:
+                    with open(page_path, 'r', encoding='utf-8') as f:
+                        page_body = f.read()
+                except Exception:
+                    continue
+                for name in names:
+                    if len(example_pages.get(name, [])) >= 3:
+                        continue
+                    if name in page_body:
+                        example_pages.setdefault(name, []).append(rel.replace(os.sep, '/'))
+
+    out_entities = []
+    for e in candidates:
+        out_entities.append({
+            'id': e.get('id'),
+            'name': e.get('name'),
+            'client': e.get('client'),
+            'current_type': e.get('type', 'unknown'),
+            'wiki_page': e.get('wiki_page'),
+            'example_pages': example_pages.get(e.get('name', ''), []),
+        })
+
+    # Global type distribution (across all entities, not just candidates)
+    existing_types: dict[str, int] = {}
+    for e in entities:
+        if isinstance(e, dict):
+            t = e.get('type', 'unknown')
+            existing_types[t] = existing_types.get(t, 0) + 1
+
+    entity_prompt = (
+        "You are classifying named entities extracted from a wiki.\n\n"
+        "For each entity in the table, decide which type it belongs to from "
+        "the valid types list. Use the example page for context when the "
+        "name alone is ambiguous.\n\n"
+        "Rules:\n"
+        "1. Pick one of the valid types; do NOT invent new types.\n"
+        "2. Examples:\n"
+        "   - `iso-13485`, `iec-62304`, `eu-mdr`, `gdpr` -> standard\n"
+        "   - `acme-corp`, `siemens-healthineers` -> company\n"
+        "   - `john-smith` (a person's name) -> person\n"
+        "   - `cardiac-monitor-x200` (a named product) -> product\n"
+        "   - `imu`, `bda`, `rbac` (technical concepts/acronyms) -> technology\n"
+        "   - `risk-management`, `design-validation` (abstract ideas) -> concept\n"
+        "3. If genuinely unclear, leave as `unknown` -- better than a wrong guess.\n\n"
+        "Output a single JSON array:\n"
+        '  [{"id": "iso-13485", "type": "standard"}, ...]\n\n'
+        "Then run one of:\n"
+        "  mneme entity apply --id <id> --type <type>        # one at a time\n"
+        "  mneme entity bulk-apply classifications.json      # batch"
+    )
+
+    return {
+        'entities': out_entities,
+        'existing_types': existing_types,
+        'valid_types': sorted(VALID_ENTITY_TYPES),
+        'entity_prompt': entity_prompt,
+    }
+
+
+def entity_apply(entity_id: str, type_: str) -> dict:
+    """Atomic: set a single entity's `type` in schema/entities.json."""
+    if type_ not in VALID_ENTITY_TYPES:
+        raise ValueError(
+            f'Invalid entity type "{type_}". Must be one of: '
+            f'{", ".join(sorted(VALID_ENTITY_TYPES))}'
+        )
+
+    entities_path = os.path.join(SCHEMA_DIR, 'entities.json')
+    if not os.path.exists(entities_path):
+        raise FileNotFoundError(f'entities.json not found at {entities_path}')
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    result = {'id': entity_id, 'old_type': None, 'new_type': type_}
+
+    def modifier(raw: str) -> str:
+        if raw.strip():
+            data = json.loads(raw)
+        else:
+            data = {'version': 1, 'updated': today, 'entities': []}
+        if isinstance(data, list):
+            data = {'version': 1, 'updated': today, 'entities': data}
+        entities = data.get('entities', [])
+        found = False
+        for e in entities:
+            if isinstance(e, dict) and e.get('id') == entity_id:
+                result['old_type'] = e.get('type', 'unknown')
+                e['type'] = type_
+                found = True
+                break
+        if not found:
+            raise KeyError(f'Entity id not found: {entity_id}')
+        data['entities'] = entities
+        data['updated'] = today
+        return json.dumps(data, indent=2)
+
+    _locked_read_modify_write(entities_path, modifier)
+
+    _append_log(
+        operation='UPDATE',
+        description=f'Classified entity "{entity_id}"',
+        details=[f'{result["old_type"]} -> {type_}'],
+        date=today,
+    )
+
+    return result
+
+
+def entity_bulk_apply(classifications) -> dict:
+    """
+    Apply a batch of entity classifications.
+
+    `classifications` may be either:
+      - a list of {id, type} dicts, or
+      - a path to a JSON file containing such a list.
+
+    Tolerates per-entity failures; returns a summary.
+    """
+    if isinstance(classifications, str):
+        with open(classifications, 'r', encoding='utf-8') as f:
+            classifications = json.load(f)
+    if not isinstance(classifications, list):
+        raise ValueError('Expected a list of {id, type} classifications')
+
+    applied = 0
+    errors: list[dict] = []
+    updated_ids: list[str] = []
+
+    for item in classifications:
+        if not isinstance(item, dict) or 'id' not in item or 'type' not in item:
+            errors.append({'item': item, 'error': 'missing id or type'})
+            continue
+        try:
+            entity_apply(item['id'], item['type'])
+            applied += 1
+            updated_ids.append(item['id'])
+        except (ValueError, KeyError, FileNotFoundError) as e:
+            errors.append({'id': item.get('id'), 'error': str(e)})
+
+    return {
+        'applied': applied,
+        'errors': errors,
+        'updated_ids': updated_ids,
+    }
+
+
+def _detect_id_prefixes(slugs: list[str], min_count: int = 2) -> dict[str, int]:
+    """Return {PREFIX: count} for slugs matching `^[A-Z]{2,8}-\\d+`."""
+    prefixes: dict[str, int] = {}
+    pat = re.compile(r'^([A-Z]{2,8})[-_]?\d+', re.IGNORECASE)
+    for slug in slugs:
+        m = pat.match(slug)
+        if m:
+            p = m.group(1).upper()
+            prefixes[p] = prefixes.get(p, 0) + 1
+    return {p: c for p, c in prefixes.items() if c >= min_count}
+
+
+def generate_home(client_slug: str = None, workspace_wide: bool = False) -> dict:
+    """
+    Generate a HOME.md navigation hub for a client (or workspace-wide).
+
+    Uses Obsidian Dataview queries for the rich-rendering case and a
+    plain-markdown fallback listing so the file is still useful outside
+    Obsidian. Always overwrites the target HOME.md.
+
+    Returns ``{path, pages_total, types_detected, prefixes_detected, top_tags}``.
+    """
+    if workspace_wide:
+        scope_dir = WIKI_DIR
+        out_path = os.path.join(WIKI_DIR, 'HOME.md')
+        scope_name = 'Workspace'
+        dv_from = '"wiki"'
+    else:
+        if not client_slug:
+            raise ValueError('Provide client_slug or use workspace_wide=True')
+        scope_dir = os.path.join(WIKI_DIR, client_slug)
+        out_path = os.path.join(scope_dir, 'HOME.md')
+        scope_name = client_slug
+        dv_from = f'"wiki/{client_slug}"'
+
+    pages: list[dict] = []
+    if os.path.isdir(scope_dir):
+        pattern = os.path.join(scope_dir, '**', '*.md')
+        for page_path in sorted(glob.glob(pattern, recursive=True)):
+            rel = os.path.relpath(page_path, scope_dir)
+            parts = Path(rel).parts
+            if any(p in EXCLUDED_DIRS for p in parts[:-1]):
+                continue
+            if os.path.basename(page_path) in EXCLUDED_FILES:
+                continue
+            if os.path.basename(page_path).upper() == 'HOME.MD':
+                continue
+            try:
+                with open(page_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except Exception:
+                continue
+            fm, _ = parse_frontmatter(content)
+            slug = os.path.splitext(os.path.basename(page_path))[0]
+            pages.append({
+                'slug': slug,
+                'title': fm.get('title', slug),
+                'type': fm.get('type', ''),
+                'rel': rel.replace(os.sep, '/'),
+            })
+
+    # Group by type
+    by_type: dict[str, list[dict]] = {}
+    for p in pages:
+        by_type.setdefault(p['type'] or 'unclassified', []).append(p)
+
+    # Detect ID prefixes
+    prefixes = _detect_id_prefixes([p['slug'] for p in pages])
+    by_prefix: dict[str, list[dict]] = {}
+    for p in pages:
+        m = re.match(r'^([A-Z]{2,8})[-_]?\d+', p['slug'], re.IGNORECASE)
+        if m:
+            key = m.group(1).upper()
+            if key in prefixes:
+                by_prefix.setdefault(key, []).append(p)
+
+    # Top tags (scoped)
+    top_tags: list[tuple[str, int]] = []
+    tags_data = tags_list()
+    if tags_data:
+        scoped: list[tuple[str, int]] = []
+        for tag_name, info in tags_data.items():
+            if client_slug and not workspace_wide:
+                tag_pages = info.get('pages', [])
+                count = sum(1 for tp in tag_pages if tp.startswith(client_slug + '/'))
+            else:
+                count = info.get('count', 0)
+            if count > 0:
+                scoped.append((tag_name, count))
+        scoped.sort(key=lambda kv: -kv[1])
+        top_tags = scoped[:10]
+
+    # Render
+    lines: list[str] = []
+    lines.append(f'# {scope_name} — Home')
+    lines.append('')
+    lines.append(f'_Auto-generated by `mneme home generate`. Last updated: {datetime.now().strftime("%Y-%m-%d")}._')
+    lines.append('')
+    lines.append(f'Total pages: **{len(pages)}**')
+    lines.append('')
+
+    # By type
+    lines.append('## By page type')
+    lines.append('')
+    lines.append('```dataview')
+    lines.append(f'TABLE WITHOUT ID file.link AS Page, type, updated')
+    lines.append(f'FROM {dv_from}')
+    lines.append('WHERE type')
+    lines.append('SORT type ASC, file.name ASC')
+    lines.append('```')
+    lines.append('')
+    lines.append('<details><summary>Plain-markdown fallback (no Dataview)</summary>')
+    lines.append('')
+    for t in sorted(by_type.keys()):
+        lines.append(f'### {t} ({len(by_type[t])})')
+        lines.append('')
+        for p in by_type[t][:50]:
+            link = p['rel'][:-3] if p['rel'].endswith('.md') else p['rel']
+            lines.append(f'- [[{link}|{p["title"]}]]')
+        if len(by_type[t]) > 50:
+            lines.append(f'- … and {len(by_type[t]) - 50} more')
+        lines.append('')
+    lines.append('</details>')
+    lines.append('')
+
+    # By ID prefix
+    if by_prefix:
+        lines.append('## By ID prefix')
+        lines.append('')
+        for prefix in sorted(by_prefix.keys()):
+            lines.append(f'### {prefix}-* ({len(by_prefix[prefix])})')
+            lines.append('')
+            lines.append('```dataview')
+            lines.append('TABLE WITHOUT ID file.link AS Page, updated')
+            lines.append(f'FROM {dv_from}')
+            lines.append(f'WHERE startswith(lower(file.name), "{prefix.lower()}")')
+            lines.append('SORT file.name ASC')
+            lines.append('```')
+            lines.append('')
+            lines.append('<details><summary>Plain-markdown fallback</summary>')
+            lines.append('')
+            for p in by_prefix[prefix][:50]:
+                link = p['rel'][:-3] if p['rel'].endswith('.md') else p['rel']
+                lines.append(f'- [[{link}|{p["title"]}]]')
+            if len(by_prefix[prefix]) > 50:
+                lines.append(f'- … and {len(by_prefix[prefix]) - 50} more')
+            lines.append('')
+            lines.append('</details>')
+            lines.append('')
+
+    # Top tags
+    if top_tags:
+        lines.append('## Top tags')
+        lines.append('')
+        lines.append('| Tag | Pages |')
+        lines.append('|---|---:|')
+        for tag_name, count in top_tags:
+            lines.append(f'| `{tag_name}` | {count} |')
+        lines.append('')
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+
+    return {
+        'path': out_path,
+        'pages_total': len(pages),
+        'types_detected': sorted(by_type.keys()),
+        'prefixes_detected': sorted(prefixes.keys()),
+        'top_tags': [t for t, _ in top_tags],
     }
 
 
@@ -5234,7 +6013,7 @@ def scan_repo(repo_path: str, client_slug: str) -> dict:
 
 def repair() -> dict:
     """
-    Repair corrupted Mnemosyne archives and schema files.
+    Repair corrupted mneme archives and schema files.
 
     Checks:
     - search.db: exists and is usable; if missing/corrupt, deletes and rebuilds via rebuild_index
@@ -5291,7 +6070,7 @@ def repair() -> dict:
     # --- index.md ---
     if not os.path.exists(INDEX_FILE):
         with open(INDEX_FILE, 'w') as f:
-            f.write(f'# Mnemosyne Index\nLast updated: {today}\n\n')
+            f.write(f'# mneme Index\nLast updated: {today}\n\n')
         repaired.append('index.md created (was missing)')
 
     return {
@@ -5427,7 +6206,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog='mneme',
-        description='Mnemosyne - your second brain. LLM Wiki + FTS5 search layer.',
+        description='mneme - your second brain. LLM Wiki + FTS5 search layer.',
     )
     parser.add_argument(
         '--version', '-V',
@@ -5464,7 +6243,7 @@ def main() -> None:
     ingest_parser.add_argument('--force', action='store_true', help='Re-ingest even if source was previously ingested')
 
     # init
-    init_parser = subparsers.add_parser('init', help='Initialize a new Mnemosyne workspace')
+    init_parser = subparsers.add_parser('init', help='Initialize a new mneme workspace')
     init_parser.add_argument('--project', type=str, default=None, help='Project name (default: current directory name)')
     init_parser.add_argument('--clients', type=str, default=None, help='Comma-separated client slugs (default: default)')
 
@@ -5477,6 +6256,8 @@ def main() -> None:
     ingest_dir_parser.add_argument('client_slug', help='Client slug (e.g. demo-retail, my-client)')
     ingest_dir_parser.add_argument('--force', action='store_true', help='Re-ingest even if sources were previously ingested')
     ingest_dir_parser.add_argument('--recursive', '-r', action='store_true', help='Recurse into subdirectories')
+    ingest_dir_parser.add_argument('--preserve-structure', dest='preserve_structure', action='store_true',
+                                   help='Mirror source directory structure into wiki/<client>/ subdirectories')
 
     # tornado
     tornado_parser = subparsers.add_parser('tornado', help='Process inbox: auto-detect, ingest, archive')
@@ -5524,6 +6305,56 @@ def main() -> None:
     tags_apply_parser.add_argument('page', help='Page slug (e.g. client-a/proposal)')
     tags_apply_parser.add_argument('--add', help='Comma-separated tags to add')
     tags_apply_parser.add_argument('--remove', help='Comma-separated tags to remove')
+
+    # tags bulk-suggest / bulk-apply -- operate on many pages at once
+    tags_bulk_suggest_parser = tags_sub.add_parser(
+        'bulk-suggest',
+        help='Build a tag packet covering many pages at once',
+    )
+    tags_bulk_suggest_parser.add_argument('--client', help='Limit to one client')
+    tags_bulk_suggest_parser.add_argument('--filter', dest='filter_substr', help='Substring filter on wiki_path (e.g. req-)')
+    tags_bulk_suggest_parser.add_argument('--limit', type=int, default=20, help='Max pages in the packet (default 20)')
+    tags_bulk_suggest_parser.add_argument('--include-tagged', action='store_true', help='Include pages that already have non-auto tags')
+    tags_bulk_suggest_parser.add_argument('--json', action='store_true', help='Output raw JSON')
+    tags_bulk_suggest_parser.add_argument('--out', help='Write packet to a file instead of stdout')
+
+    tags_bulk_apply_parser = tags_sub.add_parser(
+        'bulk-apply',
+        help='Apply tag changes from an agent response JSON file',
+    )
+    tags_bulk_apply_parser.add_argument('file', help='JSON file: {"pages": [{wiki_path, add, remove}, ...]}')
+
+    # entity - agent-driven classification (same pattern as tags suggest/apply)
+    entity_parser = subparsers.add_parser('entity', help='Entity classification (agent-driven)')
+    entity_sub = entity_parser.add_subparsers(dest='entity_command')
+    entity_suggest_parser = entity_sub.add_parser(
+        'suggest',
+        help='Build an entity-classification packet for an LLM agent',
+    )
+    entity_suggest_parser.add_argument('--client', help='Limit to one client')
+    entity_suggest_parser.add_argument('--limit', type=int, default=50, help='Max entities in the packet (default 50)')
+    entity_suggest_parser.add_argument('--all', action='store_true', help='Include already-classified entities too')
+    entity_suggest_parser.add_argument('--json', action='store_true', help='Output raw JSON')
+    entity_suggest_parser.add_argument('--out', help='Write packet to a file instead of stdout')
+
+    entity_apply_parser = entity_sub.add_parser(
+        'apply',
+        help='Classify a single entity by id',
+    )
+    entity_apply_parser.add_argument('--id', required=True, help='Entity id (e.g. iso-13485)')
+    entity_apply_parser.add_argument('--type', required=True, help='Entity type (standard|company|person|product|technology|concept|brand|unknown)')
+
+    entity_bulk_parser = entity_sub.add_parser(
+        'bulk-apply',
+        help='Classify many entities from a JSON file',
+    )
+    entity_bulk_parser.add_argument('file', help='JSON file: list of {id, type} objects')
+
+    # home -- generate a navigation landing page for Obsidian
+    home_parser = subparsers.add_parser('home', help='Generate a HOME.md landing page (Dataview + fallback)')
+    home_parser.add_argument('--client', help='Generate wiki/<client>/HOME.md')
+    home_parser.add_argument('--all-clients', dest='workspace_wide', action='store_true',
+                             help='Generate cross-client wiki/HOME.md')
 
     # diff
     diff_parser = subparsers.add_parser('diff', help='Show git diff for a wiki page')
@@ -5737,7 +6568,7 @@ def main() -> None:
         result = lint()
         total = result['total_issues']
         issues = result['issues']
-        print(f'=== Mnemosyne Lint ===\n')
+        print(f'=== mneme Lint ===\n')
         if total == 0:
             print('All checks passed. Knowledge base is healthy.')
         else:
@@ -5764,7 +6595,8 @@ def main() -> None:
             sys.exit(1)
         try:
             result = ingest_dir(args.directory, args.client_slug, force=args.force,
-                               recursive=getattr(args, 'recursive', False))
+                               recursive=getattr(args, 'recursive', False),
+                               preserve_structure=getattr(args, 'preserve_structure', False))
             print(f'\nBatch ingest complete.')
             print(f'  Ingested:  {result["ingested"]}')
             print(f'  Skipped:   {result["skipped"]}')
@@ -5794,7 +6626,7 @@ def main() -> None:
 
     elif args.command == 'status':
         result = status()
-        print('=== Mnemosyne Status ===\n')
+        print('=== mneme Status ===\n')
         print(f'  Sources:           {result.get("total_sources", 0)}')
         print(f'  Un-ingested:       {result.get("un_ingested", 0)}')
         print(f'  Wiki pages:        {result.get("total_wiki_pages", 0)}')
@@ -5860,8 +6692,96 @@ def main() -> None:
             if result['removed']:
                 print(f'  Removed: {", ".join(result["removed"])}')
             print(f'  Tags now: {", ".join(result["tags_after"])}')
+        elif args.tags_command == 'bulk-suggest':
+            packet = tags_bulk_suggest(
+                client=args.client,
+                filter_substr=args.filter_substr,
+                limit=args.limit,
+                include_tagged=args.include_tagged,
+            )
+            if args.json:
+                output = json.dumps(packet, indent=2)
+            else:
+                output = _format_bulk_tag_packet(packet)
+            if args.out:
+                with open(args.out, 'w', encoding='utf-8') as f:
+                    f.write(output)
+                print(f'Bulk tag packet written to {args.out} ({len(packet["pages"])} pages)')
+            else:
+                print(output)
+        elif args.tags_command == 'bulk-apply':
+            try:
+                result = tags_bulk_apply(args.file)
+            except (ValueError, FileNotFoundError) as e:
+                print(f'Error: {e}', file=sys.stderr)
+                sys.exit(1)
+            print(f'Bulk tag apply complete.')
+            print(f'  Pages updated:    {result["applied"]}')
+            print(f'  Tags added:       {result["total_tags_added"]}')
+            print(f'  Tags removed:     {result["total_tags_removed"]}')
+            if result['failed']:
+                print(f'  Failures:         {len(result["failed"])}')
+                for f in result['failed'][:10]:
+                    print(f'    - {f}')
         else:
-            print('Usage: mneme tags {list|merge|suggest|apply}', file=sys.stderr)
+            print('Usage: mneme tags {list|merge|suggest|apply|bulk-suggest|bulk-apply}', file=sys.stderr)
+
+    elif args.command == 'entity':
+        if args.entity_command == 'suggest':
+            packet = entity_suggest(
+                client=args.client,
+                limit=args.limit,
+                only_unknown=not args.all,
+            )
+            if args.json:
+                output = json.dumps(packet, indent=2)
+            else:
+                output = _format_entity_packet(packet)
+            if args.out:
+                with open(args.out, 'w', encoding='utf-8') as f:
+                    f.write(output)
+                print(f'Entity packet written to {args.out}')
+            else:
+                print(output)
+        elif args.entity_command == 'apply':
+            try:
+                result = entity_apply(args.id, args.type)
+            except (KeyError, ValueError, FileNotFoundError) as e:
+                print(f'Error: {e}', file=sys.stderr)
+                sys.exit(1)
+            print(f'Classified entity "{result["id"]}": {result["old_type"]} -> {result["new_type"]}')
+        elif args.entity_command == 'bulk-apply':
+            try:
+                result = entity_bulk_apply(args.file)
+            except (ValueError, FileNotFoundError) as e:
+                print(f'Error: {e}', file=sys.stderr)
+                sys.exit(1)
+            print(f'Bulk classification complete.')
+            print(f'  Applied: {result["applied"]}')
+            if result['errors']:
+                print(f'  Errors:  {len(result["errors"])}')
+                for err in result['errors'][:10]:
+                    print(f'    - {err}')
+        else:
+            print('Usage: mneme entity {suggest|apply|bulk-apply}', file=sys.stderr)
+
+    elif args.command == 'home':
+        if not args.client and not args.workspace_wide:
+            print('Error: provide --client <slug> or --all-clients', file=sys.stderr)
+            sys.exit(1)
+        try:
+            result = generate_home(
+                client_slug=args.client,
+                workspace_wide=args.workspace_wide,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            print(f'Error: {e}', file=sys.stderr)
+            sys.exit(1)
+        print(f'HOME.md generated: {result["path"]}')
+        print(f'  Pages:      {result["pages_total"]}')
+        print(f'  Types:      {", ".join(result["types_detected"]) or "(none)"}')
+        print(f'  Prefixes:   {", ".join(result["prefixes_detected"]) or "(none)"}')
+        print(f'  Top tags:   {", ".join(result["top_tags"][:5]) or "(none)"}')
 
     elif args.command == 'diff':
         output = diff_page(args.page)
@@ -6139,8 +7059,8 @@ def main() -> None:
                 print(f'Progress: {done}/{len(plan["tasks"])}')
                 print()
                 for t in plan['tasks']:
-                    status = statuses.get(t['id'], 'pending')
-                    marker = '[x]' if status == 'done' else '[ ]'
+                    task_status = statuses.get(t['id'], 'pending')
+                    marker = '[x]' if task_status == 'done' else '[ ]'
                     print(f'  {marker} {t["id"]}  ({t["kind"]})')
                     print(f'      {t["goal"]}')
 

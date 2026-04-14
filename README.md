@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/tolism/mneme/main/assets/logo.png" alt="Mnemosyne" width="400">
+  <img src="https://raw.githubusercontent.com/tolism/mneme/main/assets/logo.png" alt="mneme" width="400">
 </p>
 
 <h1 align="center"></h1>
@@ -124,6 +124,13 @@ One installed CLI serves many projects — each workspace is just a directory.
 | `mneme validate writing-style <page>` | Build a *review packet* for an LLM agent to grade a page |
 | `mneme tags suggest <page>` | Build a *tag packet* for an LLM agent to choose tags |
 | `mneme tags apply <page> --add t1,t2 --remove t3` | Atomic tag update (frontmatter + schema + search index) |
+| `mneme tags bulk-suggest --client X --filter req- --limit 50` | Build one *bulk packet* covering many pages |
+| `mneme tags bulk-apply response.json` | Apply tag changes from an agent JSON response |
+| `mneme entity suggest --client X` | Build an *entity-classification packet* for an LLM agent |
+| `mneme entity apply --id <id> --type <type>` | Set one entity's type atomically |
+| `mneme entity bulk-apply classifications.json` | Bulk classify many entities |
+| `mneme home --client X` / `--all-clients` | Generate a `HOME.md` navigation hub (Dataview + fallback) |
+| `mneme ingest-dir --recursive --preserve-structure` | Mirror source directory hierarchy into the wiki |
 | `mneme agent plan --goal "..." --doc-type <t> --client <c>` | Generate a deterministic TODO plan from the active profile |
 | `mneme agent next-task` | Return the next ready task in the active plan |
 | `mneme agent task-done <id>` | Mark a task as done |

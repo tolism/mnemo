@@ -1,4 +1,4 @@
-# EXAMPLES.md - Mnemosyne Usage Guide
+# EXAMPLES.md - mneme Usage Guide
 
 Real-world workflows, core concepts, and entity types used in mneme.
 
@@ -256,7 +256,7 @@ cp ~/old-qms/*.pdf inbox/
 # Let tornado figure it out
 mneme tornado --client cardio-monitor
 
-#   === Mnemosyne Tornado ===
+#   === mneme Tornado ===
 #
 #   Scanning inbox/... found 50 files
 #

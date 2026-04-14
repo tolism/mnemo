@@ -1,4 +1,4 @@
-# Mnemosyne - Wiki Protocol
+# mneme - Wiki Protocol
 
 > **If you are an LLM agent driving mneme**, read [AGENTS.md](AGENTS.md) **first**. It is the canonical agent protocol: the agent loop, the standard task templates, the sub-agent spawning patterns, and the hard rules you must never violate. CLAUDE.md (this file) describes the wiki layer; AGENTS.md describes the agent's job.
 

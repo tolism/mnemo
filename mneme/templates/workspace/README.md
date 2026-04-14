@@ -1,6 +1,6 @@
 # {{PROJECT_NAME}}
 
-A Mnemosyne knowledge workspace.
+A mneme knowledge workspace.
 
 ## Quick start
 

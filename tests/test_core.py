@@ -1,5 +1,5 @@
 """
-Comprehensive pytest test suite for Mnemosyne core.
+Comprehensive pytest test suite for mneme core.
 
 Covers:
   - parse_frontmatter (pure parsing)
@@ -387,6 +387,388 @@ class TestTagsApply:
             tags_apply('demo/no-such-page', add=['x'])
 
 
+class TestIngestDirPreserveStructure:
+    """ingest-dir --preserve-structure mirrors source layout in the wiki."""
+
+    def _make_source_tree(self, workspace, layout):
+        """layout: dict of {relpath_from_sources_dir: content}"""
+        for rel, content in layout.items():
+            full = os.path.join(workspace, 'sources', rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, 'w') as f:
+                f.write(content)
+
+    def test_flat_default_unchanged(self, sync_workspace):
+        from mneme.core import ingest_dir
+        self._make_source_tree(sync_workspace, {
+            'demo/REQUIREMENTS/req-001.md': '# req 1',
+            'demo/DESIGN/dds-001.md': '# dds 1',
+        })
+        ingest_dir(os.path.join(sync_workspace, 'sources', 'demo'),
+                   'demo', recursive=True)
+        # Without --preserve-structure, both pages flatten
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'req-001.md'))
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'dds-001.md'))
+
+    def test_preserve_structure_creates_subdirs(self, sync_workspace):
+        from mneme.core import ingest_dir
+        self._make_source_tree(sync_workspace, {
+            'demo/REQUIREMENTS/req-001.md': '# req 1',
+            'demo/DESIGN/dds-001.md': '# dds 1',
+        })
+        ingest_dir(os.path.join(sync_workspace, 'sources', 'demo'),
+                   'demo', recursive=True, preserve_structure=True)
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'requirements', 'req-001.md'))
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'design', 'dds-001.md'))
+
+    def test_preserve_avoids_basename_collision(self, sync_workspace):
+        from mneme.core import ingest_dir
+        self._make_source_tree(sync_workspace, {
+            'demo/A/INSTRUCTIONS.md': '# A version',
+            'demo/B/INSTRUCTIONS.md': '# B version',
+        })
+        ingest_dir(os.path.join(sync_workspace, 'sources', 'demo'),
+                   'demo', recursive=True, preserve_structure=True)
+        # Both should exist under their own subdirectory
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'a', 'instructions.md'))
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'b', 'instructions.md'))
+
+    def test_fts5_indexes_nested_pages(self, sync_workspace):
+        from mneme.core import ingest_dir, dual_search
+        self._make_source_tree(sync_workspace, {
+            'demo/REQUIREMENTS/req-001.md': '# Cardiac monitoring requirement',
+        })
+        ingest_dir(os.path.join(sync_workspace, 'sources', 'demo'),
+                   'demo', recursive=True, preserve_structure=True)
+        results = dual_search('cardiac', k=5)
+        assert any('requirements/req-001' in r['wiki_path'] for r in results)
+
+    def test_auto_detect_subpath(self, sync_workspace):
+        from mneme.core import _auto_detect_subpath
+        # File under sources/<client>/sub/dir/file.md -> subpath 'sub/dir' (slugified)
+        path = os.path.join(sync_workspace, 'sources', 'demo', 'TRACE', 'REQ', 'r1.md')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write('content')
+        sub = _auto_detect_subpath(path, 'demo')
+        assert sub == os.path.join('trace', 'req')
+
+    def test_resync_picks_up_nested_baseline(self, sync_workspace):
+        """A source ingested with --preserve-structure must resync to the nested page."""
+        from mneme.core import ingest_dir, resync_source
+        self._make_source_tree(sync_workspace, {
+            'demo/AREA/a-doc.md': '# Original content',
+        })
+        ingest_dir(os.path.join(sync_workspace, 'sources', 'demo'),
+                   'demo', recursive=True, preserve_structure=True)
+        nested_page = os.path.join(sync_workspace, 'wiki', 'demo', 'area', 'a-doc.md')
+        flat_page = os.path.join(sync_workspace, 'wiki', 'demo', 'a-doc.md')
+        assert os.path.exists(nested_page)
+        assert not os.path.exists(flat_page)
+
+        # Modify the source and resync
+        src = os.path.join(sync_workspace, 'sources', 'demo', 'AREA', 'a-doc.md')
+        with open(src, 'w') as f:
+            f.write('# Original content\n\nUpdated paragraph.')
+        result = resync_source(src, 'demo')
+        # The nested page must have been targeted, not duplicated
+        assert os.path.exists(nested_page)
+        assert not os.path.exists(flat_page)
+
+
+class TestGenerateHome:
+    """generate_home() writes a navigable landing page."""
+
+    def test_generates_for_client(self, sync_workspace):
+        from mneme.core import generate_home
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'b1')
+        _make_simple_page(sync_workspace, 'demo', 'p2', 'b2')
+        result = generate_home(client_slug='demo')
+        assert os.path.exists(result['path'])
+        assert result['pages_total'] == 2
+        assert result['path'].endswith(os.path.join('wiki', 'demo', 'HOME.md'))
+        with open(result['path']) as f:
+            content = f.read()
+        assert '```dataview' in content
+        assert 'demo — Home' in content
+
+    def test_detects_id_prefixes(self, sync_workspace):
+        from mneme.core import generate_home
+        _make_simple_page(sync_workspace, 'demo', 'REQ-001', 'b')
+        _make_simple_page(sync_workspace, 'demo', 'REQ-002', 'b')
+        _make_simple_page(sync_workspace, 'demo', 'DDS-001', 'b')
+        _make_simple_page(sync_workspace, 'demo', 'DDS-002', 'b')
+        _make_simple_page(sync_workspace, 'demo', 'one-off', 'b')
+        result = generate_home(client_slug='demo')
+        assert 'REQ' in result['prefixes_detected']
+        assert 'DDS' in result['prefixes_detected']
+        with open(result['path']) as f:
+            content = f.read()
+        assert 'REQ-*' in content
+        assert 'DDS-*' in content
+
+    def test_workspace_wide(self, sync_workspace):
+        from mneme.core import generate_home
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'b')
+        result = generate_home(workspace_wide=True)
+        assert result['path'] == os.path.join(sync_workspace, 'wiki', 'HOME.md')
+        with open(result['path']) as f:
+            content = f.read()
+        assert 'Workspace — Home' in content
+
+    def test_idempotent(self, sync_workspace):
+        from mneme.core import generate_home
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'b')
+        r1 = generate_home(client_slug='demo')
+        r2 = generate_home(client_slug='demo')
+        assert r1['path'] == r2['path']
+        # Re-run doesn't double page count (HOME.md is excluded from the scan)
+        assert r2['pages_total'] == 1
+
+    def test_plain_markdown_fallback_present(self, sync_workspace):
+        from mneme.core import generate_home
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'b')
+        result = generate_home(client_slug='demo')
+        with open(result['path']) as f:
+            content = f.read()
+        # The <details> fallback contains plain markdown links
+        assert '<details>' in content
+        assert '[[' in content
+
+    def test_missing_args_raises(self, sync_workspace):
+        from mneme.core import generate_home
+        with pytest.raises(ValueError):
+            generate_home()
+
+    def test_detect_id_prefixes_helper(self):
+        from mneme.core import _detect_id_prefixes
+        result = _detect_id_prefixes(['REQ-001', 'REQ-002', 'DDS-001', 'one-off'])
+        assert result == {'REQ': 2}  # DDS has only 1, filtered by min_count
+
+
+class TestBulkTags:
+    """tags_bulk_suggest / tags_bulk_apply."""
+
+    def test_bulk_suggest_only_untagged_by_default(self, sync_workspace):
+        from mneme.core import tags_bulk_suggest, tags_apply
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        _make_simple_page(sync_workspace, 'demo', 'p2', 'body')
+        tags_apply('demo/p1', add=['already-tagged'])
+        packet = tags_bulk_suggest(client='demo')
+        paths = {p['wiki_path'] for p in packet['pages']}
+        assert 'demo/p2.md' in paths
+        assert 'demo/p1.md' not in paths
+
+    def test_bulk_suggest_include_tagged_flag(self, sync_workspace):
+        from mneme.core import tags_bulk_suggest, tags_apply
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        tags_apply('demo/p1', add=['already-tagged'])
+        packet = tags_bulk_suggest(client='demo', include_tagged=True)
+        paths = {p['wiki_path'] for p in packet['pages']}
+        assert 'demo/p1.md' in paths
+
+    def test_bulk_suggest_respects_limit(self, sync_workspace):
+        from mneme.core import tags_bulk_suggest
+        for i in range(10):
+            _make_simple_page(sync_workspace, 'demo', f'p{i}', 'body')
+        packet = tags_bulk_suggest(client='demo', limit=3)
+        assert len(packet['pages']) == 3
+
+    def test_bulk_suggest_filter(self, sync_workspace):
+        from mneme.core import tags_bulk_suggest
+        _make_simple_page(sync_workspace, 'demo', 'req-001', 'body')
+        _make_simple_page(sync_workspace, 'demo', 'dds-001', 'body')
+        packet = tags_bulk_suggest(client='demo', filter_substr='req-')
+        paths = {p['wiki_path'] for p in packet['pages']}
+        assert any('req-001' in p for p in paths)
+        assert not any('dds-001' in p for p in paths)
+
+    def test_bulk_suggest_shares_taxonomy_once(self, sync_workspace):
+        from mneme.core import tags_bulk_suggest, tags_apply
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        _make_simple_page(sync_workspace, 'demo', 'p2', 'body')
+        _make_simple_page(sync_workspace, 'demo', 'p3', 'body')
+        tags_apply('demo/p1', add=['shared'])
+        # p2, p3 untagged -> in packet
+        packet = tags_bulk_suggest(client='demo')
+        assert isinstance(packet['tag_taxonomy'], list)
+        # Taxonomy is at the packet root, not per-page
+        for p in packet['pages']:
+            assert 'tag_taxonomy' not in p
+
+    def test_bulk_apply_all_changes(self, sync_workspace):
+        from mneme.core import tags_bulk_apply, tags_list
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        _make_simple_page(sync_workspace, 'demo', 'p2', 'body')
+        result = tags_bulk_apply({
+            'pages': [
+                {'wiki_path': 'demo/p1.md', 'add': ['foo', 'bar']},
+                {'wiki_path': 'demo/p2.md', 'add': ['baz']},
+            ]
+        })
+        assert result['applied'] == 2
+        assert result['total_tags_added'] == 3
+        tags = tags_list()
+        assert 'foo' in tags and 'bar' in tags and 'baz' in tags
+
+    def test_bulk_apply_continues_on_missing_page(self, sync_workspace):
+        from mneme.core import tags_bulk_apply
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        result = tags_bulk_apply({
+            'pages': [
+                {'wiki_path': 'demo/p1.md', 'add': ['foo']},
+                {'wiki_path': 'demo/missing.md', 'add': ['bar']},
+            ]
+        })
+        assert result['applied'] == 1
+        assert len(result['failed']) == 1
+        assert 'missing' in result['failed'][0]['wiki_path']
+
+    def test_bulk_apply_rejects_bad_shape(self, sync_workspace):
+        from mneme.core import tags_bulk_apply
+        with pytest.raises(ValueError):
+            tags_bulk_apply({'not_pages': []})
+        with pytest.raises(ValueError):
+            tags_bulk_apply({'pages': 'not a list'})
+
+
+class TestEntityClassification:
+    """entity_suggest / entity_apply / entity_bulk_apply."""
+
+    def _seed_entities(self, workspace, rows):
+        entities_path = os.path.join(workspace, 'schema', 'entities.json')
+        data = {'version': 1, 'updated': '2026-04-14', 'entities': rows}
+        with open(entities_path, 'w') as f:
+            json.dump(data, f)
+
+    def test_suggest_default_only_unknown(self, sync_workspace):
+        from mneme.core import entity_suggest
+        self._seed_entities(sync_workspace, [
+            {'id': 'iso-13485', 'name': 'ISO 13485', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+            {'id': 'already-classified', 'name': 'Acme Corp', 'type': 'company', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+        ])
+        packet = entity_suggest(client='demo')
+        ids = {e['id'] for e in packet['entities']}
+        assert 'iso-13485' in ids
+        assert 'already-classified' not in ids
+
+    def test_suggest_all_includes_classified(self, sync_workspace):
+        from mneme.core import entity_suggest
+        self._seed_entities(sync_workspace, [
+            {'id': 'iso-13485', 'name': 'ISO 13485', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+            {'id': 'acme', 'name': 'Acme', 'type': 'company', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+        ])
+        packet = entity_suggest(client='demo', only_unknown=False)
+        ids = {e['id'] for e in packet['entities']}
+        assert 'acme' in ids
+
+    def test_suggest_respects_limit(self, sync_workspace):
+        from mneme.core import entity_suggest
+        self._seed_entities(sync_workspace, [
+            {'id': f'e-{i}', 'name': f'Entity {i}', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []}
+            for i in range(10)
+        ])
+        packet = entity_suggest(client='demo', limit=3)
+        assert len(packet['entities']) == 3
+
+    def test_suggest_packet_fields(self, sync_workspace):
+        from mneme.core import entity_suggest
+        self._seed_entities(sync_workspace, [
+            {'id': 'foo', 'name': 'Foo', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+        ])
+        packet = entity_suggest(client='demo')
+        assert 'entities' in packet
+        assert 'existing_types' in packet
+        assert 'valid_types' in packet
+        assert 'entity_prompt' in packet
+        assert 'standard' in packet['valid_types']
+
+    def test_apply_updates_type(self, sync_workspace):
+        from mneme.core import entity_apply
+        self._seed_entities(sync_workspace, [
+            {'id': 'iso-13485', 'name': 'ISO 13485', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+        ])
+        result = entity_apply('iso-13485', 'standard')
+        assert result['old_type'] == 'unknown'
+        assert result['new_type'] == 'standard'
+        # Verify persisted
+        with open(os.path.join(sync_workspace, 'schema', 'entities.json')) as f:
+            data = json.load(f)
+        e = next(x for x in data['entities'] if x['id'] == 'iso-13485')
+        assert e['type'] == 'standard'
+
+    def test_apply_rejects_invalid_type(self, sync_workspace):
+        from mneme.core import entity_apply
+        self._seed_entities(sync_workspace, [
+            {'id': 'foo', 'name': 'Foo', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+        ])
+        with pytest.raises(ValueError):
+            entity_apply('foo', 'nonsense')
+
+    def test_apply_raises_on_missing_id(self, sync_workspace):
+        from mneme.core import entity_apply
+        self._seed_entities(sync_workspace, [])
+        with pytest.raises(KeyError):
+            entity_apply('nonexistent', 'company')
+
+    def test_bulk_apply_partial_failure(self, sync_workspace):
+        from mneme.core import entity_bulk_apply
+        self._seed_entities(sync_workspace, [
+            {'id': 'a', 'name': 'A', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+            {'id': 'b', 'name': 'B', 'type': 'unknown', 'client': 'demo', 'wiki_page': 'demo/p1', 'tags': []},
+        ])
+        result = entity_bulk_apply([
+            {'id': 'a', 'type': 'standard'},
+            {'id': 'does-not-exist', 'type': 'company'},
+            {'id': 'b', 'type': 'technology'},
+        ])
+        assert result['applied'] == 2
+        assert len(result['errors']) == 1
+        assert 'a' in result['updated_ids']
+        assert 'b' in result['updated_ids']
+
+
+class TestProgressBar:
+    """_ProgressBar behaves correctly in TTY and non-TTY modes."""
+
+    def test_non_tty_emits_periodic_lines(self):
+        import io
+        from mneme.core import _ProgressBar
+        buf = io.StringIO()
+        bar = _ProgressBar(10, stream=buf, enabled=False)
+        for _ in range(10):
+            bar.update(1, current='x')
+        bar.finish()
+        out = buf.getvalue()
+        # No carriage returns in non-TTY mode
+        assert '\r' not in out
+        # At least the final count should appear
+        assert '[10/10]' in out
+
+    def test_fmt_eta(self):
+        from mneme.core import _ProgressBar
+        assert _ProgressBar._fmt_eta(125) == '02:05'
+        assert _ProgressBar._fmt_eta(0) == '00:00'
+        assert _ProgressBar._fmt_eta(float('inf')) == '--:--'
+
+    def test_zero_total_does_not_crash(self):
+        import io
+        from mneme.core import _ProgressBar
+        bar = _ProgressBar(0, stream=io.StringIO(), enabled=False)
+        bar.update(0)
+        bar.finish()
+
+    def test_tty_mode_uses_carriage_return(self):
+        import io
+        from mneme.core import _ProgressBar
+        buf = io.StringIO()
+        bar = _ProgressBar(5, stream=buf, enabled=True)
+        for _ in range(5):
+            bar.update(1, current='a')
+        bar.finish()
+        assert '\r' in buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Category 5: CLI Integration Tests
 # ---------------------------------------------------------------------------
@@ -619,8 +1001,8 @@ def _cleanup_test_client():
             with open(fp, 'r') as f:
                 content = f.read().strip()
             header_only_signatures = (
-                '# Mnemosyne Index',
-                '# Mnemosyne Log',
+                '# mneme Index',
+                '# mneme Log',
                 '# Index',
                 '# Log',
             )
@@ -731,7 +1113,7 @@ class TestIngestIntegration:
         with open(index_file, 'r') as f:
             index_content = f.read()
         assert len(index_content) > 0
-        assert 'Mnemosyne' in index_content
+        assert 'mneme' in index_content
 
 
 # ---------------------------------------------------------------------------
