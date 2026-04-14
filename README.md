@@ -122,15 +122,18 @@ One installed CLI serves many projects — each workspace is just a directory.
 | `mneme search "<query>"` | Search across all layers |
 | `mneme draft --doc-type <t> --section <s> --client <c>` | Build a *write packet* for an LLM agent to produce one section |
 | `mneme validate writing-style <page>` | Build a *review packet* for an LLM agent to grade a page |
+| `mneme tags suggest <page>` | Build a *tag packet* for an LLM agent to choose tags |
+| `mneme tags apply <page> --add t1,t2 --remove t3` | Atomic tag update (frontmatter + schema + search index) |
 | `mneme agent plan --goal "..." --doc-type <t> --client <c>` | Generate a deterministic TODO plan from the active profile |
 | `mneme agent next-task` | Return the next ready task in the active plan |
 | `mneme agent task-done <id>` | Mark a task as done |
-| `mneme sync` | Sync wiki to Memvid memory |
+| `mneme sync` | Sync wiki pages to FTS5 search index |
+| `mneme reindex` | Rebuild search index from wiki pages |
 | `mneme drift` | Detect layer desynchronization |
 | `mneme stats` | Health overview |
 | `mneme repair` | Fix corrupted archives |
 
-**Formats:** `.md`, `.txt`, `.pdf`
+**Formats:** `.md`, `.txt`, `.pdf`, `.xlsx` (with `pip install "mneme-cli[xlsx]"`)
 
 ---
 
@@ -165,6 +168,121 @@ Mneme generates the plan deterministically from the active profile's section_not
 
 ---
 
+## End-to-end example: from raw documents to a tagged, searchable, validated knowledge base
+
+A realistic walkthrough showing how the human, the CLI, and the LLM agent collaborate. Suppose you're building a knowledge base for **Parkiwatch**, a medical device for Parkinson's monitoring.
+
+### Step 1 — Scaffold a workspace (human, one-time)
+
+```bash
+mneme new ~/projects/parkiwatch --name Parkiwatch --client parkiwatch --profile eu-mdr
+cd ~/projects/parkiwatch
+```
+
+Creates the workspace tree, sets the EU MDR writing-style profile, and initializes empty schema files.
+
+### Step 2 — Ingest source material (human)
+
+```bash
+# Drop a folder of source documents into inbox/, then bulk-process
+cp -r ~/Downloads/parkinson-research/* inbox/
+mneme tornado --client parkiwatch
+
+# Or ingest individual files
+mneme ingest research-paper.pdf parkiwatch
+mneme ingest-csv risk-register.csv parkiwatch --mapping risk-register
+mneme ingest spec-table.xlsx parkiwatch          # .xlsx renders sheets as markdown tables
+mneme ingest-dir docs/ parkiwatch --recursive    # walk subdirectories
+```
+
+What happens per ingest: source file → wiki page in `wiki/parkiwatch/` → frontmatter with auto-extracted entities → entry in `index.md` → row in the FTS5 search DB → log entry.
+
+### Step 3 — Tag the new pages (LLM agent)
+
+The new pages have only the auto-applied `parkiwatch` client tag. The agent now adds meaningful tags:
+
+```bash
+# For each new page, the agent runs:
+mneme tags suggest parkiwatch/research-paper > /tmp/packet.md
+```
+
+The packet contains the page body, the current tag taxonomy (every tag in the workspace + usage counts), and a ready-to-paste prompt. **The LLM reads the packet** — it understands the content and decides on tags, preferring existing taxonomy entries when they fit. The LLM's response is JSON:
+
+```json
+{"tags": ["clinical-trial", "iso-13485"], "new_tags": ["bradykinesia-detection"]}
+```
+
+The agent then runs:
+
+```bash
+mneme tags apply parkiwatch/research-paper \
+  --add clinical-trial,iso-13485,bradykinesia-detection
+```
+
+Atomic operation: rewrites the wiki page frontmatter, updates `schema/tags.json`, re-indexes the page in FTS5 (so search picks up the new tags immediately), appends a log entry. **Repeat for every page** — the taxonomy grows, and subsequent pages tend to reuse existing tags (consistency).
+
+### Step 4 — Search the knowledge base (anyone)
+
+```bash
+mneme search "bradykinesia"                              # BM25 + Porter stemming
+mneme search "clinical evaluation" --client parkiwatch   # client-scoped
+```
+
+Sub-millisecond. Returns the page title, snippet (with `<b>highlights</b>`), tags, and BM25 score.
+
+### Step 5 — Produce a regulatory deliverable (LLM agent driving the agent loop)
+
+```bash
+# Generate a deterministic plan from the active profile
+mneme agent plan --goal "produce a Design Validation Report" \
+                 --doc-type design-validation-report \
+                 --client parkiwatch
+# → 15 tasks: 11 section drafts + assemble + harmonize + review + submission-check
+
+# Walk the plan
+mneme agent next-task
+# → Task: section-purpose-and-scope
+#   next_command: mneme draft --doc-type design-validation-report \
+#                             --section purpose-and-scope --client parkiwatch
+
+mneme draft --doc-type design-validation-report \
+            --section purpose-and-scope --client parkiwatch \
+            --query "purpose scope intended use" \
+            --out /tmp/write-packet.md
+
+# The LLM reads /tmp/write-packet.md (which includes wiki search hits as evidence,
+# the profile's writing-style rules, and a write prompt) and produces the section.
+# The agent writes the section to wiki/parkiwatch/design-validation-report.md.
+
+mneme agent task-done section-purpose-and-scope
+
+# ... repeat for each section ...
+
+# After all sections drafted:
+mneme harmonize --client parkiwatch --fix       # mechanical vocabulary swap
+mneme validate writing-style parkiwatch/design-validation-report > /tmp/review.md
+# The LLM reads /tmp/review.md, critiques every section, applies fixes in place
+mneme agent task-done review-page
+
+# Submission readiness
+mneme validate consistency --client parkiwatch  # cross-doc version checks
+mneme trace gaps parkiwatch                     # find broken trace chains
+mneme trace matrix parkiwatch --csv --out trace-matrix.csv  # for the DHF
+mneme snapshot parkiwatch                       # versioned audit zip
+```
+
+### Who does what
+
+| Layer | Responsibility |
+|---|---|
+| **Human** | Drops sources, runs commands, reviews diffs, ships the deliverable |
+| **mneme CLI** | Deterministic infrastructure: parses files, builds packets, indexes, traces, harmonizes vocabulary, generates plans, atomic state updates |
+| **LLM agent** | All reasoning: classifying entities, choosing tags, drafting prose, grading writing style, deciding when a chain is complete |
+
+mneme never calls an LLM. The LLM never bypasses mneme's atomic operations. They meet at the packet boundary.
+
+---
+
 ## How It Works
 
 ```
@@ -177,9 +295,9 @@ Mneme generates the plan deterministically from the active profile's section_not
          |       Frontmatter, citations, [[wikilinks]]
          |       You read and browse here
          |
-         +---> Memory Layer (.mv2 archive)
-         |       Smart Frames, semantic embeddings
-         |       Machines query here (<5ms)
+         +---> Search Index (SQLite FTS5)
+         |       BM25 ranking, Porter stemming
+         |       Sub-millisecond queries, zero dependencies
          |
          +---> Schema Layer (JSON)
                  entities.json - people, companies, products
@@ -187,9 +305,9 @@ Mneme generates the plan deterministically from the active profile's section_not
                  tags.json    - taxonomy
 ```
 
-Every `mneme ingest` writes both layers atomically. `mneme drift` catches desync. `mneme repair` fixes it.
+Every `mneme ingest` writes the wiki page and updates the search index atomically. `mneme drift` catches desync. `mneme reindex` rebuilds the index from wiki pages.
 
-**Memvid is optional.** Without it, mneme runs as a wiki-only knowledge base with text search. Add `memvid-sdk` when you outgrow grep.
+**Zero external dependencies for search.** SQLite FTS5 is built into Python's stdlib — no install, no API key, no capacity limit.
 
 ---
 
@@ -364,14 +482,15 @@ See `EXAMPLES.md` Example 13 for a full walkthrough with a real Parkiwatch scena
 
 ## When You Need This
 
-| Scale | Wiki alone | Wiki + Memvid |
-|---|---|---|
-| 5 docs | Plenty | Overkill |
-| 50 docs | Fine | Starting to help |
-| 500 docs | Grep takes 2-3s, misses semantic matches | 2ms, cross-client connections |
-| 5,000 docs | Unusable | Still 2ms |
+| Scale | Search performance |
+|---|---|
+| 5 docs | Sub-millisecond |
+| 50 docs | Sub-millisecond |
+| 500 docs | Sub-millisecond, BM25 ranked |
+| 5,000 docs | A few ms, still ranked by relevance |
+| 50,000 docs | Tens of ms |
 
-Start wiki-only. Add the memory layer when search gets slow.
+SQLite FTS5 scales transparently. No tuning, no capacity limits.
 
 ---
 
@@ -382,7 +501,7 @@ mneme/
   sources/        Raw documents (immutable, never modified)
   wiki/           Markdown knowledge pages (Obsidian-compatible)
   schema/         entities.json, graph.json, tags.json
-  memvid/         .mv2 memory archives
+  search.db       SQLite FTS5 search index
   core.py         Engine (ingest, search, sync, drift, repair)
   config.py       Configuration
   server.py       Web dashboard
@@ -448,7 +567,7 @@ password = pypi-AgENd...          # from https://test.pypi.org/manage/account/to
 This project builds on two foundational ideas:
 
 - **LLM Wiki pattern** by [Andrej Karpathy](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) -- the insight that LLMs should build and maintain a persistent, compounding wiki instead of re-deriving answers from raw documents on every query
-- **Memvid** by [Olow304/memvid](https://github.com/Olow304/memvid) -- single-file AI memory with sub-millisecond retrieval, no vector DB required
+- **SQLite FTS5** -- the world's most-deployed embedded database, with built-in BM25 full-text search
 - **Original implementation** -- [tashisleepy/knowledge-engine](https://github.com/tashisleepy/knowledge-engine) -- the first version that fused both patterns into a dual-layer bridge
 
 ---

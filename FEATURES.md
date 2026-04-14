@@ -17,13 +17,14 @@
 | `mneme new` | Scaffold a new workspace from the bundled template (preferred over `init`) |
 | `mneme init` | Scaffold a workspace in cwd (legacy) |
 | `mneme --workspace <dir>` / `MNEME_HOME=<dir>` | Run any command against a specific workspace |
-| `mneme ingest` | Atomic ingest: source -> wiki + Memvid + schema |
+| `mneme ingest` | Atomic ingest: source -> wiki + FTS5 index + schema |
 | `mneme resync` | Diff-aware re-ingest: 3-way merge (baseline / wiki / fresh ingest) via `git merge-file` |
 | `mneme resync-resolve` | Mark a conflicted resync page as resolved after editing out markers |
 | `mneme ingest-dir` | Batch ingest all files from a directory |
 | `mneme search` | Dual-layer search with `--client` scoping |
 | `mneme lint` | Health check: orphan pages, dead links, stale pages, citations, schema drift, coverage |
-| `mneme sync` | Sync wiki pages to Memvid |
+| `mneme sync` | Sync wiki pages to FTS5 search index |
+| `mneme reindex` | Rebuild search index from wiki pages |
 | `mneme drift` | Detect layer desynchronization |
 | `mneme stats` | Health overview |
 | `mneme repair` | Fix corrupted archives and schema |
@@ -31,6 +32,8 @@
 | `mneme recent` | Show last N activity log entries |
 | `mneme tags list` | List all tags with page counts |
 | `mneme tags merge` | Merge one tag into another across all pages |
+| `mneme tags suggest <page>` | Build a *tag packet* for an LLM agent (page content + taxonomy + prompt) |
+| `mneme tags apply <page> --add t1,t2 --remove t3` | Atomic tag update: rewrites frontmatter, updates schema/tags.json, re-syncs FTS5 index |
 | `mneme diff` | Git-aware diff for a wiki page |
 | `mneme snapshot` | Versioned zip archive of a client + git tag |
 | `mneme dedupe` | Detect near-duplicate wiki pages |
@@ -54,7 +57,7 @@
 | `mneme scan-repo` | Scan code repo, compare against QMS docs, find gaps |
 | `mneme tornado` | Inbox processor: auto-detect type/client, ingest, archive to sources |
 | `mneme ingest-csv` | CSV ingest: one row = one wiki page, with column-to-frontmatter mapping and auto trace links |
-| `mneme demo clean` | Remove all demo content: demo-retail client, demo/ folder, schema entries, memvid manifest, index/log entries |
+| `mneme demo clean` | Remove all demo content: demo-retail client, demo/ folder, schema entries, search index entries, index/log entries |
 
 ### Web UI (localhost:3141)
 

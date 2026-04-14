@@ -8,7 +8,7 @@ Two distinct roots:
   from here.
 
 * WORKSPACE_DIR - where the user's data lives (wiki/, sources/, schema/,
-  memvid/, index.md, log.md). Resolved in this order:
+  search.db, index.md, log.md). Resolved in this order:
       1. The MNEME_HOME environment variable, if set.
       2. The current working directory.
 
@@ -54,9 +54,7 @@ BASE_DIR = WORKSPACE_DIR
 WIKI_DIR = os.path.join(WORKSPACE_DIR, 'wiki')
 SOURCES_DIR = os.path.join(WORKSPACE_DIR, 'sources')
 SCHEMA_DIR = os.path.join(WORKSPACE_DIR, 'schema')
-MEMVID_DIR = os.path.join(WORKSPACE_DIR, 'memvid')
-MASTER_MV2 = os.path.join(MEMVID_DIR, 'master.mv2')
-PER_CLIENT_DIR = os.path.join(MEMVID_DIR, 'per-client')
+SEARCH_DB = os.path.join(WORKSPACE_DIR, 'search.db')
 INDEX_FILE = os.path.join(WORKSPACE_DIR, 'index.md')
 LOG_FILE = os.path.join(WORKSPACE_DIR, 'log.md')
 TEMPLATES_DIR = os.path.join(WIKI_DIR, '_templates')
@@ -78,13 +76,8 @@ WORKSPACE_MAPPINGS_DIR = os.path.join(WORKSPACE_PROFILES_DIR, 'mappings')
 EXCLUDED_DIRS = ['_templates', '.baselines']
 EXCLUDED_FILES = ['_meta.yaml']
 
-# Chunk settings for memvid
-MAX_CHUNK_SIZE = 500  # characters per Smart Frame
-MIN_CHUNK_SIZE = 50   # don't create tiny frames
-
-# Ingest limits to prevent hangs on huge files
-MAX_CHUNKS_PER_INGEST = 200   # hard cap on chunks sent to memvid per page
-CHUNK_COMMIT_BATCH = 50       # commit to memvid every N chunks
+# Log rotation
+LOG_MAX_ENTRIES = 500  # archive after this many entries
 
 # Entity extraction stopwords
 ENTITY_STOPWORDS = {

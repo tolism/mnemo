@@ -1,14 +1,14 @@
 """
 Comprehensive pytest test suite for Mnemosyne core.
 
-Covers all core functions:
+Covers:
   - parse_frontmatter (pure parsing)
-  - chunk_body (chunking logic)
   - _title_from_slug (slug conversion)
-  - _sanitize_memvid_query (query cleaning)
   - _content_hash (hashing)
+  - sync_page_to_index (FTS5 upsert)
   - CLI integration (subprocess)
   - Ingest integration (with cleanup)
+  - Resync (3-way merge) unit + integration
 """
 
 import json
@@ -16,18 +16,18 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+
+import pytest
 
 # Ensure the package is importable from the tests/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from mneme.core import (
     _content_hash,
-    _sanitize_memvid_query,
     _title_from_slug,
-    chunk_body,
     parse_frontmatter,
 )
-from mneme.config import MAX_CHUNK_SIZE, MIN_CHUNK_SIZE
 
 # ---------------------------------------------------------------------------
 # Category 1: Parsing (pure functions, no I/O)
@@ -116,73 +116,7 @@ class TestParseFrontmatter:
 
 
 # ---------------------------------------------------------------------------
-# Category 2: Chunking
-# ---------------------------------------------------------------------------
-
-class TestChunkBody:
-    def test_empty_text_returns_empty(self):
-        chunks = chunk_body("")
-        assert chunks == []
-
-    def test_short_text_below_min_chunk_size_dropped(self):
-        # MIN_CHUNK_SIZE is 50; "Short text." is 11 chars, should be dropped
-        chunks = chunk_body("Short text.")
-        assert chunks == []
-
-    def test_text_at_min_chunk_size_included(self):
-        # Exactly MIN_CHUNK_SIZE characters should be included
-        text = "A" * MIN_CHUNK_SIZE
-        chunks = chunk_body(text)
-        assert len(chunks) == 1
-        assert chunks[0] == text
-
-    def test_long_text_produces_multiple_chunks(self):
-        # ~2600 chars -> should produce multiple chunks
-        text = "This is a test sentence. " * 104  # ~2600 chars
-        chunks = chunk_body(text)
-        assert len(chunks) > 1
-
-    def test_all_chunks_within_max_size(self):
-        text = ("A" * 400 + "\n\n") * 10
-        chunks = chunk_body(text)
-        for chunk in chunks:
-            # Allow small tolerance for sentence boundary splitting
-            assert len(chunk) <= MAX_CHUNK_SIZE + 50
-
-    def test_paragraph_separation_respected(self):
-        # Two paragraphs each >= MIN_CHUNK_SIZE
-        para1 = "First paragraph with enough content to pass the minimum chunk size filter."
-        para2 = "Second paragraph with enough content to pass the minimum chunk size filter."
-        text = para1 + "\n\n" + para2
-        chunks = chunk_body(text)
-        assert len(chunks) == 2
-
-    def test_whitespace_only_paragraphs_skipped(self):
-        text = "   \n\n   \n\nA" * MIN_CHUNK_SIZE
-        chunks = chunk_body(text)
-        # Whitespace paragraphs are stripped and skipped
-        for chunk in chunks:
-            assert chunk.strip() != ''
-
-    def test_single_chunk_for_text_within_max_size(self):
-        # Text of exactly 200 chars (well above MIN_CHUNK_SIZE, below MAX_CHUNK_SIZE)
-        text = "Word " * 40  # 200 chars
-        chunks = chunk_body(text)
-        assert len(chunks) == 1
-
-    def test_sentence_splitting_on_long_paragraph(self):
-        # A single very long paragraph should be split at sentence boundaries
-        sentences = ["This is sentence number %d with some extra padding words to make it longer." % i for i in range(20)]
-        text = " ".join(sentences)
-        assert len(text) > MAX_CHUNK_SIZE
-        chunks = chunk_body(text)
-        assert len(chunks) > 1
-        for chunk in chunks:
-            assert len(chunk) <= MAX_CHUNK_SIZE + 50
-
-
-# ---------------------------------------------------------------------------
-# Category 3: Title from slug
+# Category 2: Title from slug
 # ---------------------------------------------------------------------------
 
 class TestTitleFromSlug:
@@ -193,8 +127,6 @@ class TestTitleFromSlug:
         assert _title_from_slug("test_document") == "Test Document"
 
     def test_md_extension_becomes_part_of_last_word(self):
-        # _title_from_slug converts hyphens/underscores but does not strip .md
-        # The slug 'my-file.md' becomes 'My File.md' (period is not a separator)
         title = _title_from_slug("my-file.md")
         assert "My File" in title
 
@@ -205,83 +137,20 @@ class TestTitleFromSlug:
         assert _title_from_slug("product-overview-v2") == "Product Overview V2"
 
     def test_mixed_separators(self):
-        # Mixed hyphens and underscores
         result = _title_from_slug("hello_world-test")
         assert result == "Hello World Test"
 
     def test_empty_string(self):
-        # Edge case: empty slug
         result = _title_from_slug("")
         assert result == ""
 
     def test_single_hyphen(self):
-        # A slug that is just a separator normalizes to empty or single space then stripped
         result = _title_from_slug("-")
-        # re.sub replaces '-' with ' ', split on spaces gives [''], capitalize gives ''
         assert isinstance(result, str)
 
 
 # ---------------------------------------------------------------------------
-# Category 4: Memvid query sanitization
-# ---------------------------------------------------------------------------
-
-class TestSanitizeMemvidQuery:
-    def test_removes_boolean_or(self):
-        result = _sanitize_memvid_query("price or volume analysis")
-        assert "or" not in result.split()
-        assert "price" in result
-        assert "analysis" in result
-
-    def test_removes_boolean_and(self):
-        result = _sanitize_memvid_query("revenue and growth")
-        assert "and" not in result.split()
-
-    def test_removes_boolean_not(self):
-        result = _sanitize_memvid_query("cost not overhead")
-        assert "not" not in result.split()
-        assert "cost" in result
-
-    def test_removes_common_stopwords(self):
-        result = _sanitize_memvid_query("for the operations in a system")
-        words = result.split()
-        reserved = {'for', 'the', 'in', 'a'}
-        assert not any(w.lower() in reserved for w in words)
-        assert "operations" in result
-        assert "system" in result
-
-    def test_preserves_meaningful_words(self):
-        result = _sanitize_memvid_query("Thermobox patent analysis")
-        assert "Thermobox" in result
-        assert "patent" in result
-        assert "analysis" in result
-
-    def test_all_reserved_words_returns_first_word(self):
-        # When all words are reserved, fallback returns the first word
-        result = _sanitize_memvid_query("and or not")
-        assert len(result) > 0
-        assert result == "and"  # first word as fallback
-
-    def test_empty_string_returns_empty(self):
-        result = _sanitize_memvid_query("")
-        assert result == ""
-
-    def test_normal_query_unchanged(self):
-        result = _sanitize_memvid_query("revenue growth analysis")
-        assert result == "revenue growth analysis"
-
-    def test_mixed_case_reserved_words_stripped(self):
-        # Reserved words are checked case-insensitively
-        result = _sanitize_memvid_query("AND OR NOT price")
-        # 'AND' -> lower 'and' in reserved set -> stripped
-        assert "price" in result
-
-    def test_single_non_reserved_word_preserved(self):
-        result = _sanitize_memvid_query("revenue")
-        assert result == "revenue"
-
-
-# ---------------------------------------------------------------------------
-# Category 5: Content hash
+# Category 3: Content hash
 # ---------------------------------------------------------------------------
 
 class TestContentHash:
@@ -312,14 +181,214 @@ class TestContentHash:
         assert len(h) == 32
 
     def test_long_content_returns_fixed_length(self):
-        # MD5 always returns 32 hex chars regardless of input length
         long_content = "word " * 10000
         h = _content_hash(long_content)
         assert len(h) == 32
 
 
 # ---------------------------------------------------------------------------
-# Category 6: CLI Integration Tests
+# Category 4: sync_page_to_index (FTS5 upsert)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sync_workspace():
+    """Build a clean temp workspace and rebind mneme path constants."""
+    td = tempfile.mkdtemp(prefix='mneme-sync-test-')
+    for sub in ('wiki', 'sources', 'schema'):
+        os.makedirs(os.path.join(td, sub), exist_ok=True)
+    with open(os.path.join(td, 'index.md'), 'w') as f:
+        f.write('# Index\n')
+    with open(os.path.join(td, 'log.md'), 'w') as f:
+        f.write('# Log\n')
+    for name, default in [
+        ('entities.json', {'version': 1, 'updated': '2026-01-01', 'entities': []}),
+        ('tags.json', {'version': 1, 'updated': '2026-01-01', 'tags': {}}),
+        ('graph.json', {'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []}),
+    ]:
+        with open(os.path.join(td, 'schema', name), 'w') as f:
+            json.dump(default, f)
+
+    from mneme.core import _apply_workspace_override
+    prior = os.environ.get('MNEME_HOME')
+    _apply_workspace_override(td)
+    try:
+        yield td
+    finally:
+        if prior is not None:
+            _apply_workspace_override(prior)
+        else:
+            os.environ.pop('MNEME_HOME', None)
+            _apply_workspace_override(os.getcwd())
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _make_simple_page(workspace, client, slug, body='body text'):
+    d = os.path.join(workspace, 'wiki', client)
+    os.makedirs(d, exist_ok=True)
+    fm = (
+        '---\n'
+        f'title: {slug}\n'
+        'type: source-summary\n'
+        f'client: {client}\n'
+        'tags: []\n'
+        '---\n\n'
+        f'{body}\n'
+    )
+    path = os.path.join(d, f'{slug}.md')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(fm)
+    return path
+
+
+class TestSyncPageToIndex:
+    def test_returns_bool_when_new(self, sync_workspace):
+        from mneme.core import sync_page_to_index
+        path = _make_simple_page(sync_workspace, 'demo', 'p1', 'unique_word_xyz body')
+        result = sync_page_to_index(path, client_slug='demo')
+        assert result is True
+
+    def test_returns_false_when_unchanged(self, sync_workspace):
+        from mneme.core import sync_page_to_index
+        path = _make_simple_page(sync_workspace, 'demo', 'p1', 'stable body content')
+        first = sync_page_to_index(path, client_slug='demo')
+        second = sync_page_to_index(path, client_slug='demo')
+        assert first is True
+        assert second is False
+
+    def test_reindexes_when_content_changes(self, sync_workspace):
+        from mneme.core import sync_page_to_index
+        path = _make_simple_page(sync_workspace, 'demo', 'p1', 'original body')
+        sync_page_to_index(path, client_slug='demo')
+        # Modify
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content.replace('original body', 'modified body'))
+        result = sync_page_to_index(path, client_slug='demo')
+        assert result is True
+
+
+class TestTagsSuggest:
+    """tags_suggest() builds a packet for an LLM agent to read."""
+
+    def test_packet_has_required_fields(self, sync_workspace):
+        from mneme.core import tags_suggest
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'cardiac monitoring')
+        packet = tags_suggest('demo/p1')
+        assert 'page' in packet
+        assert 'tag_taxonomy' in packet
+        assert 'tag_prompt' in packet
+        assert packet['page']['wiki_path'] == 'demo/p1.md'
+        assert packet['page']['client'] == 'demo'
+
+    def test_includes_current_tags(self, sync_workspace):
+        from mneme.core import tags_suggest, sync_page_to_index, tags_apply
+        path = _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        sync_page_to_index(path, client_slug='demo')
+        tags_apply('demo/p1', add=['existing-tag'])
+        packet = tags_suggest('demo/p1')
+        assert 'existing-tag' in packet['page']['current_tags']
+
+    def test_taxonomy_includes_existing_tags(self, sync_workspace):
+        from mneme.core import tags_suggest, sync_page_to_index, tags_apply
+        # Create two pages with tags so taxonomy is populated
+        p1 = _make_simple_page(sync_workspace, 'demo', 'p1', 'b')
+        p2 = _make_simple_page(sync_workspace, 'demo', 'p2', 'b')
+        sync_page_to_index(p1, client_slug='demo')
+        sync_page_to_index(p2, client_slug='demo')
+        tags_apply('demo/p1', add=['shared-tag'])
+        tags_apply('demo/p2', add=['shared-tag', 'unique-tag'])
+        packet = tags_suggest('demo/p1')
+        names = {t['name'] for t in packet['tag_taxonomy']}
+        assert 'shared-tag' in names
+        assert 'unique-tag' in names
+
+    def test_raises_on_missing_page(self, sync_workspace):
+        from mneme.core import tags_suggest
+        with pytest.raises(FileNotFoundError):
+            tags_suggest('demo/no-such-page')
+
+    def test_accepts_slug_with_md_extension(self, sync_workspace):
+        from mneme.core import tags_suggest
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        # Both forms should work
+        a = tags_suggest('demo/p1')
+        b = tags_suggest('demo/p1.md')
+        assert a['page']['wiki_path'] == b['page']['wiki_path']
+
+
+class TestTagsApply:
+    """tags_apply() rewrites frontmatter, updates tags.json, re-syncs FTS."""
+
+    def test_add_tags_writes_frontmatter(self, sync_workspace):
+        from mneme.core import tags_apply, parse_frontmatter
+        path = _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        result = tags_apply('demo/p1', add=['foo', 'bar'])
+        assert 'foo' in result['tags_after']
+        assert 'bar' in result['tags_after']
+        assert result['added'] == ['foo', 'bar']
+        with open(path, 'r') as f:
+            fm, _ = parse_frontmatter(f.read())
+        assert 'foo' in fm['tags']
+        assert 'bar' in fm['tags']
+
+    def test_remove_tag(self, sync_workspace):
+        from mneme.core import tags_apply, parse_frontmatter
+        path = _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        tags_apply('demo/p1', add=['foo', 'bar'])
+        result = tags_apply('demo/p1', remove=['foo'])
+        assert result['removed'] == ['foo']
+        assert 'foo' not in result['tags_after']
+        assert 'bar' in result['tags_after']
+        with open(path, 'r') as f:
+            fm, _ = parse_frontmatter(f.read())
+        assert 'foo' not in fm['tags']
+
+    def test_dedup_on_add(self, sync_workspace):
+        from mneme.core import tags_apply
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        tags_apply('demo/p1', add=['foo'])
+        result = tags_apply('demo/p1', add=['foo'])
+        # Already there, count should be 1, not 2
+        assert result['tags_after'].count('foo') == 1
+
+    def test_updates_tags_json(self, sync_workspace):
+        from mneme.core import tags_apply, tags_list
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        tags_apply('demo/p1', add=['foo'])
+        tags = tags_list()
+        assert 'foo' in tags
+        assert tags['foo']['count'] == 1
+
+    def test_remove_drops_from_tags_json(self, sync_workspace):
+        from mneme.core import tags_apply, tags_list
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        tags_apply('demo/p1', add=['foo'])
+        tags_apply('demo/p1', remove=['foo'])
+        tags = tags_list()
+        assert 'foo' not in tags
+
+    def test_search_picks_up_new_tag(self, sync_workspace):
+        from mneme.core import tags_apply, dual_search
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'unrelated body')
+        tags_apply('demo/p1', add=['unique-search-tag'])
+        results = dual_search('unique-search-tag', k=10)
+        assert any(r['wiki_path'] == 'demo/p1.md' for r in results)
+
+    def test_normalizes_tags_to_lowercase(self, sync_workspace):
+        from mneme.core import tags_apply
+        _make_simple_page(sync_workspace, 'demo', 'p1', 'body')
+        result = tags_apply('demo/p1', add=['Foo-BAR'])
+        assert 'foo-bar' in result['tags_after']
+
+    def test_raises_on_missing_page(self, sync_workspace):
+        from mneme.core import tags_apply
+        with pytest.raises(FileNotFoundError):
+            tags_apply('demo/no-such-page', add=['x'])
+
+
+# ---------------------------------------------------------------------------
+# Category 5: CLI Integration Tests
 # ---------------------------------------------------------------------------
 
 BRIDGE_DIR = os.path.join(os.path.dirname(__file__), '..')
@@ -408,11 +477,8 @@ class TestCLI:
         assert rc == 1
 
     def test_ingest_valid_slug_format_accepted(self):
-        # Valid slug format: lowercase + hyphens + digits
-        # Will fail on missing file but not on slug validation
         rc, out, err = _run_mnemo('ingest', '/tmp/does-not-exist.md', 'my-client-123')
         assert rc == 1
-        # Error must be about the file, not the slug
         assert 'not found' in err.lower() or 'source not found' in err.lower()
 
     def test_drift_exits_zero(self):
@@ -437,17 +503,15 @@ class TestCLI:
 
     def test_repair_output_has_status(self):
         rc, out, err = _run_mnemo('repair')
-        # Either "all checks passed" or "fixed the following" or "warnings"
         assert 'repair' in out.lower() or rc == 0
 
 
 # ---------------------------------------------------------------------------
-# Category 7: Ingest Integration Tests (with cleanup)
+# Category 6: Ingest Integration Tests (with cleanup)
 # ---------------------------------------------------------------------------
 
 _KE_BASE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 _TEST_CLIENT = 'pytest-int-test'
-# Use a fixed unique filename unlikely to clash with any real source
 _TEST_SOURCE_SLUG = 'pytest-mneme-ingest-test-fixture'
 _TEST_FILE = f'/tmp/{_TEST_SOURCE_SLUG}.md'
 
@@ -458,10 +522,15 @@ def _cleanup_test_client():
     if os.path.exists(wiki_dir):
         shutil.rmtree(wiki_dir)
 
-    mv2 = os.path.join(_KE_BASE, 'memvid', 'per-client', f'{_TEST_CLIENT}.mv2')
-    for path in [mv2, mv2 + '.lock']:
-        if os.path.exists(path):
-            os.remove(path)
+    # Remove search.db if tests created one in the project root
+    search_db = os.path.join(_KE_BASE, 'search.db')
+    for suffix in ('', '-wal', '-shm'):
+        p = search_db + suffix
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     ent_file = os.path.join(_KE_BASE, 'schema', 'entities.json')
     if os.path.exists(ent_file):
@@ -477,7 +546,6 @@ def _cleanup_test_client():
         except (json.JSONDecodeError, OSError):
             pass
 
-    # tags.json - drop tag pages referencing the test client
     tags_file = os.path.join(_KE_BASE, 'schema', 'tags.json')
     if os.path.exists(tags_file):
         try:
@@ -498,7 +566,6 @@ def _cleanup_test_client():
         except (json.JSONDecodeError, OSError):
             pass
 
-    # index.md - strip the test client section and any wikilink entries
     index_file = os.path.join(_KE_BASE, 'index.md')
     if os.path.exists(index_file):
         try:
@@ -519,7 +586,6 @@ def _cleanup_test_client():
                             continue
                         if stripped.startswith('|') and _TEST_CLIENT in stripped:
                             continue
-                # Drop any stray wikilink lines outside the section too
                 if f'[[{_TEST_CLIENT}/' in line:
                     continue
                 cleaned_lines.append(line)
@@ -528,20 +594,15 @@ def _cleanup_test_client():
         except OSError:
             pass
 
-    # Remove any log entries for the test source file so duplicate detection
-    # doesn't block re-ingestion across test runs
     log_file = os.path.join(_KE_BASE, 'log.md')
     if os.path.exists(log_file):
         try:
             with open(log_file, 'r') as f:
                 lines = f.readlines()
-            # Filter out log blocks that contain our test fixture filename
-            # A block starts with '## [' and spans until the next '## [' or EOF
             cleaned_lines = []
             skip_block = False
             for line in lines:
                 if line.startswith('## ['):
-                    # Start of a new log block - decide whether to skip it
                     skip_block = _TEST_SOURCE_SLUG in line
                 if not skip_block:
                     cleaned_lines.append(line)
@@ -550,10 +611,6 @@ def _cleanup_test_client():
         except OSError:
             pass
 
-    # Finally, if we left behind empty workspace files (created by ingest
-    # because the project root is the default workspace), remove them so the
-    # repo stays clean. Only remove if the file is empty/header-only after
-    # cleanup, never if real content remains.
     for fname in ('index.md', 'log.md'):
         fp = os.path.join(_KE_BASE, fname)
         if not os.path.exists(fp):
@@ -561,7 +618,6 @@ def _cleanup_test_client():
         try:
             with open(fp, 'r') as f:
                 content = f.read().strip()
-            # Header-only files are safe to remove
             header_only_signatures = (
                 '# Mnemosyne Index',
                 '# Mnemosyne Log',
@@ -576,7 +632,6 @@ def _cleanup_test_client():
         except OSError:
             pass
 
-    # Empty schema files: remove the schema dir if it has no real content left
     schema_dir = os.path.join(_KE_BASE, 'schema')
     if os.path.isdir(schema_dir):
         try:
@@ -595,7 +650,6 @@ def _cleanup_test_client():
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Empty wiki dir
     wd = os.path.join(_KE_BASE, 'wiki')
     if os.path.isdir(wd):
         try:
@@ -608,7 +662,6 @@ def _cleanup_test_client():
 class TestIngestIntegration:
     @classmethod
     def setup_class(cls):
-        """Create source file and ensure clean state before any test in this class."""
         _cleanup_test_client()
         with open(_TEST_FILE, 'w') as f:
             f.write(
@@ -621,15 +674,11 @@ class TestIngestIntegration:
 
     @classmethod
     def teardown_class(cls):
-        """Clean up all test artifacts after all tests in this class."""
         if os.path.exists(_TEST_FILE):
             os.remove(_TEST_FILE)
         _cleanup_test_client()
 
     def test_ingest_creates_wiki_page(self):
-        """Ingest should write a wiki page even if memvid sync subsequently fails."""
-        # Run ingest - wiki write happens before memvid sync, so page is created
-        # regardless of memvid capacity. Accept rc=0 or rc=1.
         _run_mnemo('ingest', _TEST_FILE, _TEST_CLIENT)
         wiki_page = os.path.join(
             _KE_BASE, 'wiki', _TEST_CLIENT, f'{_TEST_SOURCE_SLUG}.md'
@@ -639,11 +688,9 @@ class TestIngestIntegration:
         )
 
     def test_ingest_wiki_page_has_valid_frontmatter(self):
-        """Created wiki page should have proper frontmatter."""
         wiki_page = os.path.join(
             _KE_BASE, 'wiki', _TEST_CLIENT, f'{_TEST_SOURCE_SLUG}.md'
         )
-        # This test depends on test_ingest_creates_wiki_page having run first
         if not os.path.exists(wiki_page):
             _run_mnemo('ingest', _TEST_FILE, _TEST_CLIENT)
 
@@ -656,8 +703,6 @@ class TestIngestIntegration:
         assert 'updated' in fm
 
     def test_duplicate_ingest_warns(self):
-        """Second ingest of same file should print a warning and exit 0."""
-        # Ensure the file was previously ingested
         wiki_page = os.path.join(
             _KE_BASE, 'wiki', _TEST_CLIENT, f'{_TEST_SOURCE_SLUG}.md'
         )
@@ -669,14 +714,11 @@ class TestIngestIntegration:
         assert 'previously ingested' in out.lower() or 'skipping' in out.lower()
 
     def test_force_reingest_prints_reingest_message(self):
-        """Force re-ingest should print a re-ingesting message."""
         rc, out, err = _run_mnemo('ingest', _TEST_FILE, _TEST_CLIENT, '--force')
-        # The core prints this before the memvid step
         combined = out + err
         assert 're-ingesting' in combined.lower() or 'force' in combined.lower()
 
     def test_ingest_appends_to_log(self):
-        """Log.md should contain an entry for the ingested filename."""
         log_file = os.path.join(_KE_BASE, 'log.md')
         assert os.path.exists(log_file)
         with open(log_file, 'r') as f:
@@ -684,27 +726,17 @@ class TestIngestIntegration:
         assert f'{_TEST_SOURCE_SLUG}.md' in log_content
 
     def test_ingest_updates_index(self):
-        """index.md should exist after ingest (core maintains it)."""
-        # The _update_index call happens after memvid sync in core.py.
-        # If the master archive is at capacity, memvid sync raises before index
-        # update runs. We test that index.md exists and is well-formed instead
-        # of asserting on the specific test client entry.
         index_file = os.path.join(_KE_BASE, 'index.md')
         assert os.path.exists(index_file)
         with open(index_file, 'r') as f:
             index_content = f.read()
-        # Index always has at least the header line
         assert len(index_content) > 0
-        # Known pre-existing clients remain present - proves index is intact
         assert 'Mnemosyne' in index_content
 
 
 # ---------------------------------------------------------------------------
-# Category 8: Resync (3-way merge)
+# Category 7: Resync (3-way merge)
 # ---------------------------------------------------------------------------
-
-import tempfile
-import pytest
 
 from mneme.core import (
     _baseline_path,
@@ -767,21 +799,19 @@ class TestResyncUnits:
 
     def test_git_merge_file_missing_git(self, monkeypatch):
         monkeypatch.setenv('PATH', '')
-        # On Windows FileNotFoundError is raised when git can't be found.
         with pytest.raises((FileNotFoundError, RuntimeError)):
             _git_merge_file('a', 'a', 'a')
 
 
 # ---------------------------------------------------------------------------
-# Category 9: Resync integration (temp workspace)
+# Category 8: Resync integration (temp workspace)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def temp_workspace(monkeypatch):
     """Build a clean temp workspace and rebind mneme path constants at it."""
     td = tempfile.mkdtemp(prefix='mneme-resync-test-')
-    # Minimum skeleton
-    for sub in ('wiki', 'sources', 'schema', 'memvid', os.path.join('memvid', 'per-client')):
+    for sub in ('wiki', 'sources', 'schema'):
         os.makedirs(os.path.join(td, sub), exist_ok=True)
     with open(os.path.join(td, 'index.md'), 'w') as f:
         f.write('# Index\n')
@@ -794,7 +824,6 @@ def temp_workspace(monkeypatch):
     with open(os.path.join(td, 'schema', 'graph.json'), 'w') as f:
         json.dump({'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []}, f)
 
-    # Save prior MNEME_HOME and swap in the temp workspace via the official helper
     from mneme.core import _apply_workspace_override
     prior = os.environ.get('MNEME_HOME')
     _apply_workspace_override(td)
@@ -865,7 +894,6 @@ class TestResyncIntegration:
         with open(wiki_page, 'w', encoding='utf-8') as f:
             f.write(human_edited)
 
-        # New source with a new item
         with open(src, 'w', encoding='utf-8') as f:
             f.write('# Doc\n\n- item one\n- item two\n- item three NEW\n')
 
@@ -876,7 +904,6 @@ class TestResyncIntegration:
             merged = f.read()
         assert 'Human added question' in merged
         assert 'item three NEW' in merged
-        # Baseline updated to theirs (should NOT contain the human section)
         baseline = _read_baseline(wiki_page)
         assert 'Human added question' not in baseline
         assert 'item three NEW' in baseline
@@ -895,7 +922,6 @@ class TestResyncIntegration:
         content = content.replace('Revenue: $1M', 'Revenue: $2M HUMAN')
         with open(wiki_page, 'w', encoding='utf-8') as f:
             f.write(content)
-        # New source edits same line differently
         with open(src, 'w', encoding='utf-8') as f:
             f.write('# Doc\n\nRevenue: $5M INCOMING\n\nNotes here filler content.\n')
 
@@ -905,7 +931,6 @@ class TestResyncIntegration:
         with open(wiki_page, 'r', encoding='utf-8') as f:
             merged = f.read()
         assert '<<<<<<<' in merged
-        # Log entry
         with open(os.path.join(temp_workspace, 'log.md')) as f:
             log_content = f.read()
         assert 'RESYNC-CONFLICT' in log_content
@@ -972,7 +997,6 @@ class TestResyncResolve:
     def test_resolve_happy_path(self, temp_workspace):
         from mneme.core import resync_resolve, _read_baseline
         wiki_page, client = self._seed_conflict(temp_workspace)
-        # User cleans the file
         cleaned = (
             '---\ntitle: Doc\ntype: source-summary\nclient: ' + client + '\n---\n\n'
             '## Summary\n\nResolved content here that is long enough.\n\n'
@@ -988,7 +1012,7 @@ class TestResyncResolve:
 
 
 # ---------------------------------------------------------------------------
-# Category 10: Resync CLI smoke test
+# Category 9: Resync CLI smoke test
 # ---------------------------------------------------------------------------
 
 class TestResyncCLI:
@@ -1000,8 +1024,7 @@ class TestResyncCLI:
     def test_resync_end_to_end(self):
         td = tempfile.mkdtemp(prefix='mneme-resync-cli-')
         try:
-            for sub in ('wiki', 'sources', 'schema', 'memvid',
-                        os.path.join('memvid', 'per-client')):
+            for sub in ('wiki', 'sources', 'schema'):
                 os.makedirs(os.path.join(td, sub), exist_ok=True)
             with open(os.path.join(td, 'index.md'), 'w') as f:
                 f.write('# Index\n')
@@ -1020,13 +1043,10 @@ class TestResyncCLI:
             with open(src, 'w', encoding='utf-8') as f:
                 f.write('# Doc\n\n- alpha\n- beta\n\nLong enough filler body content.\n')
 
-            # First ingest
             rc, out, err = _run_mnemo('--workspace', td, 'ingest', src, client, '--force')
-            # Accept any rc; we just need a wiki page + baseline created
             wiki_page = os.path.join(td, 'wiki', client, 'doc.md')
             assert os.path.exists(wiki_page), f'wiki page missing. stderr={err}'
 
-            # Mutate source and resync
             with open(src, 'w', encoding='utf-8') as f:
                 f.write('# Doc\n\n- alpha\n- beta\n- gamma\n\nLong enough filler body content.\n')
             rc, out, err = _run_mnemo('--workspace', td, 'resync', src, client)

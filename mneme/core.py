@@ -1,9 +1,8 @@
 """
 core.py - Mnemosyne core engine.
 
-Fuses the LLM Wiki (System A) with Memvid (System B) into a unified knowledge layer.
-System A: structured markdown wiki at mneme/wiki/ - curated, cited, Obsidian-compatible
-System B: Memvid semantic archive at mneme/memvid/ - fast retrieval via Smart Frames
+Structured markdown wiki with SQLite FTS5 search index.
+Wiki pages are the source of truth; the search DB is a rebuildable index.
 
 Usage:
     mneme sync
@@ -62,33 +61,20 @@ def _unlock_file(fd):
     except Exception:
         pass
 
-try:
-    import memvid_sdk as mv
-    # Validate expected API exists
-    for attr in ('use', 'create'):
-        assert hasattr(mv, attr), f"memvid_sdk missing '{attr}'"
-    MEMVID_AVAILABLE = True
-except ImportError:
-    MEMVID_AVAILABLE = False
-    mv = None
+from . import search as _search
 
 from .config import (
     ACTIVE_PROFILE_FILE,
     BASE_DIR,
-    CHUNK_COMMIT_BATCH,
     ENTITY_STOPWORDS,
     EXCLUDED_DIRS,
     EXCLUDED_FILES,
     INDEX_FILE,
     LOG_FILE,
-    MASTER_MV2,
-    MAX_CHUNK_SIZE,
-    MAX_CHUNKS_PER_INGEST,
-    MEMVID_DIR,
-    MIN_CHUNK_SIZE,
-    PER_CLIENT_DIR,
+    LOG_MAX_ENTRIES,
     PROFILES_DIR,
     SCHEMA_DIR,
+    SEARCH_DB,
     SOURCES_DIR,
     TEMPLATES_DIR,
     TRACEABILITY_FILE,
@@ -96,6 +82,17 @@ from .config import (
     WORKSPACE_MAPPINGS_DIR,
     WORKSPACE_PROFILES_DIR,
 )
+
+# Lazy search DB connection (opened on first use)
+_search_conn = None
+
+
+def _get_search_db():
+    """Return a connection to the FTS5 search index, opening it lazily."""
+    global _search_conn
+    if _search_conn is None:
+        _search_conn = _search.open_db(SEARCH_DB)
+    return _search_conn
 
 
 # ---------------------------------------------------------------------------
@@ -168,105 +165,8 @@ def _parse_simple_yaml(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Chunking
+# (Chunking removed — FTS5 indexes whole pages, no frame splitting needed)
 # ---------------------------------------------------------------------------
-
-def chunk_body(body: str) -> list[str]:
-    """
-    Split wiki body text into paragraph-level chunks for Memvid Smart Frames.
-    Paragraphs are separated by blank lines. Chunks that exceed MAX_CHUNK_SIZE
-    get split further at sentence boundaries. Chunks below MIN_CHUNK_SIZE are dropped.
-    """
-    # Split on double newlines (paragraph breaks)
-    raw_paragraphs = re.split(r'\n\s*\n', body)
-    chunks = []
-    for para in raw_paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        if len(para) <= MAX_CHUNK_SIZE:
-            if len(para) >= MIN_CHUNK_SIZE:
-                chunks.append(para)
-        else:
-            # Split long paragraph at sentence boundaries
-            sentences = re.split(r'(?<=[.!?])\s+', para)
-            current = ''
-            for sentence in sentences:
-                if len(current) + len(sentence) + 1 <= MAX_CHUNK_SIZE:
-                    current = (current + ' ' + sentence).strip() if current else sentence
-                else:
-                    if len(current) >= MIN_CHUNK_SIZE:
-                        chunks.append(current)
-                    current = sentence
-            if len(current) >= MIN_CHUNK_SIZE:
-                chunks.append(current)
-    return chunks
-
-
-# ---------------------------------------------------------------------------
-# Memvid open helpers
-# ---------------------------------------------------------------------------
-
-def _open_master(mode: str = 'auto'):
-    """Open or create the master archive. Returns None if memvid not available."""
-    if not MEMVID_AVAILABLE:
-        return None
-    os.makedirs(MEMVID_DIR, exist_ok=True)
-    return mv.use('basic', MASTER_MV2, mode=mode)
-
-
-def _open_client_archive(client_slug: str, mode: str = 'auto'):
-    """Open or create a per-client archive. Returns None if memvid not available."""
-    if not MEMVID_AVAILABLE:
-        return None
-    os.makedirs(PER_CLIENT_DIR, exist_ok=True)
-    path = os.path.join(PER_CLIENT_DIR, f'{client_slug}.mv2')
-    return mv.use('basic', path, mode=mode)
-
-
-
-@contextmanager
-def _memvid_locked(mv2_path: str, mode: str = 'auto'):
-    """Open a memvid archive with file-level locking (shared for reads, exclusive for writes)."""
-    lock_path = mv2_path + '.lock'
-    os.makedirs(os.path.dirname(mv2_path), exist_ok=True)
-    lock_fd = open(lock_path, 'w')
-    try:
-        _lock_file(lock_fd, exclusive=(mode != 'open'))
-        mem = mv.use('basic', mv2_path, mode=mode)
-        yield mem
-    finally:
-        _unlock_file(lock_fd)
-        lock_fd.close()
-
-
-# ---------------------------------------------------------------------------
-# Sync manifest (BUG-003 fix: prevent duplicate frames on repeated sync)
-# ---------------------------------------------------------------------------
-
-# Path resolved lazily so MEMVID_DIR is available at import time
-def _sync_manifest_path() -> str:
-    return os.path.join(MEMVID_DIR, '.sync-manifest.json')
-
-
-def _load_manifest() -> dict:
-    """Load the sync manifest, returning an empty structure on any failure."""
-    path = _sync_manifest_path()
-    if os.path.exists(path):
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {'synced_pages': {}}
-
-
-def _save_manifest(manifest: dict) -> None:
-    """Persist the sync manifest atomically."""
-    path = _sync_manifest_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2)
 
 
 def _content_hash(content: str) -> str:
@@ -278,146 +178,60 @@ def _content_hash(content: str) -> str:
 # Core engine functions
 # ---------------------------------------------------------------------------
 
-def sync_page_to_memvid(wiki_page_path: str, client_slug: Optional[str] = None) -> int:
+def sync_page_to_index(wiki_page_path: str, client_slug: str = None) -> bool:
     """
-    Read a wiki markdown page, extract frontmatter, chunk the body, and add
-    each chunk to master.mv2 as a Smart Frame. If client_slug is provided,
-    also add frames to that client's per-client archive.
+    Read a wiki page and upsert it into the FTS5 search index.
 
-    Returns the number of frames added.
+    Returns True if the page was indexed (content changed), False if skipped.
     """
     with open(wiki_page_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # BUG-003 fix: skip sync if content hasn't changed since last sync
-    manifest = _load_manifest()
-    page_key = wiki_page_path
     content_hash = _content_hash(content)
-    if page_key in manifest['synced_pages']:
-        if manifest['synced_pages'][page_key].get('hash') == content_hash:
-            return 0  # already synced, no changes
-
     frontmatter, body = parse_frontmatter(content)
 
     title = frontmatter.get('title', os.path.basename(wiki_page_path))
     client = client_slug or frontmatter.get('client', '_unknown')
+
     tags_raw = frontmatter.get('tags', [])
-    # tags can be a list or a comma-separated string depending on wiki authoring
     if isinstance(tags_raw, str):
-        tags = [t.strip() for t in tags_raw.split(',') if t.strip()]
+        tags_raw = [t.strip() for t in tags_raw.split(',') if t.strip()]
     else:
-        tags = list(tags_raw)
-    # Always tag with client slug for filtering
-    if client and client not in tags:
-        tags.append(client)
+        tags_raw = list(tags_raw)
+    if client and client not in tags_raw:
+        tags_raw.append(client)
+    tags_str = ', '.join(tags_raw)
 
-    sources = frontmatter.get('sources', [])
-    confidence = frontmatter.get('confidence', 'medium')
-
-    # Relative path from mneme root - used as the canonical reference
     try:
-        rel_path = os.path.relpath(wiki_page_path, BASE_DIR)
+        rel_path = os.path.relpath(wiki_page_path, WIKI_DIR)
     except ValueError:
         rel_path = wiki_page_path
+    wiki_path = rel_path.replace(os.sep, '/')
 
-    chunks = chunk_body(body)
-    if not chunks:
-        return 0
+    conn = _get_search_db()
+    indexed = _search.upsert_page(conn, wiki_path, client, title, tags_str,
+                                  body, content_hash)
 
-    # BUG-001 fix: cap chunks to prevent hang on huge files
-    if len(chunks) > MAX_CHUNKS_PER_INGEST:
-        print(
-            f'[mneme] Warning: content has {len(chunks)} chunks, capping at {MAX_CHUNKS_PER_INGEST}',
-            file=sys.stderr,
-        )
-        chunks = chunks[:MAX_CHUNKS_PER_INGEST]
+    if indexed:
+        _update_tags_schema(wiki_page_path, frontmatter)
 
-    if not MEMVID_AVAILABLE:
-        print('[mneme] Memvid not installed. Wiki-only mode. Install with: pip install memvid-sdk')
-        return 0
-
-    client_mv2_path = (
-        os.path.join(PER_CLIENT_DIR, f'{client}.mv2')
-        if client and client not in EXCLUDED_DIRS else None
-    )
-
-    frames_added = 0
-
-    def _write_frames(master, client_archive=None):
-        nonlocal frames_added
-        for i, chunk in enumerate(chunks):
-            metadata = {
-                'wiki_path': rel_path,
-                'client': client,
-                'confidence': confidence,
-                'chunk_index': str(i),
-                'chunk_total': str(len(chunks)),
-                'sources': json.dumps(sources) if sources else '[]',
-            }
-            chunk_title = f'{title} [{i + 1}/{len(chunks)}]' if len(chunks) > 1 else title
-            master.put(
-                text=chunk,
-                title=chunk_title,
-                metadata=metadata,
-                tags=tags,
-            )
-            if client_archive:
-                client_archive.put(
-                    text=chunk,
-                    title=chunk_title,
-                    metadata=metadata,
-                    tags=tags,
-                )
-            frames_added += 1
-            # BUG-001 fix: batch commit every CHUNK_COMMIT_BATCH frames
-            if (i + 1) % CHUNK_COMMIT_BATCH == 0:
-                master.commit()
-                if client_archive:
-                    client_archive.commit()
-        # Final commit for remaining frames
-        master.commit()
-        if client_archive:
-            client_archive.commit()
-
-    os.makedirs(MEMVID_DIR, exist_ok=True)
-    if client_mv2_path:
-        os.makedirs(PER_CLIENT_DIR, exist_ok=True)
-        with _memvid_locked(MASTER_MV2) as master:
-            with _memvid_locked(client_mv2_path) as client_archive:
-                _write_frames(master, client_archive)
-    else:
-        with _memvid_locked(MASTER_MV2) as master:
-            _write_frames(master)
-
-    # BUG-003 fix: record sync in manifest so subsequent syncs skip unchanged pages
-    manifest['synced_pages'][page_key] = {
-        'hash': content_hash,
-        'frame_count': frames_added,
-        'synced_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
-    }
-    _save_manifest(manifest)
-
-    # BUG-006 fix: update tags.json from frontmatter tags
-    _update_tags_schema(wiki_page_path, frontmatter)
-
-    return frames_added
+    return indexed
 
 
 def sync_all_pages() -> dict:
     """
-    Glob all wiki pages (excluding _templates/ only), sync each to memvid.
-    Returns a summary dict with total_pages, total_frames, per_client breakdown.
+    Glob all wiki pages (excluding _templates/), sync each to the FTS5 index.
+    Returns a summary dict with total_pages, total_indexed, per_client breakdown.
     """
     pattern = os.path.join(WIKI_DIR, '**', '*.md')
     all_pages = glob.glob(pattern, recursive=True)
 
-    # Filter excluded dirs and files
     pages_to_sync = []
     for page in all_pages:
         rel = os.path.relpath(page, WIKI_DIR)
         parts = Path(rel).parts
         excluded = False
-        for part in parts[:-1]:  # skip filename in check
+        for part in parts[:-1]:
             if part in EXCLUDED_DIRS:
                 excluded = True
                 break
@@ -427,324 +241,117 @@ def sync_all_pages() -> dict:
             pages_to_sync.append(page)
 
     total_pages = 0
-    total_frames = 0
+    total_indexed = 0
     per_client: dict[str, int] = {}
     errors: list[str] = []
 
     for page in pages_to_sync:
-        # Derive client slug from directory structure
         rel = os.path.relpath(page, WIKI_DIR)
         parts = Path(rel).parts
         client_slug = parts[0] if len(parts) > 1 else '_unknown'
 
         try:
-            frames = sync_page_to_memvid(page, client_slug=client_slug)
+            indexed = sync_page_to_index(page, client_slug=client_slug)
             total_pages += 1
-            total_frames += frames
-            per_client[client_slug] = per_client.get(client_slug, 0) + frames
+            if indexed:
+                total_indexed += 1
+                per_client[client_slug] = per_client.get(client_slug, 0) + 1
         except Exception as e:
             errors.append(f'{page}: {e}')
 
-    result = {
+    return {
         'total_pages': total_pages,
-        'total_frames': total_frames,
+        'total_indexed': total_indexed,
         'per_client': per_client,
         'errors': errors,
     }
-    return result
-
-
-# Tantivy reserved words that cause MV999 errors in memvid semantic search
-_TANTIVY_RESERVED = {'and', 'or', 'not', 'in', 'to', 'the', 'for', 'of', 'is', 'a', 'an'}
-
-
-def _sanitize_memvid_query(query: str) -> str:
-    """Remove Tantivy reserved words from query to prevent MV999 errors.
-
-    BUG-002 fix: boolean keywords ('and', 'or', 'not') and common stop-words
-    are reserved in Tantivy's query parser. Passing them raw silently degrades
-    results or raises MV999. Strip them; if all words are reserved, keep the
-    first original word as a fallback so the search is never empty.
+def _search_wiki_text(query: str, k: int = 10, client: str = None) -> list[dict]:
     """
-    words = query.split()
-    cleaned = [w for w in words if w.lower() not in _TANTIVY_RESERVED]
-    if cleaned:
-        return ' '.join(cleaned)
-    # Fallback: keep first word even if reserved (better than empty string)
-    return words[0] if words else ''
+    Raw FTS5 search over wiki pages.
+
+    Returns a list of result dicts (text, title, wiki_path, score, tags,
+    client, layer). Used internally by dual_search and by callers that
+    want wiki-layer hits without the 'source' annotation.
+    """
+    conn = _get_search_db()
+    return _search.search(conn, query, k=k, client=client)
 
 
 def dual_search(query: str, k: int = 10, client: str = None) -> list[dict]:
     """
-    Search both wiki (text matching) and memvid master archive (semantic).
+    Search the wiki via FTS5 with BM25 ranking.
 
-    Wiki hits get priority - they are structured, curated, source-cited.
-    Memvid fills semantic gaps where text matching misses.
-
-    If client is specified, only return results from that client's pages.
-
-    Returns a unified list of results with source attribution and deduplication.
-    Each result: {'text', 'source', 'title', 'score', 'tags', 'wiki_path'}
+    Returns up to *k* results as dicts with:
+        text, title, source, score, tags, wiki_path, layer
     """
-    results = []
-    seen_paths: set[str] = set()
-    seen_texts: set[str] = set()  # dedup frames with no wiki_path by content fingerprint
+    results = _search_wiki_text(query, k=k, client=client)
 
-    # --- Layer 1: Wiki text search ---
-    wiki_hits = _search_wiki_text(query, k=k)
-    for hit in wiki_hits:
-        path = hit.get('wiki_path', '')
-        # Client filter: skip results not from the requested client
-        if client and not path.replace('wiki/', '').startswith(client + '/'):
-            continue
-        results.append({
-            'text': hit['text'],
-            'title': hit['title'],
-            'source': f"wiki: {hit['wiki_path']}",
-            'score': hit['score'],
-            'tags': hit.get('tags', []),
-            'wiki_path': path,
-            'layer': 'wiki',
-        })
-        if path:
-            seen_paths.add(path)
+    for r in results:
+        r['source'] = f'wiki: {r["wiki_path"]}'
 
-    # --- Layer 2: Memvid semantic search ---
-    if not MEMVID_AVAILABLE:
-        return results
-
-    try:
-        safe_query = _sanitize_memvid_query(query)
-        with _memvid_locked(MASTER_MV2, mode='open') as master:
-            mv_result = master.find(safe_query, k=k)
-        mv_hits = mv_result.get('hits', []) if isinstance(mv_result, dict) else mv_result.hits
-
-        for hit in mv_hits:
-            hit_title = hit.get('title', '') if isinstance(hit, dict) else hit.title
-            hit_snippet = hit.get('snippet', '') if isinstance(hit, dict) else hit.snippet
-            hit_score = hit.get('score', 0.0) if isinstance(hit, dict) else hit.score
-            hit_tags = hit.get('tags', []) if isinstance(hit, dict) else hit.tags
-
-            # Extract wiki_path from snippet metadata if present
-            path_match = re.search(r'wiki_path:\s*"?([^\s"]+)"?', hit_snippet)
-            wiki_path = path_match.group(1) if path_match else ''
-
-            # Skip if the same wiki page already returned from text search or prior memvid hit
-            if wiki_path and wiki_path in seen_paths:
-                continue
-
-            # Strip injected metadata from the snippet for clean display
-            display_text = re.sub(r'(?:wiki_path|client|confidence|chunk_index|chunk_total|sources|extractous_metadata|labels|title|tags):\s*["\[]?[^\n]+', '', hit_snippet).strip()
-
-            # Dedup frames without wiki_path by content fingerprint (first 100 chars)
-            if not wiki_path:
-                text_key = (display_text or hit_snippet)[:100]
-                if text_key in seen_texts:
-                    continue
-                seen_texts.add(text_key)
-
-            results.append({
-                'text': display_text or hit_snippet,
-                'title': hit_title,
-                'source': f"memvid: {wiki_path}" if wiki_path else f"memvid: frame {hit.get('frame_id', '?') if isinstance(hit, dict) else hit.frame_id}",
-                'score': hit_score,
-                'tags': hit_tags,
-                'wiki_path': wiki_path,
-                'layer': 'memvid',
-            })
-            if wiki_path:
-                seen_paths.add(wiki_path)
-
-    except Exception as e:
-        # Memvid may reject certain queries (reserved words, disabled index).
-        # Log the failure but don't pollute results - wiki layer already ran.
-        print(f'[mneme] memvid search skipped: {e}', file=sys.stderr)
-
-    # Sort: wiki hits first by score, then memvid hits by score
-    wiki_results = [r for r in results if r['layer'] == 'wiki']
-    memvid_results = [r for r in results if r['layer'] == 'memvid']
-
-    wiki_results.sort(key=lambda x: x['score'], reverse=True)
-    memvid_results.sort(key=lambda x: x['score'], reverse=True)
-
-    return wiki_results + memvid_results
-
-
-def _search_wiki_text(query: str, k: int = 10) -> list[dict]:
-    """
-    Substring search across wiki markdown files. Also checks index.md.
-    Returns up to k results ranked by match count.
-    """
-    pattern = os.path.join(WIKI_DIR, '**', '*.md')
-    all_pages = glob.glob(pattern, recursive=True)
-
-    query_lower = query.lower()
-    query_terms = query_lower.split()
-    scored: list[tuple[int, dict]] = []
-
-    for page in all_pages:
-        rel = os.path.relpath(page, WIKI_DIR)
-        parts = Path(rel).parts
-        # Skip excluded dirs
-        excluded = any(p in EXCLUDED_DIRS for p in parts[:-1])
-        if excluded:
-            continue
-
-        try:
-            with open(page, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except Exception:
-            continue
-
-        content_lower = content.lower()
-        # Score = sum of occurrences of each query term
-        score = sum(content_lower.count(term) for term in query_terms)
-        if score == 0:
-            continue
-
-        frontmatter, body = parse_frontmatter(content)
-        title = frontmatter.get('title', os.path.basename(page))
-        tags = frontmatter.get('tags', [])
-        if isinstance(tags, str):
-            tags = [t.strip() for t in tags.split(',')]
-
-        # Find the first paragraph containing any query term as snippet.
-        # Fall back to the full-content match so frontmatter-only pages still show
-        # something useful (the match is in frontmatter, not body).
-        snippet = ''
-        for para in re.split(r'\n\s*\n', body):
-            if any(term in para.lower() for term in query_terms):
-                snippet = para.strip()[:300]
-                break
-        if not snippet:
-            body_stripped = body.strip()
-            if body_stripped:
-                snippet = body_stripped[:300]
-            else:
-                # Match was in frontmatter; show the raw content up to 300 chars
-                snippet = content.strip()[:300]
-
-        # Normalize to forward slashes so callers (dual_search client filter,
-        # downstream consumers) can compare against `client/page` style paths
-        # on any platform. Without this, dual_search's client filter rejects
-        # every result on Windows because the path is `wiki\client\page.md`.
-        rel_page_path = os.path.relpath(page, BASE_DIR).replace(os.sep, '/')
-        scored.append((score, {
-            'text': snippet,
-            'title': title,
-            'wiki_path': rel_page_path,
-            'score': float(score),
-            'tags': tags if isinstance(tags, list) else [],
-        }))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [item for _, item in scored[:k]]
+    return results
 
 
 def check_drift() -> dict:
     """
-    Compare wiki pages against memvid frames to find drift.
+    Compare wiki pages on disk against the FTS5 search index.
 
-    Checks:
-    - Wiki pages with no corresponding memvid frames (need sync)
-    - Memvid frames whose source wiki page no longer exists
-    - Potentially stale frames (wiki page modified after last frame creation)
-
-    Returns a structured drift report.
+    Reports: unindexed (on disk but not in DB), orphaned (in DB but not on
+    disk), stale (hash mismatch).
     """
-    # Build set of wiki pages
+    # Build set of wiki pages on disk with their hashes
     pattern = os.path.join(WIKI_DIR, '**', '*.md')
     wiki_pages = glob.glob(pattern, recursive=True)
-    wiki_rel_paths: set[str] = set()
+
+    disk_pages: dict[str, str] = {}  # wiki_path -> content_hash
     for page in wiki_pages:
         rel = os.path.relpath(page, WIKI_DIR)
         parts = Path(rel).parts
         if any(p in EXCLUDED_DIRS for p in parts[:-1]):
             continue
-        wiki_rel_paths.add(os.path.relpath(page, BASE_DIR))
+        if os.path.basename(page) in EXCLUDED_FILES:
+            continue
+        wiki_path = rel.replace(os.sep, '/')
+        try:
+            with open(page, 'r', encoding='utf-8') as f:
+                content = f.read()
+            disk_pages[wiki_path] = _content_hash(content)
+        except Exception:
+            continue
 
-    # Build set of wiki paths referenced in memvid frames
-    memvid_wiki_paths: set[str] = set()
-    orphan_frames: list[dict] = []
+    # Get indexed pages from the DB
+    conn = _get_search_db()
+    indexed_pages = _search.get_indexed_pages(conn)
 
-    if not MEMVID_AVAILABLE:
-        return {
-            'missing_from_memvid': [],
-            'orphan_frames': [],
-            'stale': [],
-            'summary': 'Memvid not installed. Install with: pip install memvid-sdk',
-        }
+    disk_set = set(disk_pages.keys())
+    index_set = set(indexed_pages.keys())
 
-    try:
-        with _memvid_locked(MASTER_MV2, mode='open') as master:
-            mv_stats = master.stats()
-            frame_count = mv_stats['frame_count'] if isinstance(mv_stats, dict) else mv_stats.frame_count
-            probe_result = master.find('wiki_path', k=500, snippet_chars=2000)
+    unindexed = sorted(disk_set - index_set)
+    orphaned = sorted(index_set - disk_set)
+    stale = sorted(
+        p for p in disk_set & index_set
+        if disk_pages[p] != indexed_pages[p]
+    )
 
-        # Search specifically for 'wiki_path' metadata key to collect all synced paths.
-        # Use large snippet_chars so the metadata block isn't truncated mid-path.
-        # Memvid injects metadata at the end of the snippet, so 2000 chars covers most frames.
-        sampled_paths: set[str] = set()
-        probe_hits = probe_result.get('hits', []) if isinstance(probe_result, dict) else probe_result.hits
-        for hit in probe_hits:
-            snippet = hit.get('snippet', '') if isinstance(hit, dict) else hit.snippet
-            # Match wiki paths ending in .md
-            for path_match in re.finditer(r'wiki_path:\s*"?([^\s"]+\.md)"?', snippet):
-                sampled_paths.add(path_match.group(1))
-
-        memvid_wiki_paths = sampled_paths
-
-        # Find frames with no backing wiki page
-        for path in memvid_wiki_paths:
-            abs_path = os.path.join(BASE_DIR, path)
-            if not os.path.exists(abs_path):
-                orphan_frames.append({'wiki_path': path, 'issue': 'source wiki page does not exist'})
-
-    except Exception as e:
-        return {
-            'error': str(e),
-            'missing_from_memvid': [],
-            'orphan_frames': [],
-            'stale': [],
-            'summary': 'Drift check failed - memvid unavailable.',
-        }
-
-    # Pages missing from memvid
-    missing_from_memvid = [p for p in wiki_rel_paths if p not in memvid_wiki_paths]
-
-    # Stale check: wiki page modified after its frames were created
-    # We can't get per-frame creation time easily, so flag pages where the file
-    # was modified recently (last 24h) as candidates for re-sync
-    stale: list[str] = []
-    now = datetime.now(tz=timezone.utc).timestamp()
-    for path in wiki_rel_paths:
-        abs_path = os.path.join(BASE_DIR, path)
-        if path in memvid_wiki_paths:
-            try:
-                mtime = os.path.getmtime(abs_path)
-                # Flag if modified in the last 24 hours and already in memvid
-                # (could have been updated after last sync)
-                if now - mtime < 86400:
-                    stale.append(path)
-            except Exception:
-                pass
-
-    total_wiki = len(wiki_rel_paths)
-    synced = len(wiki_rel_paths & memvid_wiki_paths)
+    total_wiki = len(disk_pages)
+    total_indexed = len(indexed_pages)
+    synced = len(disk_set & index_set) - len(stale)
     sync_pct = round(100 * synced / total_wiki, 1) if total_wiki else 0.0
+    is_drifted = bool(unindexed or orphaned or stale)
 
     return {
-        'missing_from_memvid': missing_from_memvid,
-        'orphan_frames': orphan_frames,
+        'unindexed': unindexed,
+        'orphaned': orphaned,
         'stale': stale,
+        'is_drifted': is_drifted,
         'summary': {
             'total_wiki_pages': total_wiki,
+            'total_indexed': total_indexed,
             'synced': synced,
             'sync_pct': sync_pct,
-            'missing_from_memvid': len(missing_from_memvid),
-            'orphan_frames': len(orphan_frames),
-            'recently_modified_may_be_stale': len(stale),
-            'memvid_frame_count': frame_count,
+            'unindexed': len(unindexed),
+            'orphaned': len(orphaned),
+            'stale': len(stale),
         },
     }
 
@@ -752,7 +359,7 @@ def check_drift() -> dict:
 def ingest_source_to_both(source_path: str, client_slug: str, force: bool = False) -> dict:
     """
     Atomic ingest operation. Takes a raw source file, writes it to the wiki,
-    syncs to memvid, updates schema/entities.json and index.md, appends to log.md.
+    syncs to search index, updates schema/entities.json and index.md, appends to log.md.
 
     Handles .md and .txt. PDF requires pymupdf.
     Returns a summary of what was created.
@@ -762,9 +369,17 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
 
     # Check for duplicate ingest (matches INGEST_STARTED and INGEST_COMPLETE)
     source_filename = os.path.basename(source_path)
+    # Use relative path for dedup so files with the same basename in different
+    # directories are ingested independently (suggestion #3).
+    try:
+        source_rel_path = os.path.relpath(source_path, BASE_DIR)
+    except ValueError:
+        source_rel_path = source_path
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'r') as f:
-            if f'INGEST | {source_filename}' in f.read():
+            log_text = f.read()
+            # Check both relative path (new) and basename (backwards compat)
+            if f'INGEST | {source_rel_path}' in log_text or f'Source: {source_path}' in log_text:
                 # BUG-005 fix: only print "Skipping" when force is False
                 if not force:
                     print(f'Warning: {source_filename} was previously ingested. Skipping. Use --force to re-ingest.')
@@ -788,6 +403,29 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
         except ImportError:
             raise ValueError(
                 'PDF extraction requires pymupdf. Install: pip install pymupdf'
+            )
+    elif ext == '.xlsx':
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+            sheets = []
+            for ws in wb.worksheets:
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    continue
+                headers = [str(h or '').strip() for h in rows[0]]
+                sheet_lines = [f'## {ws.title}\n']
+                sheet_lines.append('| ' + ' | '.join(headers) + ' |')
+                sheet_lines.append('| ' + ' | '.join(['---'] * len(headers)) + ' |')
+                for row in rows[1:]:
+                    cells = [str(c or '').strip() for c in row]
+                    sheet_lines.append('| ' + ' | '.join(cells) + ' |')
+                sheets.append('\n'.join(sheet_lines))
+            wb.close()
+            raw_content = '\n\n'.join(sheets)
+        except ImportError:
+            raise ValueError(
+                'Excel extraction requires openpyxl. Install: pip install "mneme-cli[xlsx]"'
             )
     else:
         # Generic text fallback
@@ -860,10 +498,10 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
 
     # Write INGEST_STARTED log immediately after wiki page write.
     # The duplicate-ingest guard reads log.md, so logging first ensures a crash
-    # between wiki write and memvid sync is detectable on subsequent runs.
+    # between wiki write and search index sync is detectable on subsequent runs.
     _append_log(
         operation='INGEST',
-        description=f'{source_filename} -> {client_slug}/{page_slug}.md ({action}) [INGEST_STARTED]',
+        description=f'{source_rel_path} -> {client_slug}/{page_slug}.md ({action}) [INGEST_STARTED]',
         details=[
             f'Source: {source_path}',
             f'Wiki page: {action} at {rel_wiki_path}',
@@ -871,16 +509,20 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
         date=today,
     )
 
-    # Sync the wiki page to memvid
-    frames_added = sync_page_to_memvid(wiki_page_path, client_slug=client_slug)
+    # Sync the wiki page to search index
+    indexed = sync_page_to_index(wiki_page_path, client_slug=client_slug)
 
     # Update schema/entities.json with any capitalized entity mentions
     entities_updated = _update_entities_schema(client_slug, wiki_page_path, raw_content, today)
 
     # Update schema/tags.json from the wiki page frontmatter (BUG-006 fix)
     with open(wiki_page_path, 'r', encoding='utf-8') as _f:
-        _page_fm, _ = parse_frontmatter(_f.read())
+        _page_content = _f.read()
+        _page_fm, _ = parse_frontmatter(_page_content)
     _update_tags_schema(wiki_page_path, _page_fm)
+
+    # Update schema/graph.json with nodes and edges (suggestion #18)
+    _update_graph_schema(client_slug, wiki_page_path, _page_content, _page_fm, today)
 
     # Update index.md
     _update_index(client_slug, page_slug, rel_wiki_path, today)
@@ -888,11 +530,11 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
     # Append completion log entry
     _append_log(
         operation='INGEST',
-        description=f'{source_filename} -> {client_slug}/{page_slug}.md ({action}) [INGEST_COMPLETE]',
+        description=f'{source_rel_path} -> {client_slug}/{page_slug}.md ({action}) [INGEST_COMPLETE]',
         details=[
             f'Source: {source_path}',
             f'Wiki page: {action} at {rel_wiki_path}',
-            f'Memvid frames added: {frames_added}',
+            f'Indexed: {indexed}',
             f'Entities updated: {entities_updated}',
         ],
         date=today,
@@ -901,7 +543,7 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
     return {
         'wiki_page': rel_wiki_path,
         'action': action,
-        'frames_added': frames_added,
+        'indexed': indexed,
         'entities_updated': entities_updated,
         'client': client_slug,
         'source': source_path,
@@ -1136,10 +778,10 @@ def resync_source(source_path: str, client_slug: str, dry_run: bool = False) -> 
 
     # Re-derive schema from the merged content (only if no conflicts; with
     # conflicts the file contains markers and entity extraction would be noisy)
-    frames_added = 0
+    indexed = False
     entities_updated = 0
     if not had_conflicts:
-        frames_added = sync_page_to_memvid(wiki_page_path, client_slug=client_slug)
+        indexed = sync_page_to_index(wiki_page_path, client_slug=client_slug)
         entities_updated = _update_entities_schema(client_slug, wiki_page_path, merged_text, today)
         with open(wiki_page_path, 'r', encoding='utf-8') as _f:
             _page_fm, _ = parse_frontmatter(_f.read())
@@ -1155,7 +797,7 @@ def resync_source(source_path: str, client_slug: str, dry_run: bool = False) -> 
             f'Source: {rel_source}',
             f'Wiki page: merged at {rel_wiki_path}',
             f'Conflicts: {"yes" if had_conflicts else "no"}',
-            f'Memvid frames added: {frames_added}',
+            f'Indexed: {indexed}',
             f'Entities updated: {entities_updated}',
         ],
         date=today,
@@ -1165,7 +807,7 @@ def resync_source(source_path: str, client_slug: str, dry_run: bool = False) -> 
         'action': 'merge-conflict' if had_conflicts else 'merge-clean',
         'wiki_page': rel_wiki_path,
         'conflicts': had_conflicts,
-        'frames_added': frames_added,
+        'indexed': indexed,
         'entities_updated': entities_updated,
         'client': client_slug,
         'source': source_path,
@@ -1180,7 +822,7 @@ def resync_resolve(page_ref: str) -> dict:
     This function:
       1. Verifies no merge markers remain.
       2. Re-extracts schema (entities, tags) from the cleaned page.
-      3. Updates memvid.
+      3. Updates search index.
       4. Logs RESYNC-RESOLVED.
 
     Args:
@@ -1212,7 +854,7 @@ def resync_resolve(page_ref: str) -> dict:
     client_slug = parts[0]
     page_slug = os.path.splitext(parts[-1])[0]
 
-    frames_added = sync_page_to_memvid(wiki_page_path, client_slug=client_slug)
+    indexed = sync_page_to_index(wiki_page_path, client_slug=client_slug)
     entities_updated = _update_entities_schema(client_slug, wiki_page_path, content, today)
     fm, _ = parse_frontmatter(content)
     _update_tags_schema(wiki_page_path, fm)
@@ -1226,7 +868,7 @@ def resync_resolve(page_ref: str) -> dict:
         description=f'{client_slug}/{page_slug}.md - merge conflicts resolved by user',
         details=[
             f'Wiki page: {os.path.relpath(wiki_page_path, BASE_DIR)}',
-            f'Memvid frames added: {frames_added}',
+            f'Indexed: {indexed}',
             f'Entities updated: {entities_updated}',
         ],
         date=today,
@@ -1235,14 +877,14 @@ def resync_resolve(page_ref: str) -> dict:
     return {
         'action': 'resolved',
         'wiki_page': os.path.relpath(wiki_page_path, BASE_DIR),
-        'frames_added': frames_added,
+        'indexed': indexed,
         'entities_updated': entities_updated,
     }
 
 
 def get_stats() -> dict:
     """
-    Gather stats from wiki, memvid, and schema layers.
+    Gather stats from wiki, search index, and schema layers.
     Returns a structured dict with counts, sizes, and drift status.
     """
     # --- Wiki stats ---
@@ -1267,35 +909,16 @@ def get_stats() -> dict:
 
     total_wiki_pages = sum(wiki_by_client.values())
 
-    # --- Memvid stats ---
-    memvid_stats: dict = {}
-    search_latency_ms = None
-    if not MEMVID_AVAILABLE:
-        memvid_stats = {'error': 'Memvid not installed. Install with: pip install memvid-sdk'}
-    else:
-        try:
-            master = _open_master(mode='open')
-            raw = master.stats()
-            memvid_stats = raw if isinstance(raw, dict) else {}
-
-            # Latency test
-            t0 = time.time()
-            master.find('test', k=1)
-            search_latency_ms = round((time.time() - t0) * 1000, 1)
-
-            # Per-client archive sizes
-            client_archive_sizes: dict[str, int] = {}
-            if os.path.exists(PER_CLIENT_DIR):
-                for fname in os.listdir(PER_CLIENT_DIR):
-                    if fname.endswith('.mv2'):
-                        slug = fname[:-4]
-                        fpath = os.path.join(PER_CLIENT_DIR, fname)
-                        client_archive_sizes[slug] = os.path.getsize(fpath)
-            memvid_stats['per_client_archive_sizes'] = client_archive_sizes
-            memvid_stats['search_latency_ms'] = search_latency_ms
-            master.close()  # release exclusive lock before drift check opens it again
-        except Exception as e:
-            memvid_stats = {'error': str(e)}
+    # --- Search index stats ---
+    search_stats: dict = {}
+    try:
+        conn = _get_search_db()
+        search_stats = _search.get_stats(conn, db_path=SEARCH_DB)
+        t0 = time.time()
+        _search.search(conn, 'test', k=1)
+        search_stats['search_latency_ms'] = round((time.time() - t0) * 1000, 1)
+    except Exception as e:
+        search_stats = {'error': str(e)}
 
     # --- Schema stats ---
     schema_stats: dict = {}
@@ -1318,6 +941,15 @@ def get_stats() -> dict:
             edges = data.get('edges', []) if isinstance(data, dict) else data
             rel_count = len(edges)
 
+        # Also count trace links from traceability.json (suggestion #21)
+        trace_count = 0
+        if os.path.exists(TRACEABILITY_FILE):
+            with open(TRACEABILITY_FILE, 'r') as f:
+                tdata = json.load(f)
+            trace_links = tdata.get('links', []) if isinstance(tdata, dict) else tdata
+            trace_count = len(trace_links) if isinstance(trace_links, list) else 0
+        rel_count += trace_count
+
         tag_count = 0
         if os.path.exists(tags_path):
             with open(tags_path, 'r') as f:
@@ -1334,8 +966,7 @@ def get_stats() -> dict:
         schema_stats = {'error': str(e)}
 
     # --- Drift quick check ---
-    # Run after memvid section completes (archive handle released by garbage collection).
-    # Use a fresh call without holding any open archive handles.
+    # Run after search index section completes.
     drift_synced = 'unknown'
     try:
         drift = check_drift()
@@ -1350,7 +981,7 @@ def get_stats() -> dict:
             'by_client': wiki_by_client,
             'total_cross_references': total_cross_refs,
         },
-        'memvid': memvid_stats,
+        'search': search_stats,
         'schema': schema_stats,
         'drift': {
             'sync_status': drift_synced,
@@ -1419,7 +1050,7 @@ def _build_default_body(raw_content: str) -> str:
     """Build a basic wiki page body from raw source content."""
     stripped = raw_content.strip()
     if not stripped:
-        # Nothing to put in the body - return empty so chunk_body produces 0 frames.
+        # Nothing to put in the body - return empty.
         return ''
 
     return f"""## Summary
@@ -1452,6 +1083,10 @@ def _update_entities_schema(client_slug: str, wiki_page_path: str, content: str,
     Scan content for capitalized multi-word phrases (rough entity detection).
     Add any new entities to schema/entities.json.
     Returns count of new entities added.
+
+    Note: entity type classification and acronym extraction are left to the
+    LLM agent, which has the context to classify correctly. This function
+    only does mechanical proper-noun detection.
     """
     entities_path = os.path.join(SCHEMA_DIR, 'entities.json')
     os.makedirs(SCHEMA_DIR, exist_ok=True)
@@ -1523,7 +1158,7 @@ def _update_tags_schema(wiki_page_path: str, frontmatter: dict) -> None:
 
     BUG-006 fix: tags.json was never populated because no code path called
     into it. This function is called from ingest_source_to_both() and
-    sync_page_to_memvid() after the wiki page is written.
+    sync_page_to_index() after the wiki page is written.
     """
     tags = frontmatter.get('tags', [])
     if isinstance(tags, str):
@@ -1569,6 +1204,81 @@ def _update_tags_schema(wiki_page_path: str, frontmatter: dict) -> None:
         return json.dumps(data, indent=2)
 
     _locked_read_modify_write(tags_file, modifier)
+
+
+def _update_graph_schema(client_slug: str, wiki_page_path: str, content: str,
+                         frontmatter: dict, today: str) -> None:
+    """
+    Build graph.json nodes and edges from wiki pages and their wikilinks.
+
+    Creates a node for the current page and an edge for every [[wikilink]]
+    found in the body. Also adds edges for trace links in frontmatter's
+    ``related`` field.
+    """
+    graph_path = os.path.join(SCHEMA_DIR, 'graph.json')
+    os.makedirs(SCHEMA_DIR, exist_ok=True)
+
+    try:
+        rel_path = os.path.relpath(wiki_page_path, WIKI_DIR)
+    except ValueError:
+        rel_path = wiki_page_path
+    page_id = rel_path.replace(os.sep, '/').replace('.md', '')
+    page_type = frontmatter.get('type', 'source-summary')
+
+    # Extract wikilinks from body
+    wikilinks = re.findall(r'\[\[([^\]]+)\]\]', content)
+
+    # Extract related from frontmatter
+    related = frontmatter.get('related', [])
+    if isinstance(related, str):
+        related = [related]
+    for r in related:
+        # Strip [[ ]] if present
+        cleaned = r.strip().strip('[').strip(']')
+        if cleaned and cleaned not in wikilinks:
+            wikilinks.append(cleaned)
+
+    def modifier(raw: str) -> str:
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {'version': 1, 'updated': today, 'nodes': [], 'edges': []}
+        else:
+            data = {'version': 1, 'updated': today, 'nodes': [], 'edges': []}
+
+        nodes = data.get('nodes', [])
+        edges = data.get('edges', [])
+
+        # Add/update node for this page
+        existing_node_ids = {n.get('id') for n in nodes}
+        if page_id not in existing_node_ids:
+            nodes.append({
+                'id': page_id,
+                'type': page_type,
+                'client': client_slug,
+            })
+
+        # Add edges for wikilinks (dedup)
+        existing_edges = {(e.get('from'), e.get('to')) for e in edges}
+        for link in wikilinks:
+            link = link.strip()
+            if not link:
+                continue
+            if (page_id, link) not in existing_edges:
+                edges.append({
+                    'from': page_id,
+                    'to': link,
+                    'label': 'references',
+                })
+                existing_edges.add((page_id, link))
+
+        data['nodes'] = nodes
+        data['edges'] = edges
+        data['updated'] = today
+        return json.dumps(data, indent=2)
+
+    _locked_read_modify_write(graph_path, modifier)
 
 
 def _update_index(client_slug: str, page_slug: str, rel_wiki_path: str, today: str) -> None:
@@ -1618,6 +1328,40 @@ def _update_index(client_slug: str, page_slug: str, rel_wiki_path: str, today: s
     _locked_read_modify_write(INDEX_FILE, modifier)
 
 
+def _rotate_log_if_needed() -> None:
+    """Archive old log entries when log.md exceeds LOG_MAX_ENTRIES."""
+    if not os.path.exists(LOG_FILE):
+        return
+    with open(LOG_FILE, 'r', encoding='utf-8') as f:
+        content = f.read()
+    # Find all entry markers (## [YYYY-MM-DD ...])
+    entry_starts = [m.start() for m in re.finditer(r'^## \[', content, re.MULTILINE)]
+    if len(entry_starts) <= LOG_MAX_ENTRIES:
+        return
+    # Keep the newest LOG_MAX_ENTRIES entries (entries are in reverse chronological order)
+    # The cut point is the start of the (LOG_MAX_ENTRIES+1)th entry
+    cut_point = entry_starts[LOG_MAX_ENTRIES]
+    keep_content = content[:cut_point]
+    archive_content = content[cut_point:]
+    # Find the header section (everything before the first entry)
+    if entry_starts:
+        header = content[:entry_starts[0]]
+    else:
+        header = '# Mneme Activity Log\n\n'
+    # Write archive
+    today = datetime.now().strftime('%Y-%m-%d')
+    archive_path = os.path.join(BASE_DIR, f'log-archive-{today}.md')
+    # Append to existing archive if it exists
+    mode = 'a' if os.path.exists(archive_path) else 'w'
+    with open(archive_path, mode, encoding='utf-8') as f:
+        if mode == 'w':
+            f.write(header)
+        f.write(archive_content)
+    # Write trimmed log
+    with open(LOG_FILE, 'w', encoding='utf-8') as f:
+        f.write(keep_content)
+
+
 def _append_log(operation: str, description: str, details: list[str], date: str) -> None:
     """Append a log entry to log.md (newest first)."""
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
@@ -1642,6 +1386,7 @@ def _append_log(operation: str, description: str, details: list[str], date: str)
         return existing[:header_end + 2] + entry + existing[header_end + 2:]
 
     _locked_read_modify_write(LOG_FILE, modifier)
+    _rotate_log_if_needed()
 
 
 # ---------------------------------------------------------------------------
@@ -1672,7 +1417,6 @@ def init_workspace(project_name=None, clients=None):
         'wiki/_shared',
         'wiki/_templates',
         'schema',
-        'memvid',
     ]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
@@ -1727,7 +1471,7 @@ def init_workspace(project_name=None, clients=None):
                 '# Mnemosyne Log\n\n'
                 '## [' + today + '] INIT | ' + project_name + ' workspace created\n'
                 '- Clients: ' + ', '.join(clients) + '\n'
-                '- Structure: sources/, wiki/, schema/, memvid/\n\n'
+                '- Structure: sources/, wiki/, schema/\n\n'
             )
 
     claude_md_path = 'CLAUDE.md'
@@ -1843,11 +1587,11 @@ def init_workspace(project_name=None, clients=None):
 def _print_sync_result(result: dict) -> None:
     print(f'Sync complete.')
     print(f'  Pages synced:  {result["total_pages"]}')
-    print(f'  Frames added:  {result["total_frames"]}')
+    print(f'  Pages indexed: {result["total_indexed"]}')
     if result['per_client']:
         print('  Per client:')
-        for client, frames in sorted(result['per_client'].items()):
-            print(f'    {client}: {frames} frames')
+        for client, count in sorted(result['per_client'].items()):
+            print(f'    {client}: {count} pages indexed')
     if result['errors']:
         print(f'  Errors ({len(result["errors"])}):')
         for err in result['errors']:
@@ -1859,7 +1603,7 @@ def _print_search_results(results: list[dict]) -> None:
         print('No results found.')
         return
     for i, r in enumerate(results, 1):
-        layer_tag = '[wiki]' if r['layer'] == 'wiki' else '[memvid]'
+        layer_tag = '[wiki]' if r['layer'] == 'wiki' else '[fts5]'
         print(f'\n{i}. {layer_tag} {r["title"]}')
         print(f'   Source: {r["source"]}')
         if r['tags']:
@@ -1876,7 +1620,6 @@ def _print_drift_report(report: dict) -> None:
         return
     s = report.get('summary')
     print('Drift report:')
-    # When memvid is unavailable, check_drift returns a plain-string summary.
     if isinstance(s, str):
         print(f'  {s}')
         return
@@ -1884,32 +1627,33 @@ def _print_drift_report(report: dict) -> None:
         print('  (no summary available)')
         return
     print(f'  Wiki pages total:      {s["total_wiki_pages"]}')
-    print(f'  Synced to memvid:      {s["synced"]} ({s["sync_pct"]}%)')
-    print(f'  Missing from memvid:   {s["missing_from_memvid"]}')
-    print(f'  Orphan frames:         {s["orphan_frames"]}')
-    print(f'  Recently modified:     {s["recently_modified_may_be_stale"]}')
+    print(f'  Indexed:               {s.get("total_indexed", s.get("synced", 0))} ({s["sync_pct"]}%)')
+    print(f'  Unindexed:             {s["unindexed"]}')
+    print(f'  Orphaned:              {s.get("orphaned", 0)}')
+    print(f'  Stale:                 {s.get("stale", 0)}')
+    print(f'  Drifted:               {report.get("is_drifted", False)}')
 
-    if report['missing_from_memvid']:
-        print('\nPages missing from memvid:')
-        for p in report['missing_from_memvid'][:10]:
+    if report.get('unindexed'):
+        print('\nUnindexed pages:')
+        for p in report['unindexed'][:10]:
             print(f'  - {p}')
-        if len(report['missing_from_memvid']) > 10:
-            print(f'  ... and {len(report["missing_from_memvid"]) - 10} more')
+        if len(report['unindexed']) > 10:
+            print(f'  ... and {len(report["unindexed"]) - 10} more')
 
-    if report['orphan_frames']:
-        print('\nOrphan frames (source page gone):')
-        for f in report['orphan_frames'][:10]:
-            print(f'  - {f["wiki_path"]}')
+    if report.get('orphaned'):
+        print('\nOrphaned index entries (source page gone):')
+        for p in report['orphaned'][:10]:
+            print(f'  - {p}')
 
-    if report['stale']:
-        print('\nRecently modified (may need re-sync):')
+    if report.get('stale'):
+        print('\nStale pages (may need re-sync):')
         for p in report['stale'][:10]:
             print(f'  - {p}')
 
 
 def _print_stats(stats: dict) -> None:
     w = stats['wiki']
-    m = stats['memvid']
+    m = stats['search']
     sc = stats['schema']
     d = stats['drift']
 
@@ -1922,19 +1666,15 @@ def _print_stats(stats: dict) -> None:
         for client, count in sorted(w['by_client'].items()):
             print(f'    {client}: {count} pages')
 
-    print('\nMEMVID')
+    print('\nSEARCH INDEX')
     if 'error' in m:
         print(f'  Error: {m["error"]}')
     else:
-        print(f'  Frame count:       {m.get("frame_count", "?")}')
-        size_mb = round(m.get("size_bytes", 0) / 1024 / 1024, 2)
-        print(f'  Master size:       {size_mb} MB')
+        print(f'  Indexed pages:     {m.get("page_count", "?")}')
+        size_kb = round(m.get("db_size_bytes", 0) / 1024, 1)
+        print(f'  DB size:           {size_kb} KB')
         if m.get('search_latency_ms') is not None:
             print(f'  Search latency:    {m["search_latency_ms"]} ms')
-        if m.get('per_client_archive_sizes'):
-            print('  Per-client archives:')
-            for slug, size in sorted(m['per_client_archive_sizes'].items()):
-                print(f'    {slug}: {round(size / 1024, 1)} KB')
 
     print('\nSCHEMA')
     if 'error' in sc:
@@ -2197,27 +1937,39 @@ def lint() -> dict:
     }
 
 
-def ingest_dir(directory: str, client_slug: str, force: bool = False) -> dict:
+def ingest_dir(directory: str, client_slug: str, force: bool = False,
+               recursive: bool = False) -> dict:
     """
     Batch ingest all supported files from a directory.
 
     Walks the directory (non-recursive by default for safety), ingests each
     supported file (.md, .txt, .pdf) into the given client.
 
+    When recursive=True, walks subdirectories as well.
+
     Returns a summary of all ingestions.
     """
     if not os.path.isdir(directory):
         raise FileNotFoundError(f'Directory not found: {directory}')
 
-    supported_exts = {'.md', '.txt', '.pdf'}
+    supported_exts = {'.md', '.txt', '.pdf', '.xlsx'}
     files = []
-    for fname in sorted(os.listdir(directory)):
-        fpath = os.path.join(directory, fname)
-        if not os.path.isfile(fpath):
-            continue
-        _, ext = os.path.splitext(fname)
-        if ext.lower() in supported_exts:
-            files.append(fpath)
+    if recursive:
+        for root, dirs, filenames in os.walk(directory):
+            # Skip hidden directories
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for fname in sorted(filenames):
+                _, ext = os.path.splitext(fname)
+                if ext.lower() in supported_exts:
+                    files.append(os.path.join(root, fname))
+    else:
+        for fname in sorted(os.listdir(directory)):
+            fpath = os.path.join(directory, fname)
+            if not os.path.isfile(fpath):
+                continue
+            _, ext = os.path.splitext(fname)
+            if ext.lower() in supported_exts:
+                files.append(fpath)
 
     if not files:
         print(f'No supported files found in {directory}')
@@ -2630,7 +2382,7 @@ def _csv_row_to_wiki_page(row: dict, mapping: dict, client_slug: str, today: str
     trace_links = {}
 
     for csv_col, target in col_map.items():
-        value = row.get(csv_col, '').strip()
+        value = (row.get(csv_col) or '').strip()
         if not value:
             continue
 
@@ -2719,7 +2471,7 @@ confidence: medium
     return page_slug, page_content, trace_links
 
 
-def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_run: bool = False) -> dict:
+def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_run: bool = False, delimiter: str = None) -> dict:
     """
     Ingest a CSV file, creating one wiki page per row.
 
@@ -2739,7 +2491,17 @@ def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_ru
 
     # Read CSV
     with open(csv_path, 'r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
+        sample = f.read(4096)
+        f.seek(0)
+        if delimiter:
+            delim = delimiter
+        else:
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+                delim = dialect.delimiter
+            except csv.Error:
+                delim = ','
+        reader = csv.DictReader(f, delimiter=delim)
         headers = reader.fieldnames or []
         rows = list(reader)
 
@@ -2853,9 +2615,9 @@ def ingest_csv(csv_path: str, client_slug: str, mapping_name: str = None, dry_ru
         # Update index
         _update_index(client_slug, page_slug, os.path.relpath(wiki_path, BASE_DIR), today)
 
-        # Sync to memvid
+        # Sync to search index
         try:
-            sync_page_to_memvid(wiki_path, client_slug=client_slug)
+            sync_page_to_index(wiki_path, client_slug=client_slug)
         except Exception:
             pass
 
@@ -2964,6 +2726,7 @@ def status() -> dict:
                     source_files.append(os.path.join(root, fname))
 
     # Read log.md to find which sources have been ingested
+    log_content = ''
     ingested_sources = set()
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'r') as f:
@@ -2975,10 +2738,12 @@ def status() -> dict:
 
     # Count un-ingested: sources whose basename is not mentioned in any ingest log line
     uningest_count = 0
+    un_ingested_files = []
     for sf in source_files:
         basename = os.path.basename(sf)
-        if basename not in log_content if os.path.exists(LOG_FILE) else True:
+        if basename not in log_content:
             uningest_count += 1
+            un_ingested_files.append(sf)
 
     # Count wiki pages
     wiki_pages = []
@@ -3007,8 +2772,11 @@ def status() -> dict:
 
     return {
         'source_files': len(source_files),
+        'total_sources': len(source_files),
         'un_ingested': uningest_count,
+        'un_ingested_files': un_ingested_files,
         'wiki_pages': len(wiki_pages),
+        'total_wiki_pages': len(wiki_pages),
         'orphan_pages': orphan_count,
     }
 
@@ -3128,6 +2896,240 @@ def tags_merge(old_tag: str, new_tag: str) -> dict:
         'pages_updated': pages_updated,
         'old_tag': old_tag,
         'new_tag': new_tag,
+    }
+
+
+def _format_tag_packet(packet: dict) -> str:
+    """Render a tag packet as markdown for piping to an LLM agent."""
+    lines: list[str] = []
+    page = packet['page']
+    lines.append('# Tag packet')
+    lines.append('')
+    lines.append(f'**Page:** `{page["wiki_path"]}`')
+    lines.append(f'**Title:** {page["title"]}')
+    lines.append(f'**Client:** {page["client"]}')
+    current = page.get('current_tags') or []
+    lines.append(f'**Current tags:** {", ".join(current) if current else "(none)"}')
+    if packet.get('profile_guidance'):
+        lines.append(f'**Profile:** {packet["profile_guidance"]}')
+    lines.append('')
+
+    taxonomy = packet.get('tag_taxonomy') or []
+    lines.append('## Existing tag taxonomy (sorted by usage)')
+    lines.append('')
+    if not taxonomy:
+        lines.append('_(no tags exist yet in this workspace)_')
+    else:
+        lines.append('| Tag | Pages | Description |')
+        lines.append('|---|---:|---|')
+        for t in taxonomy[:50]:
+            desc = t.get('description', '') or ''
+            lines.append(f'| `{t["name"]}` | {t["count"]} | {desc} |')
+        if len(taxonomy) > 50:
+            lines.append(f'\n_(... and {len(taxonomy) - 50} more)_')
+    lines.append('')
+
+    lines.append('## Page content')
+    lines.append('')
+    lines.append('```markdown')
+    lines.append(page['body'])
+    lines.append('```')
+    lines.append('')
+
+    lines.append('## Instruction')
+    lines.append('')
+    lines.append(packet['tag_prompt'])
+    return '\n'.join(lines)
+
+
+def tags_suggest(page_slug: str) -> dict:
+    """
+    Build a *tag packet* for an LLM agent to read.
+
+    The packet contains the page content, current tags, the workspace tag
+    taxonomy (existing tags with usage counts), and a ready-to-paste prompt
+    instructing the agent to propose tags. The agent reads the packet,
+    decides on tags, and calls ``mneme tags apply`` to write them.
+
+    page_slug format: "client/page" (with or without .md extension).
+    """
+    if page_slug.endswith('.md'):
+        page_slug = page_slug[:-3]
+    rel_page = page_slug.replace('/', os.sep) + '.md'
+    page_path = os.path.join(WIKI_DIR, rel_page)
+    if not os.path.exists(page_path):
+        raise FileNotFoundError(f'Page not found: {page_slug}')
+
+    with open(page_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    frontmatter, body = parse_frontmatter(content)
+
+    title = frontmatter.get('title', os.path.basename(page_path))
+    client = frontmatter.get('client', page_slug.split('/')[0])
+    current_tags = frontmatter.get('tags', [])
+    if isinstance(current_tags, str):
+        current_tags = [t.strip() for t in current_tags.split(',') if t.strip()]
+
+    # Collect the workspace tag taxonomy (existing tags + counts).
+    taxonomy = []
+    tags_data = tags_list()
+    for tag_name, info in sorted(tags_data.items(), key=lambda kv: -kv[1].get('count', 0)):
+        taxonomy.append({
+            'name': tag_name,
+            'count': info.get('count', 0),
+            'description': info.get('description', ''),
+        })
+
+    # Profile tag guidance, if any.
+    profile_guidance = ''
+    try:
+        profile = get_active_profile()
+        if profile:
+            profile_guidance = (
+                f"Active profile: {profile.get('name', 'unknown')}. "
+                "Prefer profile vocabulary terms when they describe the topic."
+            )
+    except Exception:
+        pass
+
+    tag_prompt = (
+        "You are tagging a wiki page in a knowledge workspace.\n\n"
+        "Read the page content below. Propose 3-7 tags that describe the "
+        "topic, domain, and any standards/regulations mentioned.\n\n"
+        "Rules:\n"
+        "1. PREFER existing tags from the taxonomy when they fit -- consistency "
+        "matters more than novelty.\n"
+        "2. Add NEW tags only when no existing tag captures the concept.\n"
+        "3. Tag format: lowercase, hyphenated (e.g. `iso-13485`, "
+        "`risk-management`, `cardiac-monitoring`).\n"
+        "4. Do NOT add the client slug -- it is auto-applied.\n"
+        "5. Do NOT propose generic tags like `summary`, `overview`, `report`.\n\n"
+        "Output a single JSON object with two keys:\n"
+        '  {"tags": ["existing-tag-a", "existing-tag-b"], '
+        '"new_tags": ["proposed-new-tag"]}\n\n'
+        "After deciding, the operator will run:\n"
+        f"  mneme tags apply {page_slug} --add tag1,tag2,tag3"
+    )
+
+    return {
+        'page': {
+            'wiki_path': page_slug + '.md',
+            'title': title,
+            'client': client,
+            'current_tags': current_tags,
+            'body': body.strip(),
+        },
+        'tag_taxonomy': taxonomy,
+        'profile_guidance': profile_guidance,
+        'tag_prompt': tag_prompt,
+    }
+
+
+def tags_apply(page_slug: str, add: list = None,
+               remove: list = None) -> dict:
+    """
+    Apply tag changes to a wiki page atomically.
+
+    1. Read the page frontmatter.
+    2. Add / remove tags (deduplicated, lowercase, hyphenated).
+    3. Write the page back.
+    4. Update schema/tags.json via _update_tags_schema().
+    5. Re-sync the page to the FTS5 index so search reflects the new tags.
+
+    Returns ``{wiki_path, tags_before, tags_after, added, removed}``.
+    """
+    if page_slug.endswith('.md'):
+        page_slug = page_slug[:-3]
+    rel_page = page_slug.replace('/', os.sep) + '.md'
+    page_path = os.path.join(WIKI_DIR, rel_page)
+    if not os.path.exists(page_path):
+        raise FileNotFoundError(f'Page not found: {page_slug}')
+
+    add = [t.strip().lower() for t in (add or []) if t and t.strip()]
+    remove = [t.strip().lower() for t in (remove or []) if t and t.strip()]
+
+    with open(page_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    frontmatter, body = parse_frontmatter(content)
+
+    current = frontmatter.get('tags', [])
+    if isinstance(current, str):
+        current = [t.strip() for t in current.split(',') if t.strip()]
+    current = [t.lower() for t in current]
+    tags_before = list(current)
+
+    # Apply removals first, then additions, dedup while preserving order.
+    new_tags = [t for t in current if t not in remove]
+    for t in add:
+        if t not in new_tags:
+            new_tags.append(t)
+    actually_added = [t for t in add if t not in tags_before]
+    actually_removed = [t for t in remove if t in tags_before]
+
+    # Rewrite the page frontmatter.
+    today = datetime.now().strftime('%Y-%m-%d')
+    client = frontmatter.get('client', page_slug.split('/')[0])
+    new_page = _build_wiki_page(
+        title=frontmatter.get('title', os.path.basename(page_path)),
+        client=client,
+        sources=frontmatter.get('sources', []),
+        tags=new_tags,
+        created=frontmatter.get('created', today),
+        updated=today,
+        confidence=frontmatter.get('confidence', 'medium'),
+        body=body.strip(),
+    )
+    with open(page_path, 'w', encoding='utf-8') as f:
+        f.write(new_page)
+
+    # Update schema/tags.json (handles add). For removals, we also need to
+    # drop the page from the removed tags' page lists.
+    new_fm, _ = parse_frontmatter(new_page)
+    _update_tags_schema(page_path, new_fm)
+
+    if actually_removed:
+        tags_file = os.path.join(SCHEMA_DIR, 'tags.json')
+        wiki_rel = os.path.relpath(page_path, WIKI_DIR)
+
+        def drop_from_removed(raw: str) -> str:
+            if not raw.strip():
+                return raw
+            data = json.loads(raw)
+            tags_dict = data.get('tags', {})
+            for t in actually_removed:
+                if t in tags_dict:
+                    pages = [p for p in tags_dict[t].get('pages', []) if p != wiki_rel]
+                    tags_dict[t]['pages'] = pages
+                    tags_dict[t]['count'] = len(pages)
+                    if not pages:
+                        del tags_dict[t]
+            data['tags'] = tags_dict
+            data['updated'] = today
+            return json.dumps(data, indent=2)
+
+        if os.path.exists(tags_file):
+            _locked_read_modify_write(tags_file, drop_from_removed)
+
+    # Re-sync the page to the FTS5 index so search picks up the new tags.
+    sync_page_to_index(page_path, client_slug=client)
+
+    _append_log(
+        operation='UPDATE',
+        description=f'Tagged {page_slug}',
+        details=[
+            f'Added: {", ".join(actually_added) or "none"}',
+            f'Removed: {", ".join(actually_removed) or "none"}',
+            f'Tags after: {", ".join(new_tags)}',
+        ],
+        date=today,
+    )
+
+    return {
+        'wiki_path': rel_page.replace(os.sep, '/'),
+        'tags_before': tags_before,
+        'tags_after': new_tags,
+        'added': actually_added,
+        'removed': actually_removed,
     }
 
 
@@ -5235,7 +5237,7 @@ def repair() -> dict:
     Repair corrupted Mnemosyne archives and schema files.
 
     Checks:
-    - master.mv2: exists and is readable; if missing/corrupt, deletes and recreates via sync_all_pages
+    - search.db: exists and is usable; if missing/corrupt, deletes and rebuilds via rebuild_index
     - entities.json, graph.json, tags.json: valid JSON; if corrupt, resets to empty structure
     - index.md: exists
 
@@ -5244,23 +5246,27 @@ def repair() -> dict:
     repaired = []
     warnings = []
 
-    # --- master.mv2 ---
-    master_ok = False
-    if os.path.exists(MASTER_MV2):
+    # --- search.db ---
+    db_ok = False
+    if os.path.exists(SEARCH_DB):
         try:
-            m = mv.use('basic', MASTER_MV2, mode='open')
-            m.stats()
-            master_ok = True
+            conn = _get_search_db()
+            _search.get_stats(conn, db_path=SEARCH_DB)
+            db_ok = True
         except Exception as e:
-            warnings.append(f'master.mv2 unreadable: {e}')
+            warnings.append(f'search.db unreadable: {e}')
             try:
-                os.remove(MASTER_MV2)
+                os.remove(SEARCH_DB)
             except OSError:
                 pass
-    if not master_ok:
-        print('[mneme] repair: master.mv2 missing or corrupt - rebuilding via sync_all_pages...', file=sys.stderr)
-        sync_result = sync_all_pages()
-        repaired.append(f'master.mv2 rebuilt ({sync_result["total_frames"]} frames from {sync_result["total_pages"]} pages)')
+            global _search_conn
+            _search_conn = None
+    if not db_ok:
+        print('[mneme] repair: search.db missing or corrupt - rebuilding index...', file=sys.stderr)
+        conn = _get_search_db()
+        rebuild_result = _search.rebuild_index(conn, WIKI_DIR, BASE_DIR, EXCLUDED_DIRS, EXCLUDED_FILES)
+        pages_reindexed = rebuild_result if isinstance(rebuild_result, int) else rebuild_result.get('total_pages', 0)
+        repaired.append(f'search.db rebuilt ({pages_reindexed} pages reindexed)')
 
     # --- Schema files ---
     today = datetime.now().strftime('%Y-%m-%d')
@@ -5366,7 +5372,7 @@ def new_workspace(
     # Default client directories
     os.makedirs(os.path.join(target_abs, 'wiki', default_client), exist_ok=True)
     os.makedirs(os.path.join(target_abs, 'sources', default_client), exist_ok=True)
-    os.makedirs(os.path.join(target_abs, 'memvid'), exist_ok=True)
+    # Search DB is created lazily on first use; no directory needed.
 
     # Active profile
     if profile and profile != 'none':
@@ -5403,7 +5409,7 @@ def _apply_workspace_override(workspace: str) -> None:
     g = globals()
     for name in (
         'ACTIVE_PROFILE_FILE', 'BASE_DIR', 'INDEX_FILE', 'LOG_FILE',
-        'MASTER_MV2', 'MEMVID_DIR', 'PER_CLIENT_DIR', 'PROFILES_DIR',
+        'SEARCH_DB', 'PROFILES_DIR',
         'SCHEMA_DIR', 'SOURCES_DIR', 'TEMPLATES_DIR', 'TRACEABILITY_FILE',
         'WIKI_DIR', 'WORKSPACE_PROFILES_DIR', 'WORKSPACE_MAPPINGS_DIR',
     ):
@@ -5411,6 +5417,9 @@ def _apply_workspace_override(workspace: str) -> None:
             g[name] = getattr(_cfg, name)
     # INBOX_DIR is derived from BASE_DIR in this module.
     g['INBOX_DIR'] = os.path.join(_cfg.BASE_DIR, 'inbox')
+    # Reset lazy search connection so it reopens against the new workspace.
+    global _search_conn
+    _search_conn = None
 
 
 def main() -> None:
@@ -5418,7 +5427,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog='mneme',
-        description='Mnemosyne - your second brain. LLM Wiki + Memvid memory layer.',
+        description='Mnemosyne - your second brain. LLM Wiki + FTS5 search layer.',
     )
     parser.add_argument(
         '--version', '-V',
@@ -5434,22 +5443,22 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest='command', required=True)
 
     # sync
-    subparsers.add_parser('sync', help='Sync all wiki pages to memvid')
+    subparsers.add_parser('sync', help='Sync all wiki pages to search index')
 
     # search
-    search_parser = subparsers.add_parser('search', help='Dual-layer search (wiki + memvid)')
+    search_parser = subparsers.add_parser('search', help='Dual-layer search (wiki + FTS5)')
     search_parser.add_argument('query', help='Search query')
     search_parser.add_argument('-k', type=int, default=10, help='Max results (default: 10)')
     search_parser.add_argument('--client', type=str, default=None, help='Scope search to a specific client')
 
     # drift
-    subparsers.add_parser('drift', help='Check sync drift between wiki and memvid')
+    subparsers.add_parser('drift', help='Check sync drift between wiki and search index')
 
     # stats
     subparsers.add_parser('stats', help='Show stats for all layers')
 
     # ingest
-    ingest_parser = subparsers.add_parser('ingest', help='Atomic ingest: source -> wiki + memvid')
+    ingest_parser = subparsers.add_parser('ingest', help='Atomic ingest: source -> wiki + search index')
     ingest_parser.add_argument('file', help='Path to source file (.md, .txt, .pdf)')
     ingest_parser.add_argument('client_slug', help='Client slug (e.g. demo-retail, my-client)')
     ingest_parser.add_argument('--force', action='store_true', help='Re-ingest even if source was previously ingested')
@@ -5467,6 +5476,7 @@ def main() -> None:
     ingest_dir_parser.add_argument('directory', help='Path to directory containing source files')
     ingest_dir_parser.add_argument('client_slug', help='Client slug (e.g. demo-retail, my-client)')
     ingest_dir_parser.add_argument('--force', action='store_true', help='Re-ingest even if sources were previously ingested')
+    ingest_dir_parser.add_argument('--recursive', '-r', action='store_true', help='Recurse into subdirectories')
 
     # tornado
     tornado_parser = subparsers.add_parser('tornado', help='Process inbox: auto-detect, ingest, archive')
@@ -5480,6 +5490,7 @@ def main() -> None:
     csv_parser.add_argument('client_slug', help='Client slug')
     csv_parser.add_argument('--mapping', type=str, default=None, help='Mapping template name (e.g. user-needs, requirements, risk-register, dds, test-cases)')
     csv_parser.add_argument('--dry-run', action='store_true', help='Show what would happen without creating pages')
+    csv_parser.add_argument('--delimiter', help='CSV delimiter character (auto-detected if omitted)')
 
     # status
     subparsers.add_parser('status', help='Quick summary of pending work')
@@ -5495,6 +5506,24 @@ def main() -> None:
     tags_merge_parser = tags_sub.add_parser('merge', help='Merge one tag into another')
     tags_merge_parser.add_argument('old_tag', help='Tag to merge from (will be removed)')
     tags_merge_parser.add_argument('new_tag', help='Tag to merge into')
+
+    # tags suggest -- build a tag packet for an LLM agent
+    tags_suggest_parser = tags_sub.add_parser(
+        'suggest',
+        help='Build a tag-suggestion packet for an LLM agent (the agent decides the tags)',
+    )
+    tags_suggest_parser.add_argument('page', help='Page slug (e.g. client-a/proposal)')
+    tags_suggest_parser.add_argument('--json', action='store_true', help='Output raw JSON instead of formatted markdown')
+    tags_suggest_parser.add_argument('--out', help='Write packet to a file instead of stdout')
+
+    # tags apply -- atomic add/remove of tags on a page
+    tags_apply_parser = tags_sub.add_parser(
+        'apply',
+        help='Apply tag changes to a page (writes frontmatter, updates schema and search index)',
+    )
+    tags_apply_parser.add_argument('page', help='Page slug (e.g. client-a/proposal)')
+    tags_apply_parser.add_argument('--add', help='Comma-separated tags to add')
+    tags_apply_parser.add_argument('--remove', help='Comma-separated tags to remove')
 
     # diff
     diff_parser = subparsers.add_parser('diff', help='Show git diff for a wiki page')
@@ -5532,6 +5561,8 @@ def main() -> None:
     trace_show_parser.add_argument('--direction', choices=['forward', 'backward'], default='forward', help='Chain direction')
     trace_matrix_parser = trace_sub.add_parser('matrix', help='Generate traceability matrix')
     trace_matrix_parser.add_argument('client_slug', help='Client slug')
+    trace_matrix_parser.add_argument('--csv', action='store_true', help='Export trace matrix as CSV')
+    trace_matrix_parser.add_argument('--out', help='Output file path (default: stdout)')
     trace_gaps_parser = trace_sub.add_parser('gaps', help='Find incomplete trace chains')
     trace_gaps_parser.add_argument('client_slug', help='Client slug')
 
@@ -5620,6 +5651,7 @@ def main() -> None:
 
     # repair
     subparsers.add_parser('repair', help='Repair corrupted archives and schema')
+    subparsers.add_parser('reindex', help='Rebuild the FTS5 search index from wiki pages')
 
     # resync
     resync_parser = subparsers.add_parser(
@@ -5649,7 +5681,7 @@ def main() -> None:
     # demo
     demo_parser = subparsers.add_parser('demo', help='Demo content management')
     demo_sub = demo_parser.add_subparsers(dest='demo_action')
-    demo_clean = demo_sub.add_parser('clean', help='Remove all demo content (files, wiki, schema, memvid, log/index entries)')
+    demo_clean = demo_sub.add_parser('clean', help='Remove all demo content (files, wiki, schema, search index, log/index entries)')
     demo_clean.add_argument('--client', default='demo-retail', help='Client slug to remove (default: demo-retail)')
     demo_clean.add_argument('--dry-run', action='store_true', help='Preview without deleting')
     demo_clean.add_argument('--yes', action='store_true', help='Skip confirmation prompt')
@@ -5690,7 +5722,7 @@ def main() -> None:
             print(f'Ingest complete.')
             print(f'  Action:          {result["action"]}')
             print(f'  Wiki page:       {result["wiki_page"]}')
-            print(f'  Memvid frames:   {result["frames_added"]}')
+            print(f'  Indexed:         {result["indexed"]}')
             print(f'  Entities added:  {result["entities_updated"]}')
         except (FileNotFoundError, ValueError, OSError) as e:
             print(f'Error: {e}', file=sys.stderr)
@@ -5731,7 +5763,8 @@ def main() -> None:
             print(f'Error: invalid client slug "{args.client_slug}". Use lowercase letters, numbers, hyphens only.', file=sys.stderr)
             sys.exit(1)
         try:
-            result = ingest_dir(args.directory, args.client_slug, force=args.force)
+            result = ingest_dir(args.directory, args.client_slug, force=args.force,
+                               recursive=getattr(args, 'recursive', False))
             print(f'\nBatch ingest complete.')
             print(f'  Ingested:  {result["ingested"]}')
             print(f'  Skipped:   {result["skipped"]}')
@@ -5751,7 +5784,7 @@ def main() -> None:
             print(f'Error: invalid client slug "{args.client_slug}".', file=sys.stderr)
             sys.exit(1)
         try:
-            result = ingest_csv(args.file, args.client_slug, mapping_name=args.mapping, dry_run=args.dry_run)
+            result = ingest_csv(args.file, args.client_slug, mapping_name=args.mapping, dry_run=args.dry_run, delimiter=args.delimiter)
             if 'error' in result:
                 print(f'Error: {result["error"]}', file=sys.stderr)
                 sys.exit(1)
@@ -5794,8 +5827,41 @@ def main() -> None:
             result = tags_merge(args.old_tag, args.new_tag)
             print(f'Merged "{result["old_tag"]}" into "{result["new_tag"]}"')
             print(f'  Pages updated: {result["pages_updated"]}')
+        elif args.tags_command == 'suggest':
+            try:
+                packet = tags_suggest(args.page)
+            except FileNotFoundError as e:
+                print(f'Error: {e}', file=sys.stderr)
+                sys.exit(1)
+            if args.json:
+                output = json.dumps(packet, indent=2)
+            else:
+                output = _format_tag_packet(packet)
+            if args.out:
+                with open(args.out, 'w', encoding='utf-8') as f:
+                    f.write(output)
+                print(f'Tag packet written to {args.out}')
+            else:
+                print(output)
+        elif args.tags_command == 'apply':
+            add_list = [t for t in (args.add or '').split(',') if t.strip()]
+            remove_list = [t for t in (args.remove or '').split(',') if t.strip()]
+            if not add_list and not remove_list:
+                print('Error: provide --add and/or --remove with comma-separated tags', file=sys.stderr)
+                sys.exit(1)
+            try:
+                result = tags_apply(args.page, add=add_list, remove=remove_list)
+            except FileNotFoundError as e:
+                print(f'Error: {e}', file=sys.stderr)
+                sys.exit(1)
+            print(f'Updated {result["wiki_path"]}')
+            if result['added']:
+                print(f'  Added:   {", ".join(result["added"])}')
+            if result['removed']:
+                print(f'  Removed: {", ".join(result["removed"])}')
+            print(f'  Tags now: {", ".join(result["tags_after"])}')
         else:
-            print('Usage: mneme tags {list|merge}', file=sys.stderr)
+            print('Usage: mneme tags {list|merge|suggest|apply}', file=sys.stderr)
 
     elif args.command == 'diff':
         output = diff_page(args.page)
@@ -5894,17 +5960,36 @@ def main() -> None:
                     print(f'  {indent}{item["relationship"]} -> {item["page"]}')
         elif args.trace_command == 'matrix':
             result = trace_matrix(args.client_slug)
-            rows = result.get('rows', [])
-            if not rows:
-                print('No trace links found for this client.')
+            if getattr(args, 'csv', False):
+                import io
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['Source'] + result['columns'])
+                for row_slug in result['rows']:
+                    row_data = [row_slug]
+                    for col_slug in result['columns']:
+                        cell = result['cells'].get((row_slug, col_slug), '')
+                        row_data.append(cell)
+                    writer.writerow(row_data)
+                csv_text = output.getvalue()
+                if getattr(args, 'out', None):
+                    with open(args.out, 'w', encoding='utf-8') as f:
+                        f.write(csv_text)
+                    print(f'Trace matrix exported to {args.out}')
+                else:
+                    print(csv_text)
             else:
-                print(f'=== Traceability Matrix: {args.client_slug} ===\n')
-                print(f'  Items traced: {len(rows)}')
-                gaps = result.get('gaps', [])
-                if gaps:
-                    print(f'  Gaps (no links): {len(gaps)}')
-                    for g in gaps[:10]:
-                        print(f'    - {g}')
+                rows = result.get('rows', [])
+                if not rows:
+                    print('No trace links found for this client.')
+                else:
+                    print(f'=== Traceability Matrix: {args.client_slug} ===\n')
+                    print(f'  Items traced: {len(rows)}')
+                    gaps = result.get('gaps', [])
+                    if gaps:
+                        print(f'  Gaps (no links): {len(gaps)}')
+                        for g in gaps[:10]:
+                            print(f'    - {g}')
         elif args.trace_command == 'gaps':
             result = trace_gaps(args.client_slug)
             total = result.get('total_gaps', 0)
@@ -6164,7 +6249,7 @@ def main() -> None:
                 print(f'  Theirs hash:   {result["theirs_hash"][:12]}')
                 print(f'  Merged hash:   {result["merged_hash"][:12]}')
         else:
-            print(f'  Frames added:    {result.get("frames_added", 0)}')
+            print(f'  Indexed:         {result.get("indexed", False)}')
             print(f'  Entities updated:{result.get("entities_updated", 0)}')
 
     elif args.command == 'resync-resolve':
@@ -6174,7 +6259,7 @@ def main() -> None:
             print(f'Error: {e}', file=sys.stderr)
             sys.exit(1)
         print(f'mneme resync-resolve: {result["wiki_page"]}')
-        print(f'  Frames added:    {result["frames_added"]}')
+        print(f'  Indexed:         {result["indexed"]}')
         print(f'  Entities updated:{result["entities_updated"]}')
         print('  Baseline updated. Page is clean.')
 
@@ -6233,14 +6318,13 @@ def main() -> None:
         print(f'  Graph nodes:            {result["graph_nodes_removed"]}')
         print(f'  Graph edges:            {result["graph_edges_removed"]}')
         print(f'  Trace links:            {result["trace_links_removed"]}')
-        print(f'  Memvid manifest entries:{result["manifest_entries_removed"]}')
-        print(f'  Memvid archives:        {result["memvid_archives_removed"]}')
+        print(f'  Search pages removed:   {result["search_pages_removed"]}')
         print(f'  Index lines:            {result["index_lines_removed"]}')
         print(f'  Log entries:            {result["log_entries_removed"]}')
         if args.dry_run:
             print('Dry run -- nothing was modified. Re-run without --dry-run to apply.')
         else:
-            print('Done. Note: master.mv2 frames are not removed; run `mneme repair` or rebuild memvid to drop them.')
+            print('Done.')
 
     elif args.command == 'repair':
         result = repair()
@@ -6256,11 +6340,32 @@ def main() -> None:
                 for w in result['warnings']:
                     print(f'  - {w}')
 
+    elif args.command == 'reindex':
+        global _search_conn
+        # Drop the existing connection and the DB file, then rebuild.
+        if _search_conn is not None:
+            try:
+                _search_conn.close()
+            except Exception:
+                pass
+            _search_conn = None
+        if os.path.exists(SEARCH_DB):
+            os.remove(SEARCH_DB)
+        conn = _get_search_db()
+        result = _search.rebuild_index(
+            conn, WIKI_DIR, BASE_DIR,
+            EXCLUDED_DIRS, EXCLUDED_FILES,
+        )
+        print(f'Reindex complete.')
+        print(f'  Pages indexed: {result["pages_indexed"]}')
+        if result['errors']:
+            print(f'  Errors: {result["errors"]}')
+
 
 def clean_demo(client_slug: str = 'demo-retail', dry_run: bool = False) -> dict:
     """
-    Remove all demo content: wiki pages, sources, schema entries, memvid sync
-    manifest entries, index.md and log.md entries, and stray top-level demo dirs.
+    Remove all demo content: wiki pages, sources, schema entries, search index
+    entries, index.md and log.md entries, and stray top-level demo dirs.
 
     Returns a dict with what was (or would be) removed.
     """
@@ -6276,10 +6381,9 @@ def clean_demo(client_slug: str = 'demo-retail', dry_run: bool = False) -> dict:
         'graph_nodes_removed': 0,
         'graph_edges_removed': 0,
         'trace_links_removed': 0,
-        'manifest_entries_removed': 0,
+        'search_pages_removed': 0,
         'index_lines_removed': 0,
         'log_entries_removed': 0,
-        'memvid_archives_removed': 0,
     }
 
     page_prefix = f'{client_slug}/'
@@ -6297,13 +6401,17 @@ def clean_demo(client_slug: str = 'demo-retail', dry_run: bool = False) -> dict:
             if not dry_run:
                 shutil.rmtree(d)
 
-    # 2. Per-client memvid archive
-    per_client_mv2 = os.path.join(PER_CLIENT_DIR, f'{client_slug}.mv2')
-    if os.path.exists(per_client_mv2):
-        removed['files'].append(os.path.relpath(per_client_mv2, BASE_DIR))
-        removed['memvid_archives_removed'] += 1
-        if not dry_run:
-            os.remove(per_client_mv2)
+    # 2. Delete pages from search index for this client
+    wiki_client_dir = os.path.join(WIKI_DIR, client_slug)
+    if os.path.isdir(wiki_client_dir):
+        conn = _get_search_db()
+        for root, _dirs, files in os.walk(wiki_client_dir):
+            for fn in files:
+                if fn.endswith('.md'):
+                    wiki_path = os.path.relpath(os.path.join(root, fn), BASE_DIR)
+                    if not dry_run:
+                        _search.delete_page(conn, wiki_path)
+                    removed['search_pages_removed'] += 1
 
     # 3. Lint reports referencing the client
     if os.path.isdir(WIKI_DIR):
@@ -6417,27 +6525,7 @@ def clean_demo(client_slug: str = 'demo-retail', dry_run: bool = False) -> dict:
         else:
             _locked_read_modify_write(TRACEABILITY_FILE, trace_mod)
 
-    # 8. memvid/.sync-manifest.json — drop entries pointing at the client
-    manifest_file = os.path.join(MEMVID_DIR, '.sync-manifest.json')
-    if os.path.exists(manifest_file):
-        def manifest_mod(content: str) -> str:
-            try:
-                data = json.loads(content) if content.strip() else {}
-            except json.JSONDecodeError:
-                return content
-            synced = data.get('synced_pages', {})
-            needle = f'/wiki/{client_slug}/'
-            needle_win = f'\\wiki\\{client_slug}\\'
-            kept = {k: v for k, v in synced.items()
-                    if needle not in k.replace('\\', '/') and needle_win not in k}
-            removed['manifest_entries_removed'] = len(synced) - len(kept)
-            data['synced_pages'] = kept
-            return json.dumps(data, indent=2)
-        if dry_run:
-            with open(manifest_file, 'r', encoding='utf-8') as f:
-                manifest_mod(f.read())
-        else:
-            _locked_read_modify_write(manifest_file, manifest_mod)
+    # 8. (search index pages already removed in step 2)
 
     # 9. index.md — strip the client section and any line referencing the client
     if os.path.exists(INDEX_FILE):
@@ -6514,7 +6602,6 @@ def clean_demo(client_slug: str = 'demo-retail', dry_run: bool = False) -> dict:
                 f'Files: {len(removed["files"])}',
                 f'Entities: {removed["schema_entities_removed"]}',
                 f'Tag pages: {removed["schema_tag_pages_removed"]}',
-                f'Manifest entries: {removed["manifest_entries_removed"]}',
             ],
             date=today,
         )

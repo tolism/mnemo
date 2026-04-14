@@ -69,7 +69,7 @@ A mneme workspace is a directory. Its shape is stable across versions:
     graph.json       relationship graph
     tags.json        tag registry
     traceability.json  trace links between pages
-  memvid/            optional .mv2 archives (semantic search)
+  search.db          SQLite FTS5 search index (rebuilt from wiki)
   profiles/          workspace-local profiles and CSV mappings
     mappings/        JSON column mappings for ingest-csv
   exports/           JSON / markdown exports
@@ -107,7 +107,7 @@ mneme tornado --client <client>          # batch from inbox/
 ```
 
 `ingest` is atomic: it writes the wiki page, updates the schema, and
-advances the Memvid archive in one operation. `ingest-csv` produces one
+indexes the page in SQLite FTS5 in one operation. `ingest-csv` produces one
 wiki page per row, with trace links derived from the mapping. `tornado`
 is a bulk inbox processor — it auto-detects page type and routes CSVs
 through `ingest-csv`, everything else through `ingest`.
@@ -206,6 +206,44 @@ would clobber hand edits. Use `resync`. It runs a 3-way merge between
 baseline, your current wiki page, and a fresh ingest of the new source.
 If there are conflicts, the page is left with merge markers. Edit them
 out manually, then run `resync-resolve`.
+
+### 3.6 TAG — agent-driven tagging
+
+```bash
+mneme tags suggest <client>/<page>                     # build tag packet
+mneme tags suggest <client>/<page> --json              # raw dict
+mneme tags apply <client>/<page> --add t1,t2 --remove t3
+```
+
+`mneme tags suggest` builds a **tag packet**: the page content, current
+tags, the workspace tag taxonomy (every existing tag with usage counts),
+active profile guidance, and a ready-to-paste prompt instructing you to
+choose 3–7 tags. Mneme does **not** propose tags itself — content
+understanding is your job. The packet gives you all the context you need.
+
+Your contract when consuming a tag packet:
+
+1. **Prefer existing tags** from the taxonomy when they fit. Consistency
+   matters more than novelty — `iso-13485` should not become `iso13485`
+   on the next page.
+2. **Add new tags only** when no existing tag captures the concept.
+3. Follow the format: lowercase, hyphenated (`risk-management`, not
+   `Risk Management`).
+4. Do not propose generic tags (`summary`, `overview`, `report`).
+5. Do not add the client slug — it is auto-applied.
+6. Output JSON: `{"tags": ["existing-a", "existing-b"], "new_tags": ["proposed-c"]}`.
+
+`mneme tags apply` is **atomic**: it rewrites the wiki page frontmatter,
+updates `schema/tags.json`, re-syncs the page to the FTS5 index, and
+appends a log entry — all in one operation. Search picks up the new tags
+immediately. Use `--add` and/or `--remove`, comma-separated.
+
+Existing taxonomy ops:
+
+```bash
+mneme tags list                                        # all tags + counts
+mneme tags merge <old> <new>                           # rename across all pages
+```
 
 ---
 

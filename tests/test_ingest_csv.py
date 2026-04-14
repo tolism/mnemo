@@ -21,7 +21,7 @@ from mneme.core import (
 def temp_workspace(monkeypatch):
     """Build a clean temp workspace and rebind mneme path constants at it."""
     td = tempfile.mkdtemp(prefix='mneme-csv-test-')
-    for sub in ('wiki', 'sources', 'schema', 'memvid', os.path.join('memvid', 'per-client')):
+    for sub in ('wiki', 'sources', 'schema'):
         os.makedirs(os.path.join(td, sub), exist_ok=True)
     with open(os.path.join(td, 'index.md'), 'w') as f:
         f.write('# Index\n')

@@ -23,7 +23,7 @@ from .config import (
     UI_FILE,
 )
 
-# Lazy import core so memvid errors don't kill startup
+# Lazy import core so import errors don't kill startup
 try:
     from .core import (
         get_stats,
@@ -300,7 +300,7 @@ def main():
     print('Press Ctrl+C to stop')
     if not CORE_OK:
         print(f'[WARNING] core import failed: {CORE_ERROR}')
-        print('[WARNING] Some API endpoints will return errors. Memvid features disabled.')
+        print('[WARNING] Some API endpoints will return errors. Search features disabled.')
     try:
         server.serve_forever()
     except KeyboardInterrupt:

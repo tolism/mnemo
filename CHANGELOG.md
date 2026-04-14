@@ -4,6 +4,60 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-13
+
+### Breaking Changes
+
+- **Replaced memvid-sdk with SQLite FTS5.** The `memvid/` directory and `.mv2`
+  archives are no longer used. Search is now powered by a local `search.db`
+  file using BM25 ranking with Porter stemming. **Zero external dependencies**
+  for search — `sqlite3` is in the Python stdlib.
+- `mneme repair` now rebuilds the FTS5 index instead of memvid archives.
+- `mneme drift` reports `unindexed` / `orphaned` / `stale` instead of
+  `missing_from_memvid` / `orphan_frames`.
+- `get_stats()` returns a `search` key (page_count, db_size_bytes,
+  search_latency_ms) instead of `memvid`.
+- `sync_page_to_memvid()` renamed to `sync_page_to_index()`. Returns
+  `bool` (indexed) instead of `int` (frame count).
+- Removed `chunk_body()`, `_sanitize_memvid_query()`, and all chunking
+  config (`MAX_CHUNK_SIZE`, `MIN_CHUNK_SIZE`, `MAX_CHUNKS_PER_INGEST`,
+  `CHUNK_COMMIT_BATCH`).
+- Removed `MEMVID_DIR`, `MASTER_MV2`, `PER_CLIENT_DIR` config constants.
+  Replaced by `SEARCH_DB`.
+
+### Added
+
+- **`mneme reindex`** command — rebuild search index from wiki pages.
+- **`ingest-dir --recursive` / `-r`** — recurse into subdirectories.
+- **`ingest-dir --preserve-structure`** — mirror source directory structure
+  in wiki subdirectories (avoids dedup collisions between same-basename files
+  in different directories).
+- **`ingest-csv --delimiter`** flag with auto-detection via `csv.Sniffer`.
+- **`.xlsx` ingest support** — install with `pip install "mneme-cli[xlsx]"`.
+  Sheets are rendered as markdown tables.
+- **`mneme trace matrix --csv [--out FILE]`** — export the trace matrix as
+  CSV for QMS audits and DHF inclusion.
+- **`graph.json` auto-populated** during ingest from wiki page wikilinks
+  and `related` frontmatter.
+- **`stats` relationship count** now includes traceability.json links, not
+  just graph.json edges.
+- **log.md rotation** — entries beyond `LOG_MAX_ENTRIES` (default 500) are
+  archived to `log-archive-YYYY-MM-DD.md`.
+
+### Fixed
+
+- `mneme status` crash (UnboundLocalError on `log_content`).
+- CSV ingest crash on `None` cells (`row.get()` returning None).
+- Duplicate ingest detection now uses full source path, not just filename
+  (two `INSTRUCTIONS.md` files in different directories now both ingest).
+
+### Removed
+
+- `memvid-sdk` dependency.
+- `MNEME_NO_MEMVID` env var (no longer needed — FTS5 is always available).
+- Chunking logic (`chunk_body`, `MAX_CHUNK_SIZE`, frame management).
+- Tantivy-reserved-word query sanitizer (FTS5 has different syntax).
+
 ## [Unreleased]
 
 ### Added

@@ -24,7 +24,7 @@ mneme --workspace /path/to/{{PROJECT_SLUG}} stats
   wiki/{{DEFAULT_CLIENT}}/   structured markdown pages
   sources/{{DEFAULT_CLIENT}}/  immutable source archive
   schema/                    entities, graph, tags, traceability
-  memvid/                    semantic search archive (created on first sync)
+  search.db                  SQLite FTS5 search index (created on first sync)
   inbox/                     drop files here, run `mneme tornado`
   index.md                   master catalog
   log.md                     activity timeline

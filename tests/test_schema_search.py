@@ -19,6 +19,7 @@ from mneme.core import (
     get_stats,
     status,
     recent,
+    sync_all_pages,
     tags_list,
     tags_merge,
     dedupe,
@@ -35,7 +36,7 @@ from mneme.core import (
 def temp_workspace(monkeypatch):
     """Build a clean temp workspace and rebind mneme path constants at it."""
     td = tempfile.mkdtemp(prefix='mneme-schtest-')
-    for sub in ('wiki', 'sources', 'schema', 'memvid', os.path.join('memvid', 'per-client')):
+    for sub in ('wiki', 'sources', 'schema'):
         os.makedirs(os.path.join(td, sub), exist_ok=True)
     with open(os.path.join(td, 'index.md'), 'w') as f:
         f.write('# Index\nLast updated: 2026-01-01\n\n')
@@ -192,6 +193,7 @@ class TestSearch:
     def test_finds_match(self, temp_workspace):
         _make_page(temp_workspace, 'demo', 'p1', 'the quarterly budget report')
         _make_page(temp_workspace, 'demo', 'p2', 'the annual review')
+        sync_all_pages()
         results = _search_wiki_text('quarterly')
         assert len(results) == 1
         assert 'p1' in results[0]['wiki_path']
@@ -199,19 +201,22 @@ class TestSearch:
     def test_k_cap(self, temp_workspace):
         for i in range(5):
             _make_page(temp_workspace, 'demo', f'p{i}', 'quarterly budget')
+        sync_all_pages()
         results = _search_wiki_text('quarterly', k=2)
         assert len(results) == 2
 
     def test_dual_search_client_filter(self, temp_workspace):
         _make_page(temp_workspace, 'demoA', 'p1', 'quarterly data')
         _make_page(temp_workspace, 'demoB', 'p1', 'quarterly data')
+        sync_all_pages()
         results = dual_search('quarterly', client='demoA')
         assert len(results) >= 1
         for r in results:
             assert 'demoA' in r.get('wiki_path', '')
 
-    def test_dual_search_no_memvid_ok(self, temp_workspace):
+    def test_dual_search_returns_list(self, temp_workspace):
         _make_page(temp_workspace, 'demo', 'p1', 'quarterly')
+        sync_all_pages()
         out = dual_search('quarterly')
         assert isinstance(out, list)
 
@@ -220,13 +225,26 @@ class TestCheckDrift:
     def test_empty(self, temp_workspace):
         r = check_drift()
         assert isinstance(r, dict)
+        assert 'unindexed' in r
+        assert 'orphaned' in r
+        assert 'stale' in r
+        assert 'summary' in r
 
-    def test_unsynced_page(self, temp_workspace):
+    def test_unindexed_page(self, temp_workspace):
         _make_page(temp_workspace, 'demo', 'p1', 'body')
         r = check_drift()
         assert isinstance(r, dict)
-        # With or without memvid, returns a dict structure
-        assert 'missing_from_memvid' in r or 'summary' in r
+        # Page exists on disk but is not yet indexed
+        assert any('p1' in p for p in r['unindexed'])
+        assert r['is_drifted'] is True
+
+    def test_synced_page_is_not_drifted(self, temp_workspace):
+        _make_page(temp_workspace, 'demo', 'p1', 'body')
+        sync_all_pages()
+        r = check_drift()
+        assert r['unindexed'] == []
+        assert r['stale'] == []
+        assert r['is_drifted'] is False
 
 
 class TestGetStats:

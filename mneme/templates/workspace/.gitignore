@@ -1,6 +1,6 @@
-memvid/*.mv2
-memvid/per-client/
-memvid/.sync-manifest.json
+search.db
+search.db-wal
+search.db-shm
 exports/
 snapshots/
 .mneme/

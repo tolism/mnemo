@@ -29,7 +29,7 @@ from mneme.core import (
 @pytest.fixture
 def temp_workspace():
     td = tempfile.mkdtemp(prefix='mneme-agent-test-')
-    for sub in ('wiki', 'sources', 'schema', 'memvid', os.path.join('memvid', 'per-client')):
+    for sub in ('wiki', 'sources', 'schema'):
         os.makedirs(os.path.join(td, sub), exist_ok=True)
     with open(os.path.join(td, 'index.md'), 'w') as f:
         f.write('# Index\n')
@@ -138,11 +138,14 @@ class TestDraftDocument:
         assert 'the quick brown fox' in explicit[0]['content']
 
     def test_query_includes_search_hits(self, temp_workspace):
+        from mneme.core import sync_all_pages
         set_active_profile('eu-mdr')
         _make_page(temp_workspace, 'demo', 'q-page',
                    'This page discusses the quarterly benchmarks in detail.')
         _make_page(temp_workspace, 'demo', 'a-page',
                    'This page discusses the annual benchmarks in detail.')
+        # FTS5 index must be populated before search can find hits
+        sync_all_pages()
         result = draft_document('design-validation-report', 'test-results', 'demo',
                                 query='quarterly')
         assert 'error' not in result

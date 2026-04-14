@@ -12,7 +12,7 @@ requires-python = ">=3.9"
 authors = [
     { name = "Tolis Moustaklis", email = "apostolos.moustaklis@gmail.com" },
 ]
-keywords = ["knowledge-management", "second-brain", "cli", "wiki", "memvid", "llm", "qms", "obsidian", "traceability"]
+keywords = ["knowledge-management", "second-brain", "cli", "wiki", "sqlite", "fts5", "llm", "qms", "obsidian", "traceability"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -31,13 +31,13 @@ classifiers = [
     "Topic :: Text Processing :: Markup :: Markdown",
 ]
 dependencies = [
-    "memvid-sdk>=2.0.0",
     "portalocker>=2.0.0",
 ]
 
 [project.optional-dependencies]
 pdf = ["pymupdf>=1.23.0"]
-all = ["pymupdf>=1.23.0"]
+xlsx = ["openpyxl>=3.1.0"]
+all = ["pymupdf>=1.23.0", "openpyxl>=3.1.0"]
 release = [
     "build>=1.0.0",
     "twine>=5.0.0",

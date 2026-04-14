@@ -36,7 +36,7 @@ from mneme.core import (
 @pytest.fixture
 def temp_workspace():
     td = tempfile.mkdtemp(prefix='mneme-trace-test-')
-    for sub in ('wiki', 'sources', 'schema', 'memvid', os.path.join('memvid', 'per-client')):
+    for sub in ('wiki', 'sources', 'schema'):
         os.makedirs(os.path.join(td, sub), exist_ok=True)
     with open(os.path.join(td, 'index.md'), 'w') as f:
         f.write('# Index\n')

@@ -171,7 +171,7 @@
   }
 
   .badge-wiki    { background: var(--accent-dim); color: var(--accent); }
-  .badge-memvid  { background: #3d2b5033; color: var(--purple); }
+  .badge-fts5    { background: #3d2b5033; color: var(--purple); }
   .badge-client  { background: #1f2937; color: #9ca3af; border: 1px solid var(--border); }
   .badge-high    { background: #1a3a2a; color: var(--green); }
   .badge-medium  { background: var(--amber-dim); color: var(--amber); }
@@ -792,7 +792,7 @@
   <div class="tab-panel active" id="tab-dashboard">
     <div class="stats-grid" id="stats-grid">
       <div class="stat-card"><div class="stat-value" id="s-wiki">-</div><div class="stat-label">Wiki Pages</div></div>
-      <div class="stat-card"><div class="stat-value" id="s-frames">-</div><div class="stat-label">Memvid Frames</div></div>
+      <div class="stat-card"><div class="stat-value" id="s-frames">-</div><div class="stat-label">Indexed Pages</div></div>
       <div class="stat-card"><div class="stat-value" id="s-entities">-</div><div class="stat-label">Entities</div></div>
       <div class="stat-card"><div class="stat-value" id="s-tags">-</div><div class="stat-label">Tags</div></div>
       <div class="stat-card"><div class="stat-value" id="s-latency">-</div><div class="stat-label">Search Latency</div><div class="stat-sub" id="s-latency-sub"></div></div>
@@ -878,7 +878,7 @@
       <span id="health-run-status" style="font-size:12px;color:var(--text-muted)"></span>
     </div>
     <div id="health-results">
-      <div class="empty-state">Click "Run Health Check" to analyze sync status, orphan frames, and stale pages.</div>
+      <div class="empty-state">Click "Run Health Check" to analyze sync status, orphaned entries, and stale pages.</div>
     </div>
   </div>
 
@@ -946,18 +946,18 @@ async function loadDashboard() {
     // Wiki stats
     document.getElementById('s-wiki').textContent = fmtNum(data.wiki?.total_pages ?? '-');
 
-    // Memvid frames
-    const frames = data.memvid?.frame_count ?? '-';
-    document.getElementById('s-frames').textContent = fmtNum(frames);
+    // Indexed pages (FTS5)
+    const pageCount = data.search?.page_count ?? '-';
+    document.getElementById('s-frames').textContent = fmtNum(pageCount);
 
     // Entities + tags
     document.getElementById('s-entities').textContent = fmtNum(data.schema?.entity_count ?? '-');
     document.getElementById('s-tags').textContent = fmtNum(data.schema?.tag_count ?? '-');
 
     // Latency
-    const lat = data.memvid?.search_latency_ms;
+    const lat = data.search?.search_latency_ms;
     document.getElementById('s-latency').textContent = lat != null ? lat + 'ms' : '-';
-    document.getElementById('s-latency-sub').textContent = lat != null ? 'memvid master' : 'memvid offline';
+    document.getElementById('s-latency-sub').textContent = lat != null ? 'FTS5 BM25' : 'search offline';
 
     // Drift
     const drift = data.drift?.sync_status ?? '-';
@@ -966,7 +966,7 @@ async function loadDashboard() {
 
     // Client cards
     const byClient = data.wiki?.by_client ?? {};
-    const archiveSizes = data.memvid?.per_client_archive_sizes ?? {};
+    const archiveSizes = {};
     renderClientCards(byClient, archiveSizes);
 
   } catch(e) {
@@ -1076,7 +1076,7 @@ async function doSearch() {
     }
 
     resultsEl.innerHTML = results.map(r => {
-      const layer = r.layer || (r.source?.startsWith('wiki') ? 'wiki' : 'memvid');
+      const layer = r.layer || (r.source?.startsWith('wiki') ? 'wiki' : 'fts5');
       const client = extractClient(r);
       const score = typeof r.score === 'number' ? r.score.toFixed(1) : r.score;
       const clientStr = client ? `<span class="badge badge-client">${escHtml(client)}</span>` : '';
@@ -1405,8 +1405,8 @@ function renderHealthResults(data) {
   const results = document.getElementById('health-results');
   const summary = data.summary || {};
   const syncPct = typeof summary.sync_pct === 'number' ? summary.sync_pct : null;
-  const missing = data.missing_from_memvid || [];
-  const orphans = data.orphan_frames || [];
+  const missing = data.unindexed || data.missing_from_memvid || [];
+  const orphans = data.orphaned || data.orphan_frames || [];
   const stale = data.stale || [];
   const error = data.error;
 
@@ -1425,13 +1425,13 @@ function renderHealthResults(data) {
         <div class="health-score-value" style="color:${pctColor}">${syncPct}%</div>
         <div>
           <div class="health-score-label">Sync coverage</div>
-          <div style="font-size:12px;color:var(--text-dim)">${summary.synced ?? '-'} of ${summary.total_wiki_pages ?? '-'} pages in memvid</div>
+          <div style="font-size:12px;color:var(--text-dim)">${summary.synced ?? '-'} of ${summary.total_wiki_pages ?? '-'} pages indexed</div>
         </div>
       </div>
       <div class="progress-bar">
         <div class="progress-fill ${barClass}" style="width:${barWidth}%"></div>
       </div>
-      <div style="font-size:11px;color:var(--text-dim);margin-top:4px">${summary.memvid_frame_count ?? '-'} total frames in master archive</div>
+      <div style="font-size:11px;color:var(--text-dim);margin-top:4px">${summary.total_indexed ?? '-'} total pages in FTS5 index</div>
     </div>` : '';
 
   const makeSectionHtml = (title, items, emptyMsg, icon, iconColor) => `
@@ -1454,8 +1454,8 @@ function renderHealthResults(data) {
     </div>`;
 
   results.innerHTML = scoreHtml +
-    makeSectionHtml('Missing from Memvid', missing, 'All pages are synced to memvid', '&#9651;', 'var(--red)') +
-    makeSectionHtml('Orphan Frames', orphans, 'No orphan frames found', '&#9632;', 'var(--amber)') +
+    makeSectionHtml('Unindexed pages', missing, 'All pages are indexed', '&#9651;', 'var(--red)') +
+    makeSectionHtml('Orphaned entries', orphans, 'No orphaned entries found', '&#9632;', 'var(--amber)') +
     makeSectionHtml('Recently Modified (may be stale)', stale, 'No recently modified pages detected', '&#9651;', 'var(--amber)');
 }
 
@@ -1469,7 +1469,7 @@ async function runSync() {
 
   try {
     const data = await apiPost('/api/sync');
-    const msg = `Sync complete: ${data.total_pages} pages, ${data.total_frames} frames`;
+    const msg = `Sync complete: ${data.total_pages} pages, ${data.total_indexed} indexed`;
     status.textContent = msg;
     if (data.errors && data.errors.length) {
       status.textContent += ` (${data.errors.length} errors)`;

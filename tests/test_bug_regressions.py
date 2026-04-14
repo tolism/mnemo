@@ -31,6 +31,7 @@ from mneme.core import (
     dual_search,
     ingest_csv,
     lint,
+    sync_all_pages,
     trace_gaps,
 )
 
@@ -42,8 +43,7 @@ from mneme.core import (
 @pytest.fixture
 def temp_workspace():
     td = tempfile.mkdtemp(prefix='mneme-regression-')
-    for sub in ('wiki', 'sources', 'schema', 'memvid',
-                os.path.join('memvid', 'per-client')):
+    for sub in ('wiki', 'sources', 'schema'):
         os.makedirs(os.path.join(td, sub), exist_ok=True)
     with open(os.path.join(td, 'index.md'), 'w') as f:
         f.write('# Index\n')
@@ -109,12 +109,14 @@ class TestBug1DualSearchNameError:
 
     def test_returns_wiki_hits(self, temp_workspace):
         _make_page(temp_workspace, 'demo', 'budget', 'quarterly budget review')
+        sync_all_pages()
         out = dual_search('quarterly')
         assert any('budget' in r.get('wiki_path', '') for r in out)
 
     def test_client_filter(self, temp_workspace):
         _make_page(temp_workspace, 'alpha', 'p1', 'shared keyword')
         _make_page(temp_workspace, 'beta', 'p1', 'shared keyword')
+        sync_all_pages()
         out = dual_search('shared', client='alpha')
         assert all('alpha' in r.get('wiki_path', '') for r in out)
 
@@ -270,29 +272,33 @@ class TestBug5PrintDriftReport:
     """
 
     def test_string_summary_does_not_crash(self, capsys):
+        # Defensive: if some caller hands us a report with a string summary
+        # (e.g., an error message), the printer must not crash.
         report = {
-            'missing_from_memvid': [],
-            'orphan_frames': [],
+            'unindexed': [],
+            'orphaned': [],
             'stale': [],
-            'summary': 'Memvid not installed.',
+            'is_drifted': False,
+            'summary': 'Search index unavailable.',
         }
         _print_drift_report(report)  # must not raise
         out = capsys.readouterr().out
-        assert 'Memvid not installed' in out
+        assert 'Search index unavailable' in out
 
     def test_dict_summary_still_works(self, capsys):
         report = {
-            'missing_from_memvid': [],
-            'orphan_frames': [],
+            'unindexed': [],
+            'orphaned': [],
             'stale': [],
+            'is_drifted': False,
             'summary': {
                 'total_wiki_pages': 5,
+                'total_indexed': 5,
                 'synced': 5,
                 'sync_pct': 100.0,
-                'missing_from_memvid': 0,
-                'orphan_frames': 0,
-                'recently_modified_may_be_stale': 0,
-                'memvid_frame_count': 12,
+                'unindexed': 0,
+                'orphaned': 0,
+                'stale': 0,
             },
         }
         _print_drift_report(report)
@@ -300,9 +306,8 @@ class TestBug5PrintDriftReport:
         assert 'Wiki pages total' in out
         assert '5' in out
 
-    def test_check_drift_report_renders_without_memvid(self, temp_workspace, capsys):
-        # End-to-end: real check_drift output (string summary path) should
-        # render without raising.
+    def test_check_drift_report_renders(self, temp_workspace, capsys):
+        # End-to-end: real check_drift output should render without raising.
         report = check_drift()
         _print_drift_report(report)
 

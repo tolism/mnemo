@@ -69,7 +69,7 @@ A mneme workspace is a directory. Its shape is stable across versions:
     graph.json       relationship graph
     tags.json        tag registry
     traceability.json  trace links between pages
-  memvid/            optional .mv2 archives (semantic search)
+  search.db          SQLite FTS5 search index (rebuilt from wiki)
   profiles/          workspace-local profiles and CSV mappings
     mappings/        JSON column mappings for ingest-csv
   exports/           JSON / markdown exports
@@ -107,7 +107,7 @@ mneme tornado --client <client>          # batch from inbox/
 ```
 
 `ingest` is atomic: it writes the wiki page, updates the schema, and
-advances the Memvid archive in one operation. `ingest-csv` produces one
+indexes the page in SQLite FTS5 in one operation. `ingest-csv` produces one
 wiki page per row, with trace links derived from the mapping. `tornado`
 is a bulk inbox processor — it auto-detects page type and routes CSVs
 through `ingest-csv`, everything else through `ingest`.
