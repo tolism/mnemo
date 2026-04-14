@@ -280,6 +280,93 @@ plain-markdown `<details>` fallback so the page is useful outside
 Obsidian. Run after a large ingest, or whenever the wiki's shape
 changes meaningfully.
 
+### 3.9 TRACE — linking the full V-model chain
+
+The trace chain a notified body expects has two legs that both terminate
+at code and tests:
+
+```
+UN  ──implemented-by──┐
+                      ├──> REQ ──detailed-in──> DDS ──implemented-in──> codebase
+RMA ──mitigated-by────┘                             └──verified-by───> tests
+```
+
+The first three links (UN→REQ, RMA→REQ, REQ→DDS) are created
+automatically by the CSV mappings in `profiles/mappings/` (or by
+`mneme trace add` when ingesting structured sources). The last two
+links (DDS→codebase, DDS→tests) close the V-model and are the agent's
+responsibility when a user passes you one or more repositories.
+
+**When the user passes you a repo path, you must:**
+
+```bash
+# 1. Inventory: what code modules / test files exist?
+mneme scan-repo <repo-path> <client>
+# → reports which wiki pages reference the repo's modules, and which do not.
+
+# 2. For each DDS page that corresponds to a code module, add the link.
+#    The target is a git URL or an absolute repo path; mneme treats it
+#    as an opaque string (not a wiki slug) — the target may live outside
+#    the workspace.
+mneme trace add <client>/dds-cyb-001 \
+                "github.com/<org>/<repo>/blob/main/src/auth/password_policy.py" \
+                implemented-in
+
+# 3. For each DDS page that has a corresponding test, add the link.
+#    The test target can be a wiki page (for test-plan docs) or an
+#    external path (for a test file in a repo).
+mneme trace add <client>/dds-cyb-001 <client>/test-auth-001 verified-by
+mneme trace add <client>/dds-cyb-001 \
+                "github.com/<org>/<repo>/blob/main/tests/test_password_policy.py" \
+                verified-by
+```
+
+Do this for every DDS page that has implementing code or a verifying
+test. When there are tens or hundreds of links to create (typical for
+a real medical-device codebase):
+
+```bash
+# Batch approach — the agent parses the repo, maps DDS → files,
+# then writes a shell script of `mneme trace add` lines and runs it.
+# mneme has no bulk-trace-add subcommand yet; scripting is the way.
+for pair in dds-cyb-001:src/auth/password_policy.py \
+            dds-cyb-002:src/auth/mfa.py \
+            dds-cyb-003:src/auth/rate_limiter.py; do
+  dds=${pair%%:*}; file=${pair##*:}
+  mneme trace add <client>/$dds "<repo-url>/$file" implemented-in
+done
+```
+
+**Verify the chain is now complete:**
+
+```bash
+mneme trace gaps <client>
+# → should report 0 hazards without mitigation, 0 DDS without
+#   implementation link, 0 DDS without verification link
+
+mneme trace show <client>/un-001
+# → UN.001
+#     implemented-by -> REQ.SYS.001
+#         detailed-in -> DDS.CYB.001
+#             implemented-in -> github.com/.../password_policy.py
+#             verified-by    -> github.com/.../test_password_policy.py
+```
+
+**Relationship vocabulary — use exactly these strings:**
+
+| Relationship | From → To | Semantics |
+|---|---|---|
+| `implemented-by` | UN → REQ | The user need is met by this requirement |
+| `mitigated-by` | RMA → REQ | The hazard is mitigated by this requirement |
+| `derived-from` | REQ → UN / REQ → higher-level REQ | Parent requirement |
+| `detailed-in` | REQ → DDS | The requirement is elaborated by this design spec |
+| `implemented-in` | DDS → codebase | The design spec is realised by this source file / module |
+| `verified-by` | DDS → test / REQ → test | The spec/requirement is verified by this test |
+| `validated-by` | DDS → clinical/usability study | Validation (not verification) evidence |
+
+Stick to this vocabulary. Custom relationships confuse downstream
+matrix exports and break the default `trace gaps` heuristics.
+
 ---
 
 ## 4. Profiles and the writing-style contract
@@ -572,7 +659,53 @@ file.
 Stop conditions: inbox is empty, `mneme stats` shows a plausible page
 count, and `mneme lint` reports no critical issues.
 
-### 6.6 Pre-submission readiness check before sending to a notified body
+### 6.6 Close the V-model by linking DDS to codebase and tests
+
+The user has just handed you one or more repositories. Your job is to
+connect every DDS page to the implementing source file(s) and the
+verifying test file(s) so `mneme trace show` walks end-to-end from a
+user need / hazard all the way to the exact line of code and the exact
+test that exercises it.
+
+```
+1. mneme profile show                            # sanity check
+2. mneme trace matrix <client>                   # baseline — which DDS exist?
+3. For each repo the user passes:
+     a. mneme scan-repo <repo-path> <client>     # surface module gaps
+     b. Read the repo tree and README yourself.
+        Build a mapping: DDS ID -> [source files]
+                         DDS ID -> [test files]
+        Prefer explicit evidence (comments referencing the DDS ID,
+        module/function names that mirror the DDS title, docstrings
+        that cite the requirement). When evidence is weak, flag the
+        DDS as ambiguous and surface it — do not guess.
+4. For each confident (DDS, file) pair:
+     mneme trace add <client>/<dds-slug> "<repo-url-or-path>/<file>" implemented-in
+     mneme trace add <client>/<dds-slug> "<repo-url-or-path>/<test-file>" verified-by
+   Batch these in a shell loop — there is no bulk-trace-add subcommand.
+5. mneme trace gaps <client>                     # should trend to zero
+6. mneme trace show <client>/un-001              # spot-check: full chain
+                                                   from UN to test file?
+7. mneme trace matrix <client> --csv --out trace-matrix.csv
+                                                 # DHF-ready export
+```
+
+Stop conditions: (a) every DDS page either has both `implemented-in`
+and `verified-by` trace links OR is explicitly flagged ambiguous in a
+report to the user, AND (b) `trace gaps` reports zero open chains.
+
+Hard rules:
+- Do not fabricate file paths. If the repo has no file matching a DDS,
+  report the gap and stop — the user must either point you at another
+  repo or add the link manually.
+- Trace targets for external files are opaque strings. Use a stable
+  form the team can resolve later (a git URL with a pinned commit is
+  ideal; a bare relative path is fine when the repo lives alongside
+  the workspace).
+- Never rewrite a DDS page's body to embed the code link. The link
+  lives in `schema/traceability.json` only. Wiki pages stay prose.
+
+### 6.7 Pre-submission readiness check before sending to a notified body
 
 ```
 1. mneme profile show                            # confirm active profile

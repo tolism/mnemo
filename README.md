@@ -140,7 +140,7 @@ One installed CLI serves many projects — each workspace is just a directory.
 | `mneme stats` | Health overview |
 | `mneme repair` | Fix corrupted archives |
 
-**Formats:** `.md`, `.txt`, `.pdf`, `.xlsx` (with `pip install "mneme-cli[xlsx]"`)
+**Formats:** `.md`, `.txt`, `.pdf`, `.xlsx` (built-in), plus `.csv` via `mneme ingest-csv`
 
 ---
 
@@ -195,38 +195,115 @@ Creates the workspace tree, sets the EU MDR writing-style profile, and initializ
 cp -r ~/Downloads/parkinson-research/* inbox/
 mneme tornado --client parkiwatch
 
-# Or ingest individual files
+# Or ingest individual files (auto-mirrors sources/<client>/ layout into wiki/)
 mneme ingest research-paper.pdf parkiwatch
-mneme ingest-csv risk-register.csv parkiwatch --mapping risk-register
 mneme ingest spec-table.xlsx parkiwatch          # .xlsx renders sheets as markdown tables
-mneme ingest-dir docs/ parkiwatch --recursive    # walk subdirectories
+mneme ingest-dir docs/ parkiwatch --recursive    # walk subdirectories, preserve structure
+
+# Structured CSV ingestion — one row becomes one wiki page + trace links.
+# Mappings live in <workspace>/profiles/mappings/ or are auto-detected.
+mneme ingest-csv user-needs.csv    parkiwatch --mapping parkiwatch-user-needs
+mneme ingest-csv requirements.csv  parkiwatch --mapping parkiwatch-req
+mneme ingest-csv design-specs.csv  parkiwatch --mapping parkiwatch-dds
+mneme ingest-csv risk-register.csv parkiwatch --mapping parkiwatch-rma
 ```
 
-What happens per ingest: source file → wiki page in `wiki/parkiwatch/` → frontmatter with auto-extracted entities → entry in `index.md` → row in the FTS5 search DB → log entry.
+What happens per ingest: source file → wiki page in `wiki/parkiwatch/<mirrored-subpath>/` → frontmatter with auto-extracted proper-noun entities → entry in `index.md` → row in the FTS5 search DB → log entry. CSV ingests additionally create trace links (e.g. UN→REQ `implemented-by`, REQ→DDS `detailed-in`) in `schema/traceability.json`.
 
-### Step 3 — Tag the new pages (LLM agent)
+### Step 3 — Tag many pages at once (LLM agent, bulk)
 
-The new pages have only the auto-applied `parkiwatch` client tag. The agent now adds meaningful tags:
+New pages have only the auto-applied `parkiwatch` client tag. The agent tags them in batches:
 
 ```bash
-# For each new page, the agent runs:
-mneme tags suggest parkiwatch/research-paper > /tmp/packet.md
+# 1. Pack up to 30 untagged pages into a single review packet.
+#    --filter scopes by wiki_path substring; omit for everything.
+mneme tags bulk-suggest --filter indicators --limit 30 \
+                        --json --out /tmp/tag-packet.json
 ```
 
-The packet contains the page body, the current tag taxonomy (every tag in the workspace + usage counts), and a ready-to-paste prompt. **The LLM reads the packet** — it understands the content and decides on tags, preferring existing taxonomy entries when they fit. The LLM's response is JSON:
+The packet contains, for each page: wiki_path, title, current tags, body excerpt, and the existing taxonomy with usage counts. **The LLM reads the packet** and returns a response JSON:
 
 ```json
-{"tags": ["clinical-trial", "iso-13485"], "new_tags": ["bradykinesia-detection"]}
+{
+  "pages": [
+    {"wiki_path": "parkiwatch/indicators/bda_algorithm_description.md",
+     "add": ["bradykinesia", "algorithm", "imu", "medical-device"]},
+    {"wiki_path": "parkiwatch/indicators/tremor_indicator_dataflow.md",
+     "add": ["tremor", "dataflow", "imu", "algorithm"]}
+  ]
+}
 ```
-
-The agent then runs:
 
 ```bash
-mneme tags apply parkiwatch/research-paper \
-  --add clinical-trial,iso-13485,bradykinesia-detection
+# 2. Apply all decisions in one atomic call
+mneme tags bulk-apply /tmp/tag-response.json
+# → Pages updated: 9   Tags added: 42   Tags removed: 0
 ```
 
-Atomic operation: rewrites the wiki page frontmatter, updates `schema/tags.json`, re-indexes the page in FTS5 (so search picks up the new tags immediately), appends a log entry. **Repeat for every page** — the taxonomy grows, and subsequent pages tend to reuse existing tags (consistency).
+Each application rewrites the wiki page frontmatter, updates `schema/tags.json`, re-indexes the page in FTS5, and appends a log entry. Subsequent packets reuse the growing taxonomy, so the vocabulary converges.
+
+For single pages use `mneme tags suggest <slug>` + `mneme tags apply <slug> --add a,b,c`.
+
+### Step 3b — Classify entities by type (LLM agent)
+
+Ingest auto-extracts capitalized proper nouns (e.g. "Parkiwatch", "IEC 62304") into `schema/entities.json` with `type: unknown`. Typing is an LLM judgement call, handled the same packet way as tags:
+
+```bash
+# 1. Build an entity-classification packet (up to 50 unclassified entities)
+mneme entity suggest --client parkiwatch --limit 50 \
+                     --json --out /tmp/entity-packet.json
+
+# 2. LLM reads the packet and returns classifications:
+#    [{"id": "iec-62304", "type": "standard"},
+#     {"id": "notified-body", "type": "organization"},
+#     {"id": "bradykinesia", "type": "concept"}, ...]
+
+# 3. Apply atomically
+mneme entity bulk-apply /tmp/entity-response.json
+# → Entities typed: 47   Errors: 0
+```
+
+Supported types include `standard`, `organization`, `person`, `concept`, `technology`, `regulation`, or any custom type the profile defines. Typed entities power filtered search and the knowledge graph.
+
+### Step 3c — Verify the trace chain (human, on demand)
+
+The CSV ingests in Step 2 created two parallel trace chains. Both converge at a requirement, drill into design specs, and finally terminate at **code** and **tests** — the complete QMS traceability an auditor expects:
+
+```
+Chain A:  UN ─┐
+              ├─> REQ ──> DDS ──┬─> codebase  (via `implemented-in`)
+Chain B:  RMA ┘                 └─> tests     (via `verified-by`)
+```
+
+Each arrow is a trace-link relationship type (`implemented-by`, `mitigated-by`, `detailed-in`, `implemented-in`, `verified-by`). The DDS→codebase link is stored as a frontmatter field on each DDS page (e.g. a git URL pointing at the implementing module). The DDS→tests link is a standard trace relationship added either by CSV ingest or by `mneme trace add`.
+
+Walk either chain from any root page:
+
+```bash
+# Chain A — from a user need forward to the specs that implement it
+mneme trace show parkiwatch/un-001
+# → UN.001 (secure sign-in)
+#     implemented-by -> REQ.SYS.001 (User Authentication)
+#         detailed-in -> DDS.CYB.001 (Strong Password Policy)
+#         detailed-in -> DDS.CYB.002 (Multi-Factor Authentication)
+#         ...
+
+# Chain B — from a hazard forward to the specs that mitigate it
+mneme trace show parkiwatch/rma-cyb-002
+# → RMA.CYB.002 (Unauthorized access -- weak passwords)
+#     mitigated-by -> REQ.SYS.001 (User Authentication)
+#         detailed-in -> DDS.CYB.001, DDS.CYB.002, ...
+#             implemented-in -> src/auth/password_policy.py   (codebase)
+#             verified-by    -> TEST.AUTH.001                 (tests)
+
+# Trace gaps for a notified body audit
+mneme trace gaps parkiwatch
+# → Hazards with no mitigation: ...
+#   User needs with no requirements: ...
+
+# Export the full traceability matrix for the DHF
+mneme trace matrix parkiwatch --csv --out trace-matrix.csv
+```
 
 ### Step 4 — Search the knowledge base (anyone)
 

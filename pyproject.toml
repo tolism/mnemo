@@ -32,12 +32,14 @@ classifiers = [
 ]
 dependencies = [
     "portalocker>=2.0.0",
+    "openpyxl>=3.1.0",
 ]
 
 [project.optional-dependencies]
 pdf = ["pymupdf>=1.23.0"]
+# Kept for backwards compatibility — xlsx support is now built-in.
 xlsx = ["openpyxl>=3.1.0"]
-all = ["pymupdf>=1.23.0", "openpyxl>=3.1.0"]
+all = ["pymupdf>=1.23.0"]
 release = [
     "build>=1.0.0",
     "twine>=5.0.0",

@@ -565,7 +565,7 @@ def ingest_source_to_both(source_path: str, client_slug: str, force: bool = Fals
             raw_content = '\n\n'.join(sheets)
         except ImportError:
             raise ValueError(
-                'Excel extraction requires openpyxl. Install: pip install "mneme-cli[xlsx]"'
+                'Excel extraction requires openpyxl. Install: pip install openpyxl'
             )
     else:
         # Generic text fallback
@@ -2103,7 +2103,7 @@ def lint() -> dict:
 
 
 def ingest_dir(directory: str, client_slug: str, force: bool = False,
-               recursive: bool = False, preserve_structure: bool = False) -> dict:
+               recursive: bool = False, preserve_structure: bool = True) -> dict:
     """
     Batch ingest all supported files from a directory.
 
@@ -2112,9 +2112,10 @@ def ingest_dir(directory: str, client_slug: str, force: bool = False,
 
     When recursive=True, walks subdirectories as well.
 
-    When preserve_structure=True, each file's directory position relative to
-    ``directory`` becomes a wiki subdirectory under ``wiki/<client>/``. Also
-    naturally resolves same-basename collisions (suggestion #15).
+    When preserve_structure=True (the default), each file's directory position
+    relative to ``directory`` becomes a wiki subdirectory under
+    ``wiki/<client>/``. Also naturally resolves same-basename collisions
+    (suggestion #15). Pass preserve_structure=False for a flat wiki.
 
     Returns a summary of all ingestions.
     """
@@ -2154,10 +2155,18 @@ def ingest_dir(directory: str, client_slug: str, force: bool = False,
 
     for fpath in files:
         fname = os.path.basename(fpath)
-        # Compute subpath relative to the input directory when preserving structure
         if preserve_structure:
-            sub_rel = os.path.relpath(os.path.dirname(fpath), directory)
-            subpath = '' if sub_rel in ('', '.') else sub_rel
+            # Prefer the path relative to sources/<client>/ when the input lives
+            # there, so callers running `ingest-dir sources/<client>/SUBDIR` get
+            # the SUBDIR prefix in the wiki tree (rather than silently flattening
+            # because SUBDIR itself has no nested subdirectories). Falls back to
+            # relative-to-input-directory for sources outside the canonical tree.
+            auto = _auto_detect_subpath(fpath, client_slug)
+            if auto:
+                subpath = auto
+            else:
+                sub_rel = os.path.relpath(os.path.dirname(fpath), directory)
+                subpath = '' if sub_rel in ('', '.') else sub_rel
         else:
             subpath = ''
         try:
@@ -6241,6 +6250,8 @@ def main() -> None:
     ingest_parser.add_argument('file', help='Path to source file (.md, .txt, .pdf)')
     ingest_parser.add_argument('client_slug', help='Client slug (e.g. demo-retail, my-client)')
     ingest_parser.add_argument('--force', action='store_true', help='Re-ingest even if source was previously ingested')
+    ingest_parser.add_argument('--flat', action='store_true',
+                               help='Write the page directly to wiki/<client>/ without mirroring source subpath')
 
     # init
     init_parser = subparsers.add_parser('init', help='Initialize a new mneme workspace')
@@ -6256,8 +6267,13 @@ def main() -> None:
     ingest_dir_parser.add_argument('client_slug', help='Client slug (e.g. demo-retail, my-client)')
     ingest_dir_parser.add_argument('--force', action='store_true', help='Re-ingest even if sources were previously ingested')
     ingest_dir_parser.add_argument('--recursive', '-r', action='store_true', help='Recurse into subdirectories')
-    ingest_dir_parser.add_argument('--preserve-structure', dest='preserve_structure', action='store_true',
-                                   help='Mirror source directory structure into wiki/<client>/ subdirectories')
+    # Default-on since v0.5.2: mirror source directory structure into the wiki.
+    # --flat is the explicit opt-out for users who want a single-directory wiki.
+    ingest_dir_parser.add_argument('--preserve-structure', dest='preserve_structure',
+                                   action='store_true', default=True,
+                                   help='(default) Mirror source directory structure into wiki/<client>/ subdirectories')
+    ingest_dir_parser.add_argument('--flat', dest='preserve_structure', action='store_false',
+                                   help='Write all pages to wiki/<client>/ without subdirectories')
 
     # tornado
     tornado_parser = subparsers.add_parser('tornado', help='Process inbox: auto-detect, ingest, archive')
@@ -6546,7 +6562,12 @@ def main() -> None:
             print(f'Error: invalid client slug "{args.client_slug}". Use lowercase letters, numbers, hyphens only.', file=sys.stderr)
             sys.exit(1)
         try:
-            result = ingest_source_to_both(args.file, args.client_slug, force=args.force)
+            # Auto-mirror the source's position under sources/<client>/ into the
+            # wiki, unless --flat is passed. This makes single-file ingest match
+            # the default ingest-dir behavior (preserve structure) and avoids
+            # same-basename collisions across different source directories.
+            auto_sub = '' if args.flat else _auto_detect_subpath(args.file, args.client_slug)
+            result = ingest_source_to_both(args.file, args.client_slug, force=args.force, subpath=auto_sub)
             if not result:
                 # Skipped due to duplicate detection
                 sys.exit(0)
@@ -6821,21 +6842,42 @@ def main() -> None:
 
     elif args.command == 'profile':
         if args.profile_command == 'list':
-            if os.path.exists(PROFILES_DIR):
-                profiles = [f[:-5] for f in os.listdir(PROFILES_DIR) if f.endswith('.json')]
-                active = None
-                if os.path.exists(ACTIVE_PROFILE_FILE):
-                    with open(ACTIVE_PROFILE_FILE, 'r') as f:
-                        active = f.read().strip()
-                if profiles:
-                    print('Available profiles:\n')
-                    for p in sorted(profiles):
-                        marker = ' (active)' if p == active else ''
-                        print(f'  - {p}{marker}')
-                else:
-                    print('No profiles found in profiles/ directory.')
+            # Profiles are markdown files. Look in both the workspace profiles
+            # directory (per-project overrides) and the bundled profiles
+            # directory (shipped with mneme). Workspace entries shadow bundled
+            # ones with the same name.
+            workspace_profiles: dict[str, str] = {}
+            bundled_profiles: dict[str, str] = {}
+            if os.path.isdir(WORKSPACE_PROFILES_DIR):
+                for f in os.listdir(WORKSPACE_PROFILES_DIR):
+                    if f.endswith('.md'):
+                        workspace_profiles[f[:-3]] = 'workspace'
+            if os.path.isdir(PROFILES_DIR):
+                for f in os.listdir(PROFILES_DIR):
+                    if f.endswith('.md'):
+                        bundled_profiles[f[:-3]] = 'bundled'
+
+            merged = {**bundled_profiles, **workspace_profiles}  # workspace overrides
+            active = None
+            if os.path.exists(ACTIVE_PROFILE_FILE):
+                with open(ACTIVE_PROFILE_FILE, 'r') as f:
+                    active = f.read().strip()
+
+            if merged:
+                print('Available profiles:\n')
+                for p in sorted(merged):
+                    origin = merged[p]
+                    shadowed = origin == 'workspace' and p in bundled_profiles
+                    markers = []
+                    if p == active:
+                        markers.append('active')
+                    markers.append(origin)
+                    if shadowed:
+                        markers.append('shadows bundled')
+                    print(f'  - {p}  [{", ".join(markers)}]')
             else:
-                print('No profiles/ directory found.')
+                print('No profiles found.')
+                print(f'  Searched: {WORKSPACE_PROFILES_DIR} (workspace) and {PROFILES_DIR} (bundled).')
         elif args.profile_command == 'set':
             try:
                 set_active_profile(args.name)

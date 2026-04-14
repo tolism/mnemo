@@ -398,7 +398,13 @@ class TestIngestDirPreserveStructure:
             with open(full, 'w') as f:
                 f.write(content)
 
-    def test_flat_default_unchanged(self, sync_workspace):
+    def test_preserve_structure_is_default(self, sync_workspace):
+        """v0.5.2+: ingest-dir mirrors source structure by default.
+
+        Previously flat by default; flipped because flat wikis silently
+        overwrite pages that share a basename across different source dirs
+        (suggestion #15).
+        """
         from mneme.core import ingest_dir
         self._make_source_tree(sync_workspace, {
             'demo/REQUIREMENTS/req-001.md': '# req 1',
@@ -406,9 +412,25 @@ class TestIngestDirPreserveStructure:
         })
         ingest_dir(os.path.join(sync_workspace, 'sources', 'demo'),
                    'demo', recursive=True)
-        # Without --preserve-structure, both pages flatten
+        # Default now mirrors source layout
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'requirements', 'req-001.md'))
+        assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'design', 'dds-001.md'))
+        # Flat-mode pages should NOT exist
+        assert not os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'req-001.md'))
+        assert not os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'dds-001.md'))
+
+    def test_flat_opt_out_still_works(self, sync_workspace):
+        """Callers can still request a flat wiki with preserve_structure=False."""
+        from mneme.core import ingest_dir
+        self._make_source_tree(sync_workspace, {
+            'demo/REQUIREMENTS/req-001.md': '# req 1',
+            'demo/DESIGN/dds-001.md': '# dds 1',
+        })
+        ingest_dir(os.path.join(sync_workspace, 'sources', 'demo'),
+                   'demo', recursive=True, preserve_structure=False)
         assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'req-001.md'))
         assert os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'dds-001.md'))
+        assert not os.path.exists(os.path.join(sync_workspace, 'wiki', 'demo', 'requirements', 'req-001.md'))
 
     def test_preserve_structure_creates_subdirs(self, sync_workspace):
         from mneme.core import ingest_dir
@@ -829,6 +851,127 @@ class TestCLI:
     def test_search_exits_zero_for_valid_query(self):
         rc, out, err = _run_mnemo('search', 'xyznonexistent12345qqqzzz')
         assert rc == 0
+
+    def test_profile_list_discovers_bundled_markdown_profiles(self):
+        """Regression: profile list used to filter .json (wrong ext) and only
+        look at the bundled dir. Bundled profiles ship as .md files."""
+        td = tempfile.mkdtemp(prefix='mneme-profile-list-')
+        try:
+            for sub in ('wiki', 'sources', 'schema'):
+                os.makedirs(os.path.join(td, sub), exist_ok=True)
+            with open(os.path.join(td, 'index.md'), 'w') as f:
+                f.write('# Index\n')
+            with open(os.path.join(td, 'log.md'), 'w') as f:
+                f.write('# Log\n')
+            for name, empty in (
+                ('entities.json', {'version': 1, 'updated': '2026-01-01', 'entities': []}),
+                ('tags.json', {'version': 1, 'updated': '2026-01-01', 'tags': {}}),
+                ('graph.json', {'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []}),
+            ):
+                with open(os.path.join(td, 'schema', name), 'w') as f:
+                    json.dump(empty, f)
+
+            rc, out, err = _run_mnemo('--workspace', td, 'profile', 'list')
+            assert rc == 0, f'profile list failed: {err}'
+            assert 'eu-mdr' in out, f'bundled eu-mdr not listed. got: {out}'
+            assert 'iso-13485' in out, f'bundled iso-13485 not listed. got: {out}'
+            assert 'bundled' in out, f'origin marker missing. got: {out}'
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_single_ingest_auto_detects_subpath_from_sources_tree(self):
+        """`mneme ingest` should mirror a file's position under sources/<client>/
+        by default (suggestion #15 — avoid silent basename collisions)."""
+        td = tempfile.mkdtemp(prefix='mneme-ingest-auto-')
+        try:
+            for sub in ('wiki', 'sources', 'schema'):
+                os.makedirs(os.path.join(td, sub), exist_ok=True)
+            with open(os.path.join(td, 'index.md'), 'w') as f:
+                f.write('# Index\n')
+            with open(os.path.join(td, 'log.md'), 'w') as f:
+                f.write('# Log\n')
+            for name, empty in (
+                ('entities.json', {'version': 1, 'updated': '2026-01-01', 'entities': []}),
+                ('tags.json', {'version': 1, 'updated': '2026-01-01', 'tags': {}}),
+                ('graph.json', {'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []}),
+            ):
+                with open(os.path.join(td, 'schema', name), 'w') as f:
+                    json.dump(empty, f)
+
+            src = os.path.join(td, 'sources', 'demo', 'TRACE', 'REQ', 'req-001.md')
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            with open(src, 'w') as f:
+                f.write('# Req 1\n\nFiller body content for a test.\n')
+
+            rc, out, err = _run_mnemo('--workspace', td, 'ingest', src, 'demo')
+            assert rc == 0, f'ingest failed: {err}'
+            nested = os.path.join(td, 'wiki', 'demo', 'trace', 'req', 'req-001.md')
+            flat = os.path.join(td, 'wiki', 'demo', 'req-001.md')
+            assert os.path.exists(nested), f'nested page missing at {nested}'
+            assert not os.path.exists(flat), 'flat page should not exist by default'
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_single_ingest_flat_flag_opts_out(self):
+        """`mneme ingest --flat` keeps the old flat-wiki behavior."""
+        td = tempfile.mkdtemp(prefix='mneme-ingest-flat-')
+        try:
+            for sub in ('wiki', 'sources', 'schema'):
+                os.makedirs(os.path.join(td, sub), exist_ok=True)
+            with open(os.path.join(td, 'index.md'), 'w') as f:
+                f.write('# Index\n')
+            with open(os.path.join(td, 'log.md'), 'w') as f:
+                f.write('# Log\n')
+            for name, empty in (
+                ('entities.json', {'version': 1, 'updated': '2026-01-01', 'entities': []}),
+                ('tags.json', {'version': 1, 'updated': '2026-01-01', 'tags': {}}),
+                ('graph.json', {'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []}),
+            ):
+                with open(os.path.join(td, 'schema', name), 'w') as f:
+                    json.dump(empty, f)
+
+            src = os.path.join(td, 'sources', 'demo', 'TRACE', 'req-001.md')
+            os.makedirs(os.path.dirname(src), exist_ok=True)
+            with open(src, 'w') as f:
+                f.write('# Req 1\n\nFiller body content for a test.\n')
+
+            rc, out, err = _run_mnemo('--workspace', td, 'ingest', src, 'demo', '--flat')
+            assert rc == 0, f'ingest failed: {err}'
+            flat = os.path.join(td, 'wiki', 'demo', 'req-001.md')
+            nested = os.path.join(td, 'wiki', 'demo', 'trace', 'req-001.md')
+            assert os.path.exists(flat)
+            assert not os.path.exists(nested)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_profile_list_shows_workspace_override(self):
+        """Workspace profiles should shadow bundled ones of the same name."""
+        td = tempfile.mkdtemp(prefix='mneme-profile-override-')
+        try:
+            for sub in ('wiki', 'sources', 'schema', 'profiles'):
+                os.makedirs(os.path.join(td, sub), exist_ok=True)
+            with open(os.path.join(td, 'index.md'), 'w') as f:
+                f.write('# Index\n')
+            with open(os.path.join(td, 'log.md'), 'w') as f:
+                f.write('# Log\n')
+            for name, empty in (
+                ('entities.json', {'version': 1, 'updated': '2026-01-01', 'entities': []}),
+                ('tags.json', {'version': 1, 'updated': '2026-01-01', 'tags': {}}),
+                ('graph.json', {'version': 1, 'updated': '2026-01-01', 'nodes': [], 'edges': []}),
+            ):
+                with open(os.path.join(td, 'schema', name), 'w') as f:
+                    json.dump(empty, f)
+            with open(os.path.join(td, 'profiles', 'eu-mdr.md'), 'w') as f:
+                f.write('---\nname: Override\ndescription: local\n---\n# Principles\n- test\n')
+            with open(os.path.join(td, 'profiles', 'custom.md'), 'w') as f:
+                f.write('---\nname: Custom\ndescription: workspace-only\n---\n# Principles\n- test\n')
+
+            rc, out, err = _run_mnemo('--workspace', td, 'profile', 'list')
+            assert rc == 0
+            assert 'custom' in out
+            assert 'shadows bundled' in out, f'override marker missing. got: {out}'
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
 
     def test_ingest_missing_file_exits_nonzero(self):
         rc, out, err = _run_mnemo('ingest', '/tmp/nonexistent_file_xyz_mnemo.md', 'test')

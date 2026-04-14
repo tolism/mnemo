@@ -4,6 +4,51 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-04-14
+
+### Changed
+
+- **`ingest-dir --preserve-structure` is now the default.** The wiki now
+  mirrors the source directory layout unless you pass `--flat`. This avoids
+  silent same-basename collisions (e.g. multiple `INSTRUCTIONS.md` files from
+  different source directories overwriting each other). Closes suggestion #15.
+- **`mneme ingest` (single-file) also mirrors by default.** When the source
+  lives under `sources/<client>/`, its relative position becomes a wiki
+  subpath automatically. Pass `--flat` to opt out.
+
+### Fixed
+
+- **`mneme profile list`** now discovers profiles correctly. Previously it
+  filtered files by `.json` (wrong extension — profiles are markdown) and
+  only checked the bundled directory, which meant the shipped `eu-mdr.md`
+  and `iso-13485.md` profiles appeared as "No profiles found". Now unions
+  workspace + bundled, marks origin, and flags shadowed bundled profiles.
+  Closes suggestion #25 discovery bug.
+
+### Added
+
+- **`ingest-dir --flat`** — explicit opt-out for the new preserve-structure
+  default.
+- **`ingest --flat`** — opt-out for the single-file command.
+- **xlsx support is now built-in.** `openpyxl` moved from
+  `[project.optional-dependencies].xlsx` to `dependencies`. The `[xlsx]`
+  extra is kept for backwards compatibility but is no longer required.
+
+### Documentation
+
+- **README**: expanded the agent end-to-end example. Step 3 now covers
+  bulk tagging (`tags bulk-suggest` + `bulk-apply`), Step 3b adds entity
+  typing (`entity suggest` + `bulk-apply`), and Step 3c walks the full
+  V-model trace chain (UN→REQ→DDS and RMA→REQ→DDS, terminating at code
+  and tests).
+- **AGENTS.md**: new section 3.9 "TRACE — linking the full V-model
+  chain" documents the `implemented-in` / `verified-by` relationships
+  and the DDS-to-codebase linking agents must perform when the user
+  passes repositories. New task template 6.6 "Close the V-model by
+  linking DDS to codebase and tests" gives the exact procedure, stop
+  conditions, and hard rules (no fabricated paths, trace targets are
+  opaque strings, never embed code links in page bodies).
+
 ## [0.5.0] - 2026-04-13
 
 ### Breaking Changes
