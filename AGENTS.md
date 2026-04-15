@@ -705,7 +705,260 @@ Hard rules:
 - Never rewrite a DDS page's body to embed the code link. The link
   lives in `schema/traceability.json` only. Wiki pages stay prose.
 
-### 6.7 Pre-submission readiness check before sending to a notified body
+### 6.7 Ingest a code repo into the wiki as searchable module summaries
+
+The user has handed you a code repo. Your job is to produce one wiki page
+per logical module so future agents can answer "how does this codebase do
+X?" through `mneme search` instead of re-reading the source.
+
+This is the foundation for any later code-aware work (style-matched
+extension, refactor planning, gap analysis). It does not modify the repo —
+read-only ingestion.
+
+```
+1. Walk <REPO_PATH>. Skip: .git, node_modules, .venv, dist, build,
+   __pycache__, anything in .gitignore.
+
+2. Group files into logical modules. Heuristics:
+   - A directory containing __init__.py / mod.rs / index.ts / mod.go
+     is one module.
+   - A standalone script with no siblings is one module.
+   - Tests (tests/ or *_test.* alongside) are part of the module they
+     test, not separate modules.
+
+3. For each module, write a summary file at
+     /tmp/mneme-summaries/<module-path>.md
+   with this exact frontmatter and section structure:
+
+   ---
+   title: <Module Name>
+   type: code-summary
+   client: <CLIENT_SLUG>
+   sources:
+     - <repo-relative path of every file in the module>
+   tags:
+     - code
+     - <language>
+     - <one-or-two-domain-tags>
+   ---
+
+   ## Purpose
+   One paragraph in plain English. No code.
+
+   ## Public API
+   List of exported functions / classes / types, one line each.
+   Format: `name(args) -> return_type` then a sentence.
+
+   ## Key data structures
+   Non-trivial types or schemas this module owns. Skip if none.
+
+   ## Dependencies
+   - Internal: which other modules in this repo it imports
+   - External: which libraries (with pinned version if any)
+
+   ## Tests
+   Path to test file(s) + one sentence on coverage shape.
+
+   ## Conventions observed
+   3-5 bullets: error style, async/sync, naming, comment density, etc.
+
+4. For files too large to read in one pass:
+   a. Read the first 200 lines.
+   b. Read the last 100 lines.
+   c. If the file has a clear table-of-contents (a __all__, an exports
+      block, a class index near the top), use it to guide which middle
+      sections to read in additional 200-line chunks.
+   d. State in the summary's Purpose section that this was a partial
+      read, and tag the page `partial-read` so a future pass can
+      revisit.
+
+5. Ingest the summaries in one pass:
+     mneme ingest-dir /tmp/mneme-summaries <CLIENT_SLUG> --recursive --flat
+
+   Use --flat: the summaries already encode their path in the slug, and
+   they don't live under sources/<CLIENT_SLUG>/ so subpath auto-detection
+   won't help.
+
+6. Smoke-test:
+     mneme stats
+     mneme search "<a real concept from the repo>" --client <CLIENT_SLUG>
+     mneme tags list
+```
+
+Stop conditions: every module in the repo (modulo the skip list) has a
+wiki summary, and a search for a known concept returns the right module.
+
+Hard rules:
+- Do not generate summaries for files you did not actually read. Partial
+  reads must be tagged `partial-read` in the page's frontmatter.
+- Do not speculate. If a module's purpose is unclear from the code, write
+  "unclear, needs human review" and tag the page `needs-review`.
+- Do not modify the repo. Read-only.
+- Keep summaries under 300 lines. They are pointers, not replacements.
+- One module = one wiki page. Do not split a module across pages, and
+  do not merge unrelated modules into one page.
+
+Report when done: total modules summarized, count tagged `partial-read`,
+count tagged `needs-review`, directories skipped and why, and the three
+search queries you used to verify the ingest.
+
+### 6.8 Augment a wiki page with knowledge from ingested code summaries
+
+Pre-condition: 6.7 has run, so the repo is in the wiki as `code-summary`
+pages. You now have a target wiki page (sparse, half-finished, or
+explicitly marked TBD) and you want to enrich it with sections that
+draw on the code knowledge — in the page's existing voice, with every
+claim cited.
+
+This is selective augment, not regeneration. Existing prose is sacred.
+
+```
+1. Read the target page in full at <WORKSPACE>/wiki/<client>/<page>.md.
+   Note: existing tone, sentence length, citation density, heading depth,
+   table-of-contents shape. These define the local style you must match.
+
+2. Decide what to add. Two paths:
+   a. Human-driven: the user told you "add a Performance Characteristics
+      section drawing latency data from the codebase." Skip to step 3.
+   b. Agent-driven: gap analysis. Compare the target's actual sections
+      against (i) the active profile's expected sections for this
+      doc-type (run `mneme profile show`), and (ii) topics covered by
+      code-summary pages that the target does not cite. Propose 1-5
+      candidate sections to the human and wait for confirmation. Do not
+      add sections without confirmation.
+
+3. For each agreed section, gather evidence:
+     mneme search "<topic keywords>" --client <client> -k 20
+   Prefer hits with the `code` tag for implementation details. Prefer
+   regulatory wiki pages for context and definitions. Read the top hits
+   in full before writing.
+
+4. Draft the section. Hard requirements:
+   - Match the target's local style. Local consistency wins over the
+     active profile's global rules within a single page.
+   - Every non-trivial claim cites its source as
+     `(wiki: <client>/<page>)` or `(source: <repo-relative-path>)`.
+   - When evidence is insufficient for a claim, do not invent it.
+     Insert `[TO ADD REF]` and continue.
+
+5. Insert at the structurally correct location. Read the target's TOC.
+   The new section's heading depth and ordering must follow the
+   document's own logic, not your intuition.
+
+6. Update the target's frontmatter:
+   - Append every newly cited source to the `sources:` list.
+   - Bump `updated:` to today.
+   - If the page was previously marked draft / TBD and is now complete,
+     update `confidence:` accordingly.
+
+7. Re-ingest the target so search picks up the new content. Two options:
+   a. If the page has a corresponding source file in sources/<client>/,
+      mirror your wiki edits back to it and run:
+        mneme resync sources/<client>/<path-to-source> <client>
+   b. Otherwise, edit the wiki page directly and run:
+        mneme reindex
+```
+
+Stop conditions: every agreed section is either (a) written with full
+citations, or (b) explicitly flagged as evidence-insufficient and
+reported back to the human. The page passes
+`mneme validate writing-style <client>/<page>` against the active
+profile.
+
+Hard rules:
+- Do NOT rewrite existing prose. Augment only — add new sections, do not
+  edit current ones unless explicitly asked.
+- Do NOT fabricate citations. Every `(wiki: ...)` and `(source: ...)`
+  reference must resolve to an actual page or file.
+- Do NOT exceed the human-confirmed scope. If gap analysis surfaced 5
+  candidate sections and the human approved 2, write only those 2.
+- Do NOT touch the page's frontmatter `created:` or `client:` fields.
+
+Report when done: sections added (with line counts), sources cited
+(deduplicated list), any sections you were asked to write but skipped
+because evidence was insufficient (with a one-line explanation per skip),
+and the result of the post-edit `mneme validate writing-style` run.
+
+### 6.9 Validate a claim against the literature wiki
+
+You are about to write or have already written a factual claim in a
+deliverable (DVR, CER, technical documentation, etc.). Before the
+claim ships to a notified body, it must be backed by an authoritative
+source — or explicitly carry `[TO ADD REF]` so the gap is visible.
+
+Pre-condition: the relevant literature has been ingested into the wiki
+(typically under `research-questions/` or similar) and tagged with
+`literature` plus an authority marker (`authority` / `non-authority`).
+If those tags don't exist, run a one-time `mneme tags bulk-suggest` /
+`bulk-apply` pass to add them — see Step 3 in the README.
+
+```
+1. Identify the claim. Reduce it to its load-bearing assertion.
+   "Parkinsonian tremor manifests primarily in the 4-6 Hz band" is a
+   claim. "Tremor is a problem" is not — too vague to validate.
+
+2. Search the literature for evidence. Be specific in the query:
+     mneme search "<claim keywords>" --client <client> -k 30
+   When `mneme search --tag` is available (planned), prefer:
+     mneme search "<claim keywords>" --client <client> --tag authority -k 20
+
+3. Read the top hits in full. Sort the relevant ones into three buckets:
+   a. AUTHORITY supports the claim (peer-reviewed, recent, on-topic)
+   b. NON-AUTHORITY supports the claim (preprints, blog posts, secondary)
+   c. Nothing relevant, or hits contradict the claim
+
+4. Decide based on the bucket:
+
+   a. AUTHORITY support
+      -> Write the claim with the citation:
+         "...4-6 Hz band (wiki: <client>/research-questions/.../<page>)."
+      -> Append the cited page to the deliverable's frontmatter
+         `sources:` list if not already present.
+
+   b. NON-AUTHORITY support only
+      -> Either soften the claim ("Preliminary reports suggest..."),
+         OR keep the strong form with [TO ADD REF] and find an
+         authority source separately.
+      -> Do NOT cite a non-authority source as if it were authoritative.
+
+   c. No support / contradicting evidence
+      -> Three options, in order of preference:
+         i.  Drop the claim. The deliverable doesn't need it.
+         ii. Find a new authority source. Drop the PDF into
+             sources/<client>/<literature-path>/, summarize and ingest
+             it (run a single-page version of 6.7), then return to step 2.
+         iii. Keep the claim but mark it [TO ADD REF] AND open a
+              tracked TODO so the gap doesn't ship by accident.
+
+5. After resolving the claim (or marking it), run:
+     mneme validate writing-style <client>/<deliverable-page>
+   The review packet flags every remaining [TO ADD REF] and every
+   uncited factual claim. Address them or hand the page back to the
+   human reviewer with the gaps surfaced.
+```
+
+Stop conditions: the claim is either (a) cited with an authority
+source, (b) softened to match the strength of the available evidence,
+(c) dropped, or (d) explicitly marked `[TO ADD REF]` AND tracked for
+follow-up. Never (e) cited with fabricated or non-authoritative
+evidence dressed as authoritative.
+
+Hard rules:
+- Do NOT cite a wiki page you did not read. Read every page you cite.
+- Do NOT cite a non-authority source as `(wiki: ...)` without making
+  its non-authority status visible in the surrounding prose.
+- Do NOT silently weaken or rewrite the claim to dodge the citation
+  requirement. If the evidence is weak, say so.
+- Do NOT bulk-clear `[TO ADD REF]` markers without going through this
+  procedure for each one. Each marker is a discrete claim that needs
+  individual evidence.
+
+Report when done: the original claim, the final form of the claim
+(verbatim if changed), the citation added (or the [TO ADD REF] marker
+left in place), the wiki pages read, and a one-line note on whether
+this gap should be tracked for human follow-up.
+
+### 6.10 Pre-submission readiness check before sending to a notified body
 
 ```
 1. mneme profile show                            # confirm active profile

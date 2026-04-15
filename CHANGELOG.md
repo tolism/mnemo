@@ -48,6 +48,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   linking DDS to codebase and tests" gives the exact procedure, stop
   conditions, and hard rules (no fabricated paths, trace targets are
   opaque strings, never embed code links in page bodies).
+## [0.5.3] - 2026-04-15
+
+### Documentation
+
+- **AGENTS.md**: new task template 6.7 "Ingest a code repo into the
+  wiki as searchable module summaries" — the foundation for any
+  code-aware agent work. One wiki page per logical module, chunked
+  reading for large files, explicit tagging for partial/unclear pages,
+  and `mneme ingest-dir --flat` for the bulk write.
+- **AGENTS.md**: new task template 6.8 "Augment a wiki page with
+  knowledge from ingested code summaries" — selective enrichment of a
+  target page using evidence drawn from the code summaries produced by
+  6.7. Existing prose is sacred; agent only adds new sections, in the
+  page's local style, with every claim cited.
+- **AGENTS.md**: new task template 6.9 "Validate a claim against the
+  literature wiki" — the discipline an agent applies before any
+  factual claim ships to a notified body. Three buckets (authority /
+  non-authority / no support), four resolutions (cite / soften / drop /
+  mark `[TO ADD REF]`), zero tolerance for non-authority dressed as
+  authoritative.
 
 ## [0.5.0] - 2026-04-13
 
